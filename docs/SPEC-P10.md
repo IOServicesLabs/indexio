@@ -572,7 +572,17 @@ files with no language mapping, so the hooks let them through. Three changes:
   asked for one), the transcript lines around it are appended, so the model does not spend
   a second call on the pointer it was just given.
 
-## 32. Next
+## 32. A missed path names the file it probably meant
+
+In one session (236 calls, −50 % against the built-in tools) three `file_outline` calls
+failed with `is not indexed`: the agent had guessed `components/Recurring.tsx` for a file
+that lives under `pages/`, and two names that do not exist at all. Each miss cost a
+`list_files` or `code_grep` round trip before the right call. The miss now carries the
+indexed paths of that repo with the same file name (else the same stem, up to five):
+`repo:lib/foo.rs is not indexed; did you mean src/foo.rs`. Both `file_outline` and
+`read_span` use it; a name with no relative is reported as before.
+
+## 33. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

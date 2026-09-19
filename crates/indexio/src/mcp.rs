@@ -1379,6 +1379,37 @@ fn invalid(msg: impl Into<String>) -> (i64, String) {
     (INVALID_PARAMS, msg.into())
 }
 
+/// The error for a `repo:path` the index does not hold, with the indexed
+/// paths of that repo that share the file name (else the stem) appended as
+/// `did you mean`. Agents guess paths from memory — a component under
+/// `pages/` instead of `components/` — and without the hint the miss costs
+/// a `list_files` round trip.
+fn not_indexed(engine: &Engine, repo: &str, path: &str) -> (i64, String) {
+    let mut msg = format!("{repo}:{path} is not indexed");
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let mut found: Vec<String> = Vec::new();
+    for pattern in [format!("**/{name}"), format!("**/*{stem}*")] {
+        if stem.is_empty() {
+            break;
+        }
+        let (hits, _) = engine.list_paths(&pattern, Some(repo), 5);
+        for (_, p) in hits {
+            if p != path && !found.contains(&p) {
+                found.push(p);
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    if !found.is_empty() {
+        msg.push_str("; did you mean ");
+        msg.push_str(&found.join(", "));
+    }
+    (INVALID_PARAMS, msg)
+}
+
 /// Fallible internals (semantic plane embed/index I/O) map to -32603.
 fn internal(msg: impl Into<String>) -> (i64, String) {
     (INTERNAL_ERROR, msg.into())
@@ -1896,7 +1927,7 @@ fn call_tool(
             let path = req_str(args, "path")?;
             let items = engine
                 .outline(repo, path)
-                .ok_or_else(|| invalid(format!("{repo}:{path} is not indexed")))?;
+                .ok_or_else(|| not_indexed(engine, repo, path))?;
             // the harness has no outline: this call is the cost of reading
             // by span instead of whole
             *baseline = Some(0);
@@ -1919,7 +1950,7 @@ fn call_tool(
             let end = opt_usize(args, "end", default_end)?;
             let (body, last) = engine
                 .read_span(repo, path, start as u32, end as u32)
-                .ok_or_else(|| invalid(format!("{repo}:{path} is not indexed")))?;
+                .ok_or_else(|| not_indexed(engine, repo, path))?;
             // the harness would have read the whole file — once
             let first = read_seen
                 .lock()
@@ -2732,6 +2763,13 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"file_outline","arguments":{"repo":"alpha","path":"nope.rs"}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert_eq!(v["error"]["code"], -32602);
+        assert!(!v["error"]["message"].as_str().unwrap().contains("did you mean"), "{v}");
+        // a guessed folder for a real file name: the miss names the real path
+        let req = r#"{"jsonrpc":"2.0","id":471,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"lib/foo.rs","start":1}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert_eq!(v["error"]["code"], -32602);
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("alpha:lib/foo.rs is not indexed; did you mean src/foo.rs"), "{msg}");
         // no start: the top of the file (a worker omitted it and lost the turn)
         let req = r#"{"jsonrpc":"2.0","id":48,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"src/foo.rs"}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());

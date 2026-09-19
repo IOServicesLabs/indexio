@@ -582,7 +582,28 @@ indexed paths of that repo with the same file name (else the same stem, up to fi
 `repo:lib/foo.rs is not indexed; did you mean src/foo.rs`. Both `file_outline` and
 `read_span` use it; a name with no relative is reported as before.
 
-## 33. Next
+## 33. Two more shapes seen in the wild
+
+- **An unbalanced parenthesis in a grep pattern.** `export function rateLimit|return
+  async|):.*=>` — the `)` meant a literal — was refused as an invalid regex, and the agent
+  spent a turn on it. `code_grep` now escapes the parentheses that have no partner (outside
+  classes, not already escaped) and retries; the result is prefixed with `unbalanced
+  parenthesis treated as literal:`. A pattern broken for another reason still fails.
+- **`start` after `end` in `read_span`.** `360..130` and `336..325` came back as one line
+  each. The pair is now read as swapped: the lines between them, which is what the agent
+  asked for the second time in both cases.
+- **`path` and `repo` as arguments of `code_grep`.** The same agent sent
+  `path: "app/backend/src/middleware/rate-limit.ts"` next to the pattern, the way the
+  built-in Grep takes it; the server ignored the argument and answered from the whole
+  repo. Both are accepted now and appended as the `repo:` and `path:` filters.
+- **Two binaries, one data dir.** A firmware `.ino` file was indexed by the new binary
+  (§31 extension map) and tombstoned again by the running session's older server, whose
+  walker did not know the type and took the doc for a deleted file. A content delta now
+  keeps a doc whose type it does not recognise while the file exists on disk; only a file
+  that is gone is tombstoned. The older binary in that session keeps its old behaviour
+  until the session restarts, which the `binary updated` note on its next result asks for.
+
+## 34. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

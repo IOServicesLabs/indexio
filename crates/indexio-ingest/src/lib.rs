@@ -742,9 +742,17 @@ fn delta_by_content(
         to_index.push((rel, content));
     }
     for old_path in prev_blob.keys() {
-        if !seen.contains(*old_path) {
-            doomed.insert((*old_path).to_string());
+        if seen.contains(*old_path) {
+            continue;
         }
+        // A doc this binary's walker does not recognise (a file type a
+        // newer binary indexed) is not a deleted file: leave it to the
+        // binary that knows it, or two versions serving one data dir
+        // add and tombstone the same docs in turns.
+        if Lang::from_path(old_path) == Lang::Unknown && state.path.join(old_path).is_file() {
+            continue;
+        }
+        doomed.insert((*old_path).to_string());
     }
     let mut changed_paths: Vec<String> = to_index.iter().map(|(p, _)| p.clone()).collect();
     changed_paths.extend(doomed.iter().cloned());
@@ -1310,6 +1318,36 @@ mod tests {
 
     fn open_cas(data_dir: &Path) -> Cas {
         Cas::open(&data_dir.join("cas")).unwrap()
+    }
+
+    /// Two binaries with different extension maps share one data dir: the
+    /// one that does not know a type must not tombstone the other's docs.
+    #[test]
+    fn delta_keeps_docs_of_file_types_this_walker_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(dir.path(), &[("util.py", UTIL_PY), ("notes.zzz", b"ZZZ_TOKEN = 1\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        index_dir(dir.path(), "p1", data.path(), &cas).unwrap();
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"], "zzz is unknown to this build");
+
+        // a newer binary indexed notes.zzz: the same doc under that path
+        let mut docs = extract_docs(vec![("notes.py".to_string(), b"ZZZ_TOKEN = 1\n".to_vec())], &cas);
+        docs[0].meta.path = "notes.zzz".to_string();
+        write_shard(&data.path().join("shards"), "p1", &docs).unwrap();
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["notes.zzz", "util.py"]);
+
+        // this build's delta walks past notes.zzz but the file exists: kept
+        let state = load_state(data.path(), "p1").unwrap();
+        let r = reindex_dir(&state, data.path(), &cas, None).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (0, 0), "{r:?}");
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["notes.zzz", "util.py"]);
+
+        // the file is deleted: now it goes
+        fs::remove_file(dir.path().join("notes.zzz")).unwrap();
+        let r = reindex_dir(&state, data.path(), &cas, None).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (0, 1), "{r:?}");
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"]);
     }
 
     #[test]

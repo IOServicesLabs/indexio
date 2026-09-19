@@ -1226,6 +1226,8 @@ fn tools_list() -> Value {
                  pattern to narrow.",
                 json!({
                     "pattern": string_prop("regex (may end with repo:/path:/lang: filters)"),
+                    "repo": string_prop("only this repo (optional; same as a repo: filter)"),
+                    "path": string_prop("only paths containing this (optional; same as a path: filter)"),
                     "limit": limit_prop,
                     "lines": json!({ "type": "integer", "description": "matching lines per file (default 20, max 100)", "minimum": 1 }),
                 }),
@@ -1672,14 +1674,38 @@ fn call_tool(
         }
         "code_grep" => {
             let pattern = req_str(args, "pattern")?;
+            // `repo` / `path` as separate arguments, the way Grep takes them
+            // (agents send them; they used to be ignored): trailing filters
+            let mut pattern = pattern.to_string();
+            for key in ["repo", "path"] {
+                if let Some(v) = args.get(key).and_then(Value::as_str).filter(|v| !v.is_empty() && !v.contains(char::is_whitespace)) {
+                    pattern.push_str(&format!(" {key}:{v}"));
+                }
+            }
+            let pattern = pattern.as_str();
             let limit = opt_limit(args)?;
             let lines = opt_usize(args, "lines", GREP_LINES_PER_FILE)?.clamp(1, MAX_LINES_PER_FILE);
-            let query = grep_query(pattern).map_err(|e| invalid(format!("invalid pattern: {e}")))?;
+            // an unbalanced parenthesis (`):.*=>` meaning a literal `)`) is
+            // escaped and retried instead of failing the call (SPEC-P10 §33)
+            let (query, note) = match grep_query(pattern) {
+                Ok(q) => (q, None),
+                Err(e) => match escape_unbalanced_parens(pattern) {
+                    Some(fixed) => match grep_query(&fixed) {
+                        Ok(q) => (q, Some("unbalanced parenthesis treated as literal:\n")),
+                        Err(_) => return Err(invalid(format!("invalid pattern: {e}"))),
+                    },
+                    None => return Err(invalid(format!("invalid pattern: {e}"))),
+                },
+            };
             let mut res = engine.search_lines(&query, fetch(limit), lines);
             *baseline = Some(grep_baseline(&res.hits, current));
             prefer_repo(&mut res.hits, current, limit);
             if text {
-                return Ok(plain_result(mcp_text::hits(&res.hits, true, res.truncated, "matches")));
+                let body = mcp_text::hits(&res.hits, true, res.truncated, "matches");
+                return Ok(plain_result(match note {
+                    Some(n) => format!("{n}{body}"),
+                    None => body,
+                }));
             }
             Ok(text_result(crate::serve::search_result_to_json(&res)))
         }
@@ -1948,6 +1974,9 @@ fn call_tool(
                 .map(|(_, e)| (e as usize).max(start))
                 .unwrap_or(start + 59);
             let end = opt_usize(args, "end", default_end)?;
+            // `start` after `end` is a swapped pair (seen as 360..130 and
+            // 336..325 in the wild), not a request for one line
+            let (start, end) = if end < start { (end.max(1), start) } else { (start, end) };
             let (body, last) = engine
                 .read_span(repo, path, start as u32, end as u32)
                 .ok_or_else(|| not_indexed(engine, repo, path))?;
@@ -2017,6 +2046,47 @@ fn grep_query(pattern: &str) -> Result<indexio_query::Query, String> {
     }
     let q = format!("/{}/{filters}", pattern.replace('/', "\\/"));
     indexio_query::parse(&q).map_err(|e| e.to_string())
+}
+
+/// The pattern with every parenthesis that has no partner escaped, or
+/// `None` when they all balance (the error is something else). Escaped
+/// parentheses and character classes are left alone.
+fn escape_unbalanced_parens(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut unmatched: Vec<usize> = Vec::new(); // positions to escape
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => open.push(i),
+            ')' if !in_class => {
+                if open.pop().is_none() {
+                    unmatched.push(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    unmatched.extend(open);
+    if unmatched.is_empty() {
+        return None;
+    }
+    unmatched.sort_unstable();
+    let mut out = String::with_capacity(pattern.len() + unmatched.len());
+    let mut next = unmatched.iter().peekable();
+    for (i, c) in chars.iter().enumerate() {
+        if next.peek() == Some(&&i) {
+            out.push('\\');
+            next.next();
+        }
+        out.push(*c);
+    }
+    Some(out)
 }
 
 /// Whether a lexical query reads as a grep pattern rather than words: an
@@ -2477,9 +2547,9 @@ mod tests {
             &handle(&e, &hash_emb(), &rr(), r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"nope"}}"#).unwrap(),
         );
         assert_eq!(v["error"]["code"], -32602);
-        // unparsable query (bad regex)
+        // unparsable query (bad regex; an unbalanced parenthesis alone is repaired, §33)
         let v = parse_resp(
-            &handle(&e, &hash_emb(), &rr(), r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"(bad"}}}"#).unwrap(),
+            &handle(&e, &hash_emb(), &rr(), r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"a{3,1}"}}}"#).unwrap(),
         );
         assert_eq!(v["error"]["code"], -32602);
     }
@@ -2775,6 +2845,48 @@ mod tests {
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert!(v.get("error").is_none(), "{v}");
         assert_eq!(payload_of(&v)["start"], 1);
+    }
+
+    #[test]
+    fn unbalanced_parens_are_escaped_and_retried() {
+        assert_eq!(escape_unbalanced_parens("export function x|return async|):.*=>").as_deref(), Some("export function x|return async|\\):.*=>"));
+        assert_eq!(escape_unbalanced_parens("(foo|bar").as_deref(), Some("\\(foo|bar"));
+        assert_eq!(escape_unbalanced_parens("(a)|[)]|\\)"), None, "balanced, class and escaped are fine");
+        let (_t, e) = fixture_engine();
+        let req = r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"helper\\(x|):"}}}"#;
+        let v = parse_resp(&handle_text(&e, req).unwrap());
+        assert!(v.get("error").is_none(), "{v}");
+        let t = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(t.starts_with("unbalanced parenthesis treated as literal:\n"), "{t}");
+        assert!(t.contains("helper(x)"), "{t}");
+        // a pattern that is broken for another reason still fails
+        let req = r#"{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"a{2,1}"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+    }
+
+    #[test]
+    fn code_grep_takes_repo_and_path_as_arguments() {
+        let (_t, e) = fixture_engine();
+        let req = r#"{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","path":"caller"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        let hits = payload_of(&v)["hits"].as_array().unwrap().clone();
+        assert!(!hits.is_empty(), "{v}");
+        assert!(hits.iter().all(|h| h["path"].as_str().unwrap().contains("caller")), "{v}");
+        let req = r#"{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","repo":"nosuchrepo"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert!(payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
+    }
+
+    #[test]
+    fn swapped_span_bounds_read_the_range() {
+        let (_t, e) = fixture_engine();
+        let req = r#"{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"src/foo.rs","start":3,"end":2}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        let p = payload_of(&v);
+        assert_eq!(p["start"], 2, "{v}");
+        assert_eq!(p["end"], 3);
+        assert_eq!(p["text"], "    helper(x)\n}\n");
     }
 
     #[test]

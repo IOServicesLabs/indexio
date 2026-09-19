@@ -1,0 +1,42 @@
+{
+  "name": "indexio",
+  "version": "0.1.0",
+  "description": "Code search, impact analysis and MCP server for AI coding agents",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IOServicesLabs/indexio.git"
+  },
+  "homepage": "https://github.com/IOServicesLabs/indexio#readme",
+  "bin": {
+    "indexio": "bin/indexio.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/indexio.js",
+    "install.js",
+    "README.md"
+  ],
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "code-search",
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "index",
+    "impact-analysis"
+  ]
+}

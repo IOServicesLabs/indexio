@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+**/*.rs.bk
+# scratch data directories created by local runs / tests
+/*-data/
+/.indexio/
+*.tmp
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+# release packaging output (tools/release-assets.sh)
+/dist/
+/npm/vendor/
+/npm/node_modules/

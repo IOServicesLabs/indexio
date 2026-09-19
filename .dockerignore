@@ -1,0 +1,11 @@
+target/
+*-data/
+.indexio/
+.git/
+.github/
+.claude/
+bench/
+docs/
+tools/
+*.md
+!README.md

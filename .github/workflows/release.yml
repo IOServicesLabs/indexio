@@ -1,0 +1,223 @@
+name: release
+
+# A merge to main whose Cargo.toml version has no release yet gets one:
+#
+#   release   tag v<version> + GitHub release with generated notes (90 s cap)
+#   binaries  Linux x86_64/aarch64, macOS Apple silicon/Intel, Windows x86_64,
+#             each a .tar.gz/.zip with a .sha256, attached to the release
+#   docker    ghcr.io/<owner>/indexio:<version> and :latest, linux/amd64+arm64,
+#             assembled from the Linux binaries above
+#   npm       the `indexio` package (postinstall downloads the matching binary);
+#             only when the NPM_TOKEN secret exists
+#
+# The asset jobs compile Rust, which cannot fit the 90-second budget of the
+# other workflows; they carry their own timeouts and run only when a release
+# was just created (or on manual dispatch with a tag). A merge without a
+# version change does nothing.
+#
+# To ship: bump `version` in Cargo.toml ([workspace.package]), merge to main.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build assets for, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      version: ${{ steps.rel.outputs.version }}
+      build: ${{ steps.rel.outputs.build }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag and release (90 s hard limit)
+        id: rel
+        run: |
+          timeout --signal=KILL 90 bash -eo pipefail -c '
+            if [ -n "${{ github.event.inputs.tag }}" ]; then
+              tag="${{ github.event.inputs.tag }}"
+              gh release view "$tag" > /dev/null
+              echo "tag=$tag" >> "$GITHUB_OUTPUT"
+              echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+              echo "build=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            version="$(sed -n "s/^version *= *\"\([^\"]*\)\".*/\1/p" Cargo.toml crates/indexio/Cargo.toml | head -1)"
+            [ -n "$version" ] || { echo "no version in Cargo.toml"; exit 1; }
+            tag="v${version}"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            if gh release view "$tag" > /dev/null 2>&1; then
+              echo "release $tag exists; nothing to do"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            gh release create "$tag" --target "$GITHUB_SHA" --title "indexio $version" --generate-notes
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "released $tag"
+          '
+
+  binaries:
+    needs: release
+    if: needs.release.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   cross: false }
+          - { os: ubuntu-22.04,   target: aarch64-unknown-linux-gnu, name: linux-aarch64,  cross: true }
+          - { os: macos-14,       target: aarch64-apple-darwin,      name: macos-aarch64,  cross: false }
+          - { os: macos-14,       target: x86_64-apple-darwin,       name: macos-x86_64,   cross: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, cross: false }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.release.outputs.tag }}
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@cross
+        if: matrix.cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked -p indexio --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked -p indexio --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="indexio-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/${name}"
+          case "${{ matrix.name }}" in
+            windows-*) bin=indexio.exe ;;
+            *) bin=indexio ;;
+          esac
+          cp "target/${{ matrix.target }}/release/${bin}" README.md LICENSE NOTICE "dist/${name}/"
+          cd dist
+          case "${{ matrix.name }}" in
+            windows-*) 7z a -tzip "${name}.zip" "${name}" > /dev/null; asset="${name}.zip" ;;
+            *)         tar -czf "${name}.tar.gz" "${name}"; asset="${name}.tar.gz" ;;
+          esac
+          if command -v sha256sum > /dev/null; then sha256sum "$asset" > "${asset}.sha256"; else shasum -a 256 "$asset" > "${asset}.sha256"; fi
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+          # the raw Linux binaries also feed the container image
+          case "${{ matrix.name }}" in
+            linux-x86_64)  mkdir -p "raw/linux-amd64" && cp "${name}/indexio" raw/linux-amd64/ ;;
+            linux-aarch64) mkdir -p "raw/linux-arm64" && cp "${name}/indexio" raw/linux-arm64/ ;;
+          esac
+
+      - name: Attach to the release
+        shell: bash
+        run: gh release upload "$TAG" "dist/${ASSET}" "dist/${ASSET}.sha256" --clobber
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(matrix.name, 'linux-')
+        with:
+          name: raw-${{ matrix.name }}
+          path: dist/raw
+          if-no-files-found: error
+
+  docker:
+    needs: [release, binaries]
+    if: needs.release.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Image name
+        id: img
+        run: echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/indexio" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.image }}:${{ needs.release.outputs.version }}
+            ${{ steps.img.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+  npm:
+    needs: [release, binaries]
+    if: needs.release.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - name: Skip without NPM_TOKEN
+        if: env.HAS_NPM_TOKEN != 'true'
+        run: echo "NPM_TOKEN secret not set; the npm package is not published"
+
+      - uses: actions/setup-node@v4
+        if: env.HAS_NPM_TOKEN == 'true'
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish
+        if: env.HAS_NPM_TOKEN == 'true'
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          INDEXIO_SKIP_DOWNLOAD: "1"
+        run: |
+          npm version --no-git-tag-version "${{ needs.release.outputs.version }}"
+          npm publish --access public

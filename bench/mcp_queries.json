@@ -1,0 +1,6 @@
+[
+ {"lexical": "Command::new", "hybrid": "how are sidecar python processes started"},
+ {"lexical": "fn handle_request", "hybrid": "where is the oauth token refreshed"},
+ {"lexical": "/async fn \\w+_job/", "hybrid": "how does the coordinator accept or reject a plan"},
+ {"lexical": "tokio::spawn lang:rust", "hybrid": "rate limiting for outbound http requests"}
+]

@@ -1,0 +1,122 @@
+[
+  {
+    "q": "How does ripgrep search inside gzip, bzip2 or zstd archives?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/cli/src/decompress.rs",
+    "why": "DecompressionMatcherBuilder maps extension globs (*.gz, *.zst, ...) to external filter binaries spawned via CommandReader, whose stdout is then searched."
+  },
+  {
+    "q": "How does ripgrep detect binary data while streaming a file and decide whether to quit or convert it?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/searcher/src/line_buffer.rs",
+    "why": "LineBuffer::fill scans each freshly read chunk for the configured binary byte (NUL) and implements BinaryDetection::{Quit,Convert} with binary_byte_offset tracking."
+  },
+  {
+    "q": "Where is parallel directory traversal with worker threads implemented?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/ignore/src/walk.rs",
+    "why": "WalkParallel drives crossbeam_deque Worker/Stealer threads over walkdir, each carrying a per-directory Ignore stack."
+  },
+  {
+    "q": "How are capture group references like $1 or $name expanded when replacing matched text?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/matcher/src/interpolate.rs",
+    "why": "interpolate() scans the replacement for $N/${name} references via find_cap_ref and appends the resolved capture text to the destination buffer."
+  },
+  {
+    "q": "How does ripgrep search files encoded in UTF-16 or carrying a byte-order mark?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/searcher/src/searcher/mod.rs",
+    "why": "The searcher Config's encoding/bom_sniffing options drive encoding_rs_io::DecodeReaderBytesBuilder to transcode input to UTF-8 before matching."
+  },
+  {
+    "q": "Where is the human-readable match output with colors, headings and context lines produced?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/printer/src/standard.rs",
+    "why": "The Standard printer's Sink impl writes colored path/line-number headers plus match and before/after context blocks using termcolor."
+  },
+  {
+    "q": "What rejects a regex that is capable of matching the line terminator byte?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/regex/src/ban.rs",
+    "why": "ban::check recursively walks the pattern HIR and returns ErrorKind::Banned when any sub-expression must match the forbidden byte (called from config.rs)."
+  },
+  {
+    "q": "How does ripgrep decide which directory entries are actually worth searching?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/core/haystack.rs",
+    "why": "HaystackBuilder filters walk results by file type / stdin / explicit-argument status and yields a Haystack only for searchable entries."
+  },
+  {
+    "q": "Where is the code that generates the Deserialize implementation for user structs and enums?",
+    "repo": "serde",
+    "path_suffix": "serde_derive/src/de.rs",
+    "why": "expand_derive_deserialize builds the impl TokenStream from the Container AST, dispatching bodies to the struct_/tuple/enum_* submodules."
+  },
+  {
+    "q": "How are #[serde(...)] attributes on containers, variants and fields parsed during macro expansion?",
+    "repo": "serde",
+    "path_suffix": "serde_derive/src/internals/attr.rs",
+    "why": "Module docs state this module parses #[serde(...)] attributes via Container/Variant/Field::from_ast, accumulating every malformed attribute error in Ctxt."
+  },
+  {
+    "q": "What lets serde efficiently discard data it does not care about during deserialization?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/de/ignored_any.rs",
+    "why": "IgnoredAny implements Deserialize/Visitor for any input while storing nothing, used to skip unknown fields and unwanted sequence elements."
+  },
+  {
+    "q": "How does serde buffer arbitrary input values to support untagged enum deserialization?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/private/content.rs",
+    "why": "The hidden Content enum buffers an entire Deserializer's data so generated code can retry variants for untagged and internally tagged enums."
+  },
+  {
+    "q": "How does ripgrep test thousands of `*.rs`-style wildcard patterns against a file path without running a full regex for each one?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/globset/src/glob.rs",
+    "why": "MatchStrategy::new classifies each parsed pattern as Literal/BasenameLiteral/Extension/Prefix/Suffix/RequiredExtension so matching can use hash-table lookups, falling back to Regex only when necessary; Glob also stores the tokenized pattern and its compiled regex equivalent."
+  },
+  {
+    "q": "How does ripgrep avoid running the full automaton on every line by first hunting for short mandatory byte sequences?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/regex/src/literal.rs",
+    "why": "InnerLiterals::new extracts an inner literal Seq from the pattern HIR (skipping when no line terminator is set or the regex is already accelerated) so a fast vectorized substring scan finds candidate lines and the slow engine only runs on those lines."
+  },
+  {
+    "q": "How can a type be written straight into a Formatter through its Display implementation, without serde building an intermediate String?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/ser/fmt.rs",
+    "why": "Serializer is implemented for &mut fmt::Formatter: primitives and unit variants forward to Display::fmt via the fmt_primitives! macro while compound types return Impossible errors, backing Serializer::collect_str."
+  },
+  {
+    "q": "How does serde know how to deserialize tuples, Option, primitives and standard collections when no derive macro is involved?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/de/impls.rs",
+    "why": "This module hand-writes Deserialize impls for (), bool, numbers, Option, tuples (via TupleVisitor) and maps/sequences, each pairing a small Visitor with the matching deserialize_* call on the Deserializer."
+  },
+  {
+    "q": "Where is the RegexMatcherBuilder for the PCRE2 engine, and how does it implement smart case and --fixed-strings?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/pcre2/src/matcher.rs",
+    "why": "pcre2's RegexMatcherBuilder::build_many joins patterns, escapes them when fixed_strings is set, enables caseless matching when case_smart and no uppercase literal is present, wraps whole_line/word variants, and records capture names in RegexMatcher."
+  },
+  {
+    "q": "Where is OverrideBuilder and how do -g/--glob whitelist patterns get inverted into ignore semantics?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/ignore/src/overrides.rs",
+    "why": "Override wraps a Gitignore built by OverrideBuilder; because whitelist globs mean 'only search these', matched() reports non-matches as ignored (UnmatchedIgnore) and swaps num_ignores/num_whitelists."
+  },
+  {
+    "q": "Where is FlatMapDeserializer and how does it make #[serde(flatten)] work at runtime?",
+    "repo": "serde",
+    "path_suffix": "serde/src/private/de.rs",
+    "why": "FlatMapDeserializer replays buffered key-value pairs into flattened fields (entries nulled out as claimed), while missing_field and the TaggedContentVisitor/UntaggedUnitVisitor helpers here support derive-generated code."
+  },
+  {
+    "q": "Where does serde define `impl Serialize for Option<T>` and the Serialize impls for primitives, str and collections?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/ser/impls.rs",
+    "why": "The primitive_impl! macro forwards each number/bool/char to the matching Serializer::serialize_* method, and hand-written impls for Option, str, String, slices and Vec delegate to serialize_str/serialize_seq and friends."
+  }
+]

@@ -1,0 +1,74 @@
+[
+  {
+    "q": "How does ripgrep search inside gzip, bzip2 or zstd archives?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/cli/src/decompress.rs",
+    "why": "DecompressionMatcherBuilder maps extension globs (*.gz, *.zst, ...) to external filter binaries spawned via CommandReader, whose stdout is then searched."
+  },
+  {
+    "q": "How does ripgrep detect binary data while streaming a file and decide whether to quit or convert it?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/searcher/src/line_buffer.rs",
+    "why": "LineBuffer::fill scans each freshly read chunk for the configured binary byte (NUL) and implements BinaryDetection::{Quit,Convert} with binary_byte_offset tracking."
+  },
+  {
+    "q": "Where is parallel directory traversal with worker threads implemented?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/ignore/src/walk.rs",
+    "why": "WalkParallel drives crossbeam_deque Worker/Stealer threads over walkdir, each carrying a per-directory Ignore stack."
+  },
+  {
+    "q": "How are capture group references like $1 or $name expanded when replacing matched text?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/matcher/src/interpolate.rs",
+    "why": "interpolate() scans the replacement for $N/${name} references via find_cap_ref and appends the resolved capture text to the destination buffer."
+  },
+  {
+    "q": "How does ripgrep search files encoded in UTF-16 or carrying a byte-order mark?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/searcher/src/searcher/mod.rs",
+    "why": "The searcher Config's encoding/bom_sniffing options drive encoding_rs_io::DecodeReaderBytesBuilder to transcode input to UTF-8 before matching."
+  },
+  {
+    "q": "Where is the human-readable match output with colors, headings and context lines produced?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/printer/src/standard.rs",
+    "why": "The Standard printer's Sink impl writes colored path/line-number headers plus match and before/after context blocks using termcolor."
+  },
+  {
+    "q": "What rejects a regex that is capable of matching the line terminator byte?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/regex/src/ban.rs",
+    "why": "ban::check recursively walks the pattern HIR and returns ErrorKind::Banned when any sub-expression must match the forbidden byte (called from config.rs)."
+  },
+  {
+    "q": "How does ripgrep decide which directory entries are actually worth searching?",
+    "repo": "ripgrep",
+    "path_suffix": "crates/core/haystack.rs",
+    "why": "HaystackBuilder filters walk results by file type / stdin / explicit-argument status and yields a Haystack only for searchable entries."
+  },
+  {
+    "q": "Where is the code that generates the Deserialize implementation for user structs and enums?",
+    "repo": "serde",
+    "path_suffix": "serde_derive/src/de.rs",
+    "why": "expand_derive_deserialize builds the impl TokenStream from the Container AST, dispatching bodies to the struct_/tuple/enum_* submodules."
+  },
+  {
+    "q": "How are #[serde(...)] attributes on containers, variants and fields parsed during macro expansion?",
+    "repo": "serde",
+    "path_suffix": "serde_derive/src/internals/attr.rs",
+    "why": "Module docs state this module parses #[serde(...)] attributes via Container/Variant/Field::from_ast, accumulating every malformed attribute error in Ctxt."
+  },
+  {
+    "q": "What lets serde efficiently discard data it does not care about during deserialization?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/de/ignored_any.rs",
+    "why": "IgnoredAny implements Deserialize/Visitor for any input while storing nothing, used to skip unknown fields and unwanted sequence elements."
+  },
+  {
+    "q": "How does serde buffer arbitrary input values to support untagged enum deserialization?",
+    "repo": "serde",
+    "path_suffix": "serde_core/src/private/content.rs",
+    "why": "The hidden Content enum buffers an entire Deserializer's data so generated code can retry variants for untagged and internally tagged enums."
+  }
+]

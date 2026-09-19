@@ -1,0 +1,49 @@
+# indexio as a service: the HTTP API plus a sync loop that keeps every
+# mounted source fresh. Put the folders (or a checkout root) you want
+# indexed under ./repos, or change the bind mount.
+#
+#   INDEXIO_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up -d
+#   docker compose exec sync indexio add /repos          # first-time index
+#   curl -H "Authorization: Bearer $INDEXIO_AUTH_TOKEN" \
+#        'http://127.0.0.1:7717/search?q=auth%20token%20refresh&mode=hybrid'
+#
+# Optional neural embeddings / reranking: set INDEXIO_EMBED_BASE and
+# INDEXIO_RERANK_BASE in the environment (see README).
+
+services:
+  indexio:
+    image: ghcr.io/ioserviceslabs/indexio:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7717:7717"
+    environment:
+      INDEXIO_AUTH_TOKEN: ${INDEXIO_AUTH_TOKEN:?set INDEXIO_AUTH_TOKEN}
+      INDEXIO_EMBED_BASE: ${INDEXIO_EMBED_BASE:-}
+      INDEXIO_EMBED_MODEL: ${INDEXIO_EMBED_MODEL:-}
+      INDEXIO_EMBED_DIM: ${INDEXIO_EMBED_DIM:-}
+      INDEXIO_RERANK_BASE: ${INDEXIO_RERANK_BASE:-}
+      INDEXIO_RERANK_MODEL: ${INDEXIO_RERANK_MODEL:-}
+    volumes:
+      - indexio-data:/data
+      - ./repos:/repos:ro
+
+  sync:
+    image: ghcr.io/ioserviceslabs/indexio:latest
+    build: .
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    # every 15 minutes: pull, discover, delta re-index, embed what changed
+    command: ["while true; do indexio sync || true; sleep ${INDEXIO_SYNC_SECONDS:-900}; done"]
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AZDO_TOKEN: ${AZDO_TOKEN:-}
+      INDEXIO_EMBED_BASE: ${INDEXIO_EMBED_BASE:-}
+      INDEXIO_EMBED_MODEL: ${INDEXIO_EMBED_MODEL:-}
+      INDEXIO_EMBED_DIM: ${INDEXIO_EMBED_DIM:-}
+    volumes:
+      - indexio-data:/data
+      - ./repos:/repos:ro
+
+volumes:
+  indexio-data:

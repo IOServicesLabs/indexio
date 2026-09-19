@@ -1,0 +1,26 @@
+[package]
+name = "indexio-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Query planner, ranking, fusion and impact analysis for indexio"
+
+[dependencies]
+indexio-types = { workspace = true }
+indexio-core = { workspace = true }
+indexio-index = { workspace = true }
+indexio-embed = { workspace = true }
+indexio-symbols = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+roaring = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

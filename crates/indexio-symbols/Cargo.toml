@@ -1,0 +1,22 @@
+[package]
+name = "indexio-symbols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "tree-sitter symbols, call edges and chunking for indexio"
+
+[dependencies]
+indexio-types = { workspace = true }
+tree-sitter = { workspace = true }
+streaming-iterator = "0.1"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-cpp = "0.23"
+tracing = { workspace = true }
+serde = { workspace = true }

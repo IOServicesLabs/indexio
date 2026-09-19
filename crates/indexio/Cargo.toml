@@ -1,0 +1,35 @@
+[package]
+name = "indexio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Code search, impact analysis and MCP server for AI coding agents"
+
+[[bin]]
+name = "indexio"
+path = "src/main.rs"
+
+[dependencies]
+indexio-types = { workspace = true }
+indexio-core = { workspace = true }
+indexio-index = { workspace = true }
+indexio-ingest = { workspace = true }
+indexio-query = { workspace = true }
+indexio-embed = { workspace = true }
+indexio-symbols = { workspace = true }
+notify = "8.2"
+clap = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

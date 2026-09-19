@@ -1,0 +1,26 @@
+# The published image (ghcr.io/ioserviceslabs/indexio): the runtime layer of
+# ./Dockerfile around a binary that the release workflow already built, so
+# the multi-arch image assembles in seconds instead of compiling twice.
+#
+#   dist/linux-amd64/indexio and dist/linux-arm64/indexio must exist:
+#   docker buildx build -f Dockerfile.release --platform linux/amd64,linux/arm64 .
+#
+# For a local build from source use ./Dockerfile.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 indexio \
+    && mkdir -p /data && chown indexio:indexio /data
+COPY dist/linux-${TARGETARCH}/indexio /usr/local/bin/indexio
+RUN chmod 755 /usr/local/bin/indexio
+USER indexio
+ENV INDEXIO_DATA_DIR=/data \
+    INDEXIO_BIND=0.0.0.0
+VOLUME ["/data"]
+EXPOSE 7717
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
+    CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7717 && printf 'GET /health HTTP/1.0\r\n\r\n' >&3 && head -c 12 <&3 | grep -q 200"]
+ENTRYPOINT ["/usr/bin/tini", "--", "indexio"]
+CMD ["serve", "--port", "7717"]

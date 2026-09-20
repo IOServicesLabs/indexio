@@ -625,7 +625,18 @@ the first span of a version is charged the whole file, a repeat span of the same
 version nothing, and a span after the file changed the whole file again. Compactions and
 re-indexes of unchanged content keep the id.
 
-## 35. Next
+## 35. Other repos are folded behind the session's repo
+
+A swarm building one project on a machine that also holds an older copy of it got every
+`code_grep` and lexical `code_search` answer twice: the copy's files carried the same
+identifiers, and the built-in Grep it replaces would have searched one folder. Measured
+against that baseline the answers were 20–40 % larger, one of them 3.9 KB against 246
+bytes. When the session's repo has hits, other repos now contribute at most three rows
+(the best-ranked, one file each) and the rest is a count: `+7 more in 2 other repos
+(pass repo: to search one)`. Without a session repo, or when it has no hits, every repo
+is listed as before, so a cross-repo lookup still works.
+
+## 36. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

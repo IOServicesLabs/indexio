@@ -1565,15 +1565,17 @@ fn call_tool(
                         }
                     }
                     *baseline = Some(grep_baseline(&res.hits, current));
-                    if wants_sessions(q) {
+                    let folded = if wants_sessions(q) {
                         res.hits.truncate(limit);
+                        Folded::default()
                     } else {
-                        prefer_repo(&mut res.hits, current, limit);
-                    }
+                        fold_other_repos(&mut res.hits, current, limit, OTHER_REPO_ROWS)
+                    };
                     if as_regex {
                         if text {
                             let mut out = String::from("no literal match; treated as a regex:\n");
                             out.push_str(&mcp_text::hits(&res.hits, true, res.truncated, "hits"));
+                            out.push_str(&folded.note());
                             return Ok(plain_result(out));
                         }
                         let mut v = crate::serve::search_result_to_json(&res);
@@ -1614,7 +1616,9 @@ fn call_tool(
                         }
                     }
                     if text {
-                        return Ok(plain_result(mcp_text::hits(&res.hits, true, res.truncated, "hits")));
+                        let mut out = mcp_text::hits(&res.hits, true, res.truncated, "hits");
+                        out.push_str(&folded.note());
+                        return Ok(plain_result(out));
                     }
                     Ok(text_result(crate::serve::search_result_to_json(&res)))
                 }
@@ -1704,9 +1708,9 @@ fn call_tool(
             };
             let mut res = engine.search_lines(&query, fetch(limit), lines);
             *baseline = Some(grep_baseline(&res.hits, current));
-            prefer_repo(&mut res.hits, current, limit);
+            let folded = fold_other_repos(&mut res.hits, current, limit, OTHER_REPO_ROWS);
             if text {
-                let body = mcp_text::hits(&res.hits, true, res.truncated, "matches");
+                let body = mcp_text::hits(&res.hits, true, res.truncated, "matches") + &folded.note();
                 return Ok(plain_result(match note {
                     Some(n) => format!("{n}{body}"),
                     None => body,
@@ -2012,13 +2016,69 @@ fn call_tool(
 /// code lookups — a symbol name occurs in every transcript that touched
 /// it), then truncate to `limit`.
 fn prefer_repo(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&str>, limit: usize) {
+    fold_other_repos(hits, current, limit, usize::MAX);
+}
+
+/// Other repos' rows kept in a grep-like answer once the session's own
+/// repo has hits (SPEC-P10 §35): a name that occurs in a sibling checkout
+/// or a copied project is shown once per file there, not in full.
+const OTHER_REPO_ROWS: usize = 3;
+
+/// What [`fold_other_repos`] left out: rows of other repos beyond the
+/// allowance, and how many repos they came from.
+#[derive(Default)]
+struct Folded {
+    rows: usize,
+    repos: usize,
+}
+
+impl Folded {
+    /// The trailer for a text answer; empty when nothing was folded.
+    fn note(&self) -> String {
+        if self.rows == 0 {
+            return String::new();
+        }
+        format!(
+            "\n+{} more in {} other repo{} (pass repo: to search one)",
+            self.rows,
+            self.repos,
+            if self.repos == 1 { "" } else { "s" }
+        )
+    }
+}
+
+/// [`prefer_repo`] with an allowance for other repos' rows: when the
+/// session's repo has hits, at most `keep` rows of other repos follow
+/// (the best-ranked ones, one file each where possible) and the rest is
+/// counted. Without a session repo, or when it has no hits, every repo is
+/// listed as before.
+fn fold_other_repos(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&str>, limit: usize, keep: usize) -> Folded {
     hits.retain(|h| h.repo != crate::sessions::REPO);
+    let mut folded = Folded::default();
     if let Some(cur) = current {
         let (mut here, rest): (Vec<_>, Vec<_>) = std::mem::take(hits).into_iter().partition(|h| h.repo == cur);
-        here.extend(rest);
+        if here.is_empty() || keep == usize::MAX {
+            here.extend(rest);
+        } else {
+            // one row per file first, so the allowance shows breadth
+            let mut seen_files: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            let mut kept: Vec<indexio_types::SearchHit> = Vec::new();
+            let mut left: Vec<indexio_types::SearchHit> = Vec::new();
+            for h in rest {
+                if kept.len() < keep && seen_files.insert((h.repo.clone(), h.path.clone())) {
+                    kept.push(h);
+                } else {
+                    left.push(h);
+                }
+            }
+            folded.rows = left.len();
+            folded.repos = left.iter().map(|h| h.repo.as_str()).collect::<std::collections::HashSet<_>>().len();
+            here.extend(kept);
+        }
         *hits = here;
     }
     hits.truncate(limit);
+    folded
 }
 
 /// Days of the usage log `index_stats` summarises.
@@ -2550,6 +2610,43 @@ mod tests {
         let whole2 = crate::usage::read_bytes(&e2.file_content("alpha", "src/foo.rs").unwrap());
         assert_eq!(span(&e2, &seen), Some(whole2), "changed file: read again");
         assert_eq!(span(&e2, &seen), Some(0));
+    }
+
+    /// SPEC-P10 §35: once the session's repo has hits, other repos get a
+    /// few rows and a count, not the full list (a copied project next door
+    /// doubled every grep answer).
+    #[test]
+    fn grep_answers_fold_other_repos_behind_the_session_repo() {
+        let (tmp, _e) = fixture_engine();
+        let shards = tmp.path().join("shards");
+        // a sibling checkout: the same identifier in six files
+        let docs: Vec<Doc> = (0..6)
+            .map(|i| (format!("copy/f{i}.rs"), "fn other() {\n    foo_bar_123(1);\n}\n".to_string(), vec![], vec![]))
+            .map(|(p, c, s, k)| (Box::leak(p.into_boxed_str()) as &str, Box::leak(c.into_boxed_str()) as &str, s, k))
+            .collect();
+        write_shard(&shards, &docs, &["beta".to_string()]);
+        let e = Engine::open(tmp.path()).unwrap();
+        let seen: ReadSeen = Mutex::new(HashMap::new());
+        let grep = |current: Option<&str>| {
+            let mut baseline = None;
+            let args = json!({"pattern": "foo_bar_123"});
+            let v = call_tool(&e, &hash_emb(), &rr(), "code_grep", &args, OutputFormat::Text, current, &seen, &mut baseline).unwrap();
+            v["content"][0]["text"].as_str().unwrap().to_string()
+        };
+        // in alpha: its two files first, then at most three beta rows and the count
+        let t = grep(Some("alpha"));
+        let beta_rows = t.lines().filter(|l| l.starts_with("beta:")).count();
+        assert!(t.starts_with("alpha:"), "{t}");
+        assert_eq!(beta_rows, 3, "{t}");
+        assert!(t.trim_end().ends_with("+3 more in 1 other repo (pass repo: to search one)"), "{t}");
+        // no session repo: everything is listed, no note
+        let t = grep(None);
+        assert_eq!(t.lines().filter(|l| l.starts_with("beta:")).count(), 6, "{t}");
+        assert!(!t.contains("more in"), "{t}");
+        // a session repo without hits: the others are listed in full
+        let t = grep(Some("gamma"));
+        assert_eq!(t.lines().filter(|l| l.starts_with("beta:")).count(), 6, "{t}");
+        assert!(!t.contains("more in"), "{t}");
     }
 
     #[test]

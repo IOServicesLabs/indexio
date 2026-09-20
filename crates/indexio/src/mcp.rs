@@ -17,7 +17,7 @@
 //! and ACLs live only in `indexio serve`. Do not expose this handler over a
 //! network transport.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -144,10 +144,15 @@ pub struct McpServer {
     /// Files this session has already been charged a whole-file read for
     /// (SPEC-P10 §22): only the first `read_span` of a file is measured
     /// against the harness reading it whole.
-    read_seen: Mutex<HashSet<(String, String)>>,
+    read_seen: Mutex<HashMap<(String, String), [u8; 16]>>,
 }
 
-type ReadSeen = Mutex<HashSet<(String, String)>>;
+/// The files this session has read by span, with the content id it read:
+/// the whole-file `Read` baseline is charged on the first span of a file
+/// and again whenever the file changed since (an agent re-reads a file it
+/// edited, so a session that keeps coming back to the same files is not
+/// scored as if the harness had read them once).
+type ReadSeen = Mutex<HashMap<(String, String), [u8; 16]>>;
 
 /// How often the running server re-imports session transcripts.
 const SESSIONS_IMPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
@@ -226,7 +231,7 @@ impl McpServer {
             stale_noted: AtomicBool::new(false),
             sync_last: Mutex::new(None),
             sync_busy: Arc::new(AtomicBool::new(false)),
-            read_seen: Mutex::new(HashSet::new()),
+            read_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1980,10 +1985,11 @@ fn call_tool(
             let (body, last) = engine
                 .read_span(repo, path, start as u32, end as u32)
                 .ok_or_else(|| not_indexed(engine, repo, path))?;
-            // the harness would have read the whole file — once
+            // the harness would have read the whole file: once per version
+            let version = engine.file_version(repo, path).unwrap_or([0; 16]);
             let first = read_seen
                 .lock()
-                .map(|mut s| s.insert((repo.to_string(), path.to_string())))
+                .map(|mut s| s.insert((repo.to_string(), path.to_string()), version) != Some(version))
                 .unwrap_or(false);
             *baseline = Some(if first {
                 engine.file_content(repo, path).map_or(0, |c| crate::usage::read_bytes(&c))
@@ -2514,6 +2520,36 @@ mod tests {
             serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["doc_count"], 2);
         assert_eq!(payload["repos"], json!(["alpha"]));
+    }
+
+    /// SPEC-P10 §22/§33: the whole-file Read baseline of `read_span` is
+    /// charged on the first span of a file and again once the file changed,
+    /// never for a repeat span of the same version.
+    #[test]
+    fn read_span_baseline_is_charged_once_per_file_version() {
+        let (tmp, e) = fixture_engine();
+        let seen: ReadSeen = Mutex::new(HashMap::new());
+        let span = |e: &Engine, seen: &ReadSeen| {
+            let mut baseline = None;
+            let args = json!({"repo": "alpha", "path": "src/foo.rs", "start": 1, "end": 1});
+            call_tool(e, &hash_emb(), &rr(), "read_span", &args, OutputFormat::Json, None, seen, &mut baseline).unwrap();
+            baseline
+        };
+        let whole = crate::usage::read_bytes(&e.file_content("alpha", "src/foo.rs").unwrap());
+        assert!(whole > 0);
+        assert_eq!(span(&e, &seen), Some(whole), "first span: the harness would have read the file");
+        assert_eq!(span(&e, &seen), Some(0), "same version again: nothing new to charge");
+
+        // the file changes (a later shard shadows the doc): charged again
+        write_shard(
+            &tmp.path().join("shards"),
+            &[("src/foo.rs", "fn foo_bar_123(x: u32) -> u32 {\n    helper(x + 1)\n}\n", vec![], vec![])],
+            &["alpha".to_string()],
+        );
+        let e2 = Engine::open(tmp.path()).unwrap();
+        let whole2 = crate::usage::read_bytes(&e2.file_content("alpha", "src/foo.rs").unwrap());
+        assert_eq!(span(&e2, &seen), Some(whole2), "changed file: read again");
+        assert_eq!(span(&e2, &seen), Some(0));
     }
 
     #[test]

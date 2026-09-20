@@ -614,7 +614,18 @@ indexed paths of that repo with the same file name (else the same stem, up to fi
   `file_outline` then `read_span` when there is no literal. A one-liner that writes,
   spawns or opens a variable path runs as typed.
 
-## 34. Next
+## 34. The Read baseline follows the file's version
+
+§22 charged the whole-file `Read` once per file per session, so a session that came
+back to the same files hour after hour (crewos: +40 % in its second day, −50 % overall)
+was scored as if the harness had read each file once and remembered it. The harness
+does not: an agent re-reads a file after editing it, and again after a compaction. The
+baseline now keys on the file's content id (`Engine::file_version`, the doc's blob):
+the first span of a version is charged the whole file, a repeat span of the same
+version nothing, and a span after the file changed the whole file again. Compactions and
+re-indexes of unchanged content keep the id.
+
+## 35. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

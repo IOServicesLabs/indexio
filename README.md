@@ -314,7 +314,7 @@ mechanical equivalent, the server also logs what that tool would have returned:
 
 | Call | Built-in equivalent |
 |---|---|
-| `read_span` | `Read` of the whole file, charged once per file per session |
+| `read_span` | `Read` of the whole file, charged once per file version: again after the file changes |
 | `find_symbol`, `who_calls`, `code_grep`, lexical `code_search` | `Grep` in the session's repository, first 250 rows |
 | `list_files` | `Glob` as absolute paths |
 | `file_outline` | None. Counted as cost. |

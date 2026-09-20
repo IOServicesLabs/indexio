@@ -716,6 +716,14 @@ impl Engine {
             .map(|it| (it.start_line, it.end_line))
     }
 
+    /// The content id of one indexed file: the same bytes give the same id
+    /// across re-indexes and compactions, a change gives a new one. `None`
+    /// when the file is not indexed.
+    pub fn file_version(&self, repo: &str, path: &str) -> Option<[u8; 16]> {
+        let (si, docid) = self.locate_doc(repo, path)?;
+        self.set.doc(si, docid).map(|dm| dm.blob.0)
+    }
+
     /// The raw bytes of one indexed file (`None` when it is not indexed):
     /// what a whole-file read would have returned (SPEC-P10 §22).
     pub fn file_content(&self, repo: &str, path: &str) -> Option<Vec<u8>> {

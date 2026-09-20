@@ -246,7 +246,7 @@ This writes three Claude Code hooks into `~/.claude/settings.json`:
 
 | Hook | Effect |
 |---|---|
-| PreToolUse, Bash | A shell read or search of an indexed file (`cat`, `sed -n`, `head`, `grep`, `rg`, `find`) is refused. The refusal names the indexio call that gives the same result. A command that also does other work, for example a script or a build, runs as typed. |
+| PreToolUse, Bash | A shell read or search of an indexed file (`cat`, `sed -n`, `head`, `grep`, `rg`, `find`, a `python -c` or `node -e` one-liner that only opens the file) is refused. The refusal names the indexio call that gives the same result. A command that also does other work, for example a script or a build, runs as typed. |
 | PreToolUse, Read | A whole-file Read of an indexed file is refused. The refusal names `file_outline` and `read_span`. |
 | PreCompact | Session transcripts are imported for the `recall` tool. |
 

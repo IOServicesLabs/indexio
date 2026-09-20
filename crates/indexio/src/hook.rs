@@ -416,6 +416,88 @@ const LOOKUP_OR_HARMLESS: &[&str] = &[
     "type", "test", "[", "xargs", "tee",
 ];
 
+/// The inline code of an interpreter one-liner: `python [flags] -c CODE`,
+/// `node -e CODE` / `-p CODE`, `ruby -e`, `perl -e`, `php -r`. `None` for
+/// a script file or a REPL.
+fn one_liner_code(w: &[String]) -> Option<&str> {
+    let head = w.first()?;
+    let base = head.rsplit(['/', '\\']).next().unwrap_or(head).trim_end_matches(".exe");
+    let flags: &[&str] = if base.starts_with("python") || base == "py" {
+        &["-c"]
+    } else if base == "node" || base == "deno" || base == "bun" {
+        &["-e", "-p", "--eval", "--print"]
+    } else if base == "ruby" || base == "perl" {
+        &["-e", "-E"]
+    } else if base == "php" {
+        &["-r"]
+    } else {
+        return None;
+    };
+    // the code follows the first such flag; everything before it is flags
+    let i = w[1..].iter().position(|a| flags.contains(&a.as_str()))? + 1;
+    if w[1..i].iter().any(|a| !a.starts_with('-') && !["utf8", "utf-8"].contains(&a.as_str())) {
+        return None; // a script file came first
+    }
+    w.get(i + 1).map(String::as_str)
+}
+
+/// The first string literal after `marker` in `code` (`open(r'…'`,
+/// `readFileSync("…"`, `.find('…'`): raw/byte prefixes skipped, escapes
+/// left as they are.
+fn literal_after(code: &str, marker: &str) -> Option<String> {
+    let start = code.find(marker)? + marker.len();
+    let rest = code[start..].trim_start_matches([' ', 'r', 'b', 'R', 'B', 'u', 'f']);
+    let q = rest.chars().next()?;
+    if q != '\'' && q != '"' {
+        return None;
+    }
+    let body = &rest[1..];
+    let end = body.find(q)?;
+    Some(body[..end].to_string())
+}
+
+/// A one-liner that opens a file to print part of it is a read in
+/// disguise (seen after the `cat`/`sed` denials: `python -X utf8 -c
+/// "src=open(r'…/lib.rs').read(); i=src.find('\"goto\" =>'); print(src[i:i+3000])"`).
+/// `Some((path, needle))` when the code only reads: the file it opens and
+/// the literal it looks for, if any. Anything that writes, spawns or edits
+/// is left to the shell.
+fn script_read(stage: &str) -> Option<(String, Option<String>)> {
+    let w = words(stage);
+    let code = one_liner_code(&w)?;
+    const WRITES: &[&str] = &[
+        ".write(", "writeFileSync", "writeFile(", "appendFile", "os.remove", "os.rename", "os.unlink", "shutil",
+        "subprocess", "os.system", "mkdir", "rmtree", "unlinkSync", "renameSync", "child_process", "'w'", "\"w\"",
+        "'a'", "\"a\"", "'w+'", "\"w+\"", "'r+'", "\"r+\"", "'wb'", "\"wb\"",
+    ];
+    if WRITES.iter().any(|m| code.contains(m)) {
+        return None;
+    }
+    let path = ["open(", "readFileSync(", "readFile(", "Path(", "read_text("]
+        .iter()
+        .find_map(|m| literal_after(code, m))?;
+    if path.is_empty() || path.contains('*') {
+        return None;
+    }
+    let needle = [".find(", ".index(", ".rfind(", ".indexOf(", "re.search(", ".search(", "re.finditer(", "re.findall("]
+        .iter()
+        .find_map(|m| literal_after(code, m))
+        .filter(|n| !n.trim().is_empty());
+    Some((path, needle))
+}
+
+/// `needle` as a `code_grep` pattern: every regex metacharacter escaped.
+fn grep_literal(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 8);
+    for c in needle.chars() {
+        if "\\^$.*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Whether this pipeline is work the shell has to do (SPEC-P10 §26). A
 /// call that contains such work is allowed whole even when another of its
 /// pipelines is a servable lookup: denying it made the model re-run the
@@ -437,6 +519,9 @@ fn is_other_work(pipeline: &[String]) -> bool {
     }
     if cmd == "sed" && args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
         return true;
+    }
+    if script_read(first).is_some() {
+        return false; // a one-liner that only opens a file to print it
     }
     !cmd.is_empty() && !LOOKUP_OR_HARMLESS.contains(&cmd)
 }
@@ -631,6 +716,28 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                 return Some(format!(
                     "Indexed files: use {call} instead (every matching line per file, ranked, current with your edits{ctx})"
                 ));
+            }
+            "python" | "python3" | "py" | "node" | "deno" | "bun" | "ruby" | "perl" | "php" => {
+                let Some((path, needle)) = script_read(first) else { continue };
+                let abs = resolve(&cwd, &path);
+                if !abs.is_file() {
+                    continue;
+                }
+                let Some((repo, rel)) = locate(&repos, &abs) else { continue };
+                if !indexed(&repo, &rel) {
+                    continue;
+                }
+                freshen(data_dir, &repo);
+                let call = match needle {
+                    Some(n) => format!(
+                        "mcp__indexio__code_grep {{pattern:\"{}\", repo:\"{repo}\", path:\"{rel}\"}} then read_span {{repo, path, start:line, end:line+60}}",
+                        grep_literal(&n).replace('"', "\\\"")
+                    ),
+                    None => format!(
+                        "mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need"
+                    ),
+                };
+                return Some(format!("{path} is indexed: use {call} instead of a script that opens it (numbered, fresh)"));
             }
             "find" => {
                 let pos = positional(args);
@@ -895,8 +1002,9 @@ pub fn runner_rewrite(exe: &Path, command: &str) -> Option<String> {
     if !RUNNERS.contains(&base) {
         return None;
     }
-    // `python -c '…'` and REPL-style one-liners print little: leave them
-    if base.starts_with("python") && w.get(1).is_some_and(|a| a == "-c") {
+    // `python [-X utf8] -c '…'`, `node -e` and other one-liners print what
+    // they were asked for: leave them (a read-only one is judge's business)
+    if one_liner_code(&w).is_some() {
         return None;
     }
     let prefix = if cds.is_empty() {
@@ -973,6 +1081,43 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_liners_are_recognised_with_any_flag_order() {
+        let w = |s: &str| words(s);
+        assert_eq!(one_liner_code(&w("python -c 'print(1)'")), Some("print(1)"));
+        assert_eq!(one_liner_code(&w("python -X utf8 -c \"x=1\"")), Some("x=1"));
+        assert_eq!(one_liner_code(&w("python3 -u -c 'x'")), Some("x"));
+        assert_eq!(one_liner_code(&w("node -e 'console.log(1)'")), Some("console.log(1)"));
+        assert_eq!(one_liner_code(&w("python scripts/probe.py -c")), None, "a script file");
+        assert_eq!(one_liner_code(&w("python -m pytest -c x")), None);
+        assert_eq!(one_liner_code(&w("cargo build")), None);
+        // and the runner rewrite leaves them alone
+        let rw = |c: &str| runner_rewrite(Path::new("C:/Users/x/.cargo/bin/indexio.exe"), c);
+        assert_eq!(rw("python -X utf8 -c \"print(open('a').read())\""), None);
+    }
+
+    #[test]
+    fn read_only_one_liners_are_reads_in_disguise() {
+        let stage = "python -X utf8 -c \"\nsrc=open(r'C:/x/crates/se-serve/src/lib.rs',encoding='utf-8').read()\ni=src.find('\\\"goto\\\" =>')\nprint(src[i:i+3000])\n\"";
+        let (path, needle) = script_read(stage).expect("a read");
+        assert_eq!(path, "C:/x/crates/se-serve/src/lib.rs");
+        assert_eq!(needle.as_deref(), Some("\"goto\" =>"));
+        assert_eq!(grep_literal("fn settle("), "fn settle\\(");
+        // no needle: outline + span
+        let (p, n) = script_read("python -c \"print(open('src/a.rs').read()[:400])\"").unwrap();
+        assert_eq!((p.as_str(), n), ("src/a.rs", None));
+        // node too
+        let (p, n) = script_read("node -e \"const s=require('fs').readFileSync('src/a.ts','utf8'); console.log(s.indexOf('foo'))\"").unwrap();
+        assert_eq!((p.as_str(), n.as_deref()), ("src/a.ts", Some("foo")));
+        // writes, spawns and variables are not reads
+        assert!(script_read("python -c \"open('a.rs','w').write('x')\"").is_none());
+        assert!(script_read("python -c \"import subprocess; open('a.rs').read()\"").is_none());
+        assert!(script_read("python -c \"open(p).read()\"").is_none());
+        assert!(script_read("python patch.py").is_none());
+        assert!(!is_other_work(&["python -c \"print(open('a.rs').read())\"".to_string()]));
+        assert!(is_other_work(&["python patch.py".to_string()]));
+    }
 
     #[test]
     fn splits_pipelines_and_stages() {
@@ -1134,7 +1279,8 @@ mod tests {
         let rw = |c: &str| runner_rewrite(exe, c);
         assert_eq!(rw("python scripts/probe.py --fast").as_deref(), Some("C:/Users/x/.cargo/bin/indexio.exe run -- 'python scripts/probe.py --fast'"));
         assert_eq!(rw("cd \"C:/x\" && npm test").as_deref(), Some("cd \"C:/x\" && C:/Users/x/.cargo/bin/indexio.exe run -- 'npm test'"));
-        assert_eq!(rw("node -e 'x(1)'").as_deref(), Some(r"C:/Users/x/.cargo/bin/indexio.exe run -- 'node -e '\''x(1)'\'''"), "inner quotes escaped");
+        assert_eq!(rw("node run.js 'x(1)'").as_deref(), Some(r"C:/Users/x/.cargo/bin/indexio.exe run -- 'node run.js '\''x(1)'\'''"), "inner quotes escaped");
+        assert_eq!(rw("node -e 'x(1)'"), None, "a one-liner prints what it was asked for");
         assert_eq!(rw("cargo test -p x"), None, "rtk's");
         assert_eq!(rw("git status"), None);
         assert_eq!(rw("python x.py | head -5"), None, "pipeline");

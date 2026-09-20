@@ -602,6 +602,17 @@ indexed paths of that repo with the same file name (else the same stem, up to fi
   keeps a doc whose type it does not recognise while the file exists on disk; only a file
   that is gone is tombstoned. The older binary in that session keeps its old behaviour
   until the session restarts, which the `binary updated` note on its next result asks for.
+- **A read in disguise.** Once `cat` and `sed -n` were refused, one session read files with
+  `python -X utf8 -c "src=open(r'…/lib.rs').read(); i=src.find('\"goto\" =>');
+  print(src[i:i+3000])"`. Two things went wrong: the `-X utf8` before `-c` hid the
+  one-liner from the runner rewrite, so the 77 lines the agent asked for came back as a
+  digest; and the read itself bypassed the index. Now a one-liner is recognised whatever
+  flags precede `-c` (`-e`, `-p`, `-r` for node, ruby, perl, php) and is never wrapped;
+  and a one-liner that only opens a file to print it — an `open(`/`readFileSync(` literal,
+  no write, spawn or edit — is judged like `cat`: when the file is indexed the call is
+  refused with `code_grep {pattern:<the .find literal>, repo, path} then read_span`, or
+  `file_outline` then `read_span` when there is no literal. A one-liner that writes,
+  spawns or opens a variable path runs as typed.
 
 ## 34. Next
 

@@ -246,7 +246,7 @@ impl McpServer {
     fn maybe_sync_others(&self) {
         {
             let mut last = self.sync_last.lock().expect("sync_last poisoned");
-            if last.map_or(false, |t| t.elapsed() < SYNC_EVERY) {
+            if last.is_some_and(|t| t.elapsed() < SYNC_EVERY) {
                 return;
             }
             *last = Some(std::time::Instant::now());
@@ -325,7 +325,7 @@ impl McpServer {
         }
         {
             let mut last = self.exe_checked.lock().expect("exe_checked poisoned");
-            if last.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(60)) {
+            if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
                 return false;
             }
             *last = Some(std::time::Instant::now());
@@ -347,7 +347,7 @@ impl McpServer {
     fn maybe_import_sessions(&self) {
         {
             let mut last = self.sessions_last.lock().expect("sessions_last poisoned");
-            if last.map_or(false, |t| t.elapsed() < SESSIONS_IMPORT_EVERY) {
+            if last.is_some_and(|t| t.elapsed() < SESSIONS_IMPORT_EVERY) {
                 return;
             }
             *last = Some(std::time::Instant::now());
@@ -768,7 +768,7 @@ impl McpServer {
         }
         {
             let mut last = self.repo_checked.lock().expect("repo_checked poisoned");
-            if last.map_or(false, |t| t.elapsed() < ADOPT_EVERY) {
+            if last.is_some_and(|t| t.elapsed() < ADOPT_EVERY) {
                 return;
             }
             *last = Some(std::time::Instant::now());
@@ -1768,7 +1768,7 @@ fn call_tool(
             };
             let listed: Vec<(&str, &str)> = files
                 .iter()
-                .filter(|(r, _)| current.map_or(true, |c| c == r))
+                .filter(|(r, _)| current.is_none_or(|c| c == r))
                 .map(|(r, p)| (r.as_str(), p.as_str()))
                 .collect();
             let mut b = 0u64;
@@ -2092,7 +2092,7 @@ const RECALL_EXCHANGE_AFTER: u32 = 36;
 fn grep_baseline(hits: &[indexio_types::SearchHit], current: Option<&str>) -> u64 {
     crate::usage::grep_bytes(
         hits.iter()
-            .filter(|h| h.repo != crate::sessions::REPO && current.map_or(true, |c| h.repo == c))
+            .filter(|h| h.repo != crate::sessions::REPO && current.is_none_or(|c| h.repo == c))
             .map(|h| (h.path.as_str(), h.line, h.snippet.as_str())),
     )
 }
@@ -2129,11 +2129,10 @@ fn escape_unbalanced_parens(pattern: &str) -> Option<String> {
             '[' if !in_class => in_class = true,
             ']' if in_class => in_class = false,
             '(' if !in_class => open.push(i),
-            ')' if !in_class => {
-                if open.pop().is_none() {
+            ')' if !in_class
+                && open.pop().is_none() => {
                     unmatched.push(i);
                 }
-            }
             _ => {}
         }
         i += 1;
@@ -2284,7 +2283,7 @@ fn repo_scope(engine: &Engine, q: &str) -> Option<String> {
 
 fn wants_sessions(q: &str) -> bool {
     q.split_whitespace()
-        .any(|t| t.strip_prefix("repo:").map_or(false, |r| crate::sessions::REPO.contains(&r.to_ascii_lowercase())))
+        .any(|t| t.strip_prefix("repo:").is_some_and(|r| crate::sessions::REPO.contains(&r.to_ascii_lowercase())))
 }
 
 /// The repo an MCP session works in: `explicit` (`--repo`) if registered,
@@ -2297,7 +2296,7 @@ pub fn resolve_current_repo(data_dir: &std::path::Path, explicit: Option<&str>) 
         .map(str::to_string)
         .or_else(|| std::env::var("INDEXIO_REPO").ok().filter(|s| !s.is_empty()));
     if let Some(p) = pick {
-        return if names.iter().any(|n| *n == p) {
+        return if names.contains(&p) {
             Some(p)
         } else {
             tracing::warn!(repo = %p, "current repo is not registered; ignoring");
@@ -2319,7 +2318,7 @@ pub fn repo_containing(data_dir: &std::path::Path, dir: &std::path::Path) -> Opt
         let root = st.path.canonicalize().unwrap_or(st.path.clone());
         if cwd.starts_with(&root) {
             let depth = root.components().count();
-            if best.as_ref().map_or(true, |(d, _)| depth > *d) {
+            if best.as_ref().is_none_or(|(d, _)| depth > *d) {
                 best = Some((depth, name));
             }
         }

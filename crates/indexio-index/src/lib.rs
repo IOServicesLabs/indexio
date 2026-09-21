@@ -16,6 +16,8 @@
 //!     (their posting entries carry only an offset, no length).
 //!   - TOMBSTONES is pre-sized to 64KiB: portable-serialized roaring bitmap
 //!     at offset 0, zero-padded.
+
+#![allow(clippy::type_complexity)]
 #![deny(unsafe_code)]
 
 mod format;

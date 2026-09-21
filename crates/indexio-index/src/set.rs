@@ -107,7 +107,7 @@ impl ShardSet {
     pub fn is_tombstoned(&self, shard_idx: usize, docid: u32) -> bool {
         self.shards
             .get(shard_idx)
-            .map_or(false, |s| s.tombstones().contains(docid))
+            .is_some_and(|s| s.tombstones().contains(docid))
     }
 
     pub fn delete_docs(&mut self, shard_idx: usize, docids: &[u32]) -> io::Result<()> {

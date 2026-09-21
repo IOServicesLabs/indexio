@@ -6,7 +6,7 @@ document is the operator manual.
 
 ## 0. What you have
 
-A single Cargo workspace, 8 crates, ~21.3k lines of Rust, 236 tests, no external runtime
+A single Cargo workspace, 8 crates, about 30k lines of Rust, 303 tests, no external runtime
 services. Everything lives in one binary (`indexio`) + one data directory.
 
 | Crate | Owns | Key files |

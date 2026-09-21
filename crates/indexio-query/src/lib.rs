@@ -43,6 +43,8 @@
 //!      path contains literal x5.0, exact symbol-name match x2.5. Sort
 //!      desc; stable tiebreak by (repo, path, line).
 
+#![allow(clippy::type_complexity)]
+
 #![forbid(unsafe_code)]
 
 pub mod impact;
@@ -1440,7 +1442,7 @@ impl Engine {
         // model-written questions it cost the semantic leg 9 points of
         // recall@5 and hybrid 4 (SPEC-P10 §18), and its first-time
         // vocabulary scan was the slowest part of a cold hybrid query.
-        let expanded = if std::env::var("INDEXIO_EXPAND").map_or(false, |v| !v.trim().is_empty()) {
+        let expanded = if std::env::var("INDEXIO_EXPAND").is_ok_and(|v| !v.trim().is_empty()) {
             embedder.expand_query(&cleaned)
         } else {
             cleaned.clone()

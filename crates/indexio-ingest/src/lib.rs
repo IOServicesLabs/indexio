@@ -23,6 +23,8 @@
 //! this: `docs_added` = current doc count, `docs_deleted` = previous doc
 //! count, `docs_unchanged` = 0.
 
+#![allow(clippy::type_complexity)]
+
 #![deny(unsafe_code)]
 
 mod cas;
@@ -557,7 +559,7 @@ fn read_plain_tree_cached(root: &Path, mut cache: Option<&mut WorktreeCache>) ->
             Err(e) => warn!(path = %path.display(), error = %e, "skip: unreadable"),
         }
     }
-    if let Some(c) = cache.as_deref_mut() {
+    if let Some(c) = cache {
         c.files.retain(|rel, _| files.iter().any(|f| f.rel == *rel));
     }
     Ok(files)
@@ -825,7 +827,7 @@ impl SyncLock {
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.elapsed().ok())
-                        .map_or(true, |age| age.as_secs() > SYNC_LOCK_STALE_SECS);
+                        .is_none_or(|age| age.as_secs() > SYNC_LOCK_STALE_SECS);
                     if !stale {
                         return None;
                     }
@@ -874,7 +876,7 @@ impl RepoLock {
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.elapsed().ok())
-                        .map_or(true, |age| age.as_secs() > REPO_LOCK_STALE_SECS);
+                        .is_none_or(|age| age.as_secs() > REPO_LOCK_STALE_SECS);
                     if stale {
                         warn!(path = %path.display(), "taking over a stale repo lock");
                         let _ = fs::remove_file(&path);
@@ -986,7 +988,7 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
             Err(e) => warn!(path = %path.display(), error = %e, "skip: unreadable"),
         }
     }
-    if let Some(c) = cache.as_deref_mut() {
+    if let Some(c) = cache {
         c.files.retain(|rel, _| files.iter().any(|f| f.rel == *rel));
     }
     Ok(files)

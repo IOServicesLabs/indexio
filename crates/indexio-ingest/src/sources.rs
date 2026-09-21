@@ -610,7 +610,7 @@ fn default_dest(data_dir: &Path, src: &Source, repo: &str) -> PathBuf {
 /// Repo name implied by a clone URL (`…/owner/repo.git` → `repo`).
 fn url_repo_name(url: &str) -> String {
     trim_git_suffix(url)
-        .rsplit(|c| c == '/' || c == ':')
+        .rsplit(['/', ':'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("repo")

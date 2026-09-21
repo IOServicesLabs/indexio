@@ -272,7 +272,7 @@ impl EmbedCas {
                     }
                 }
             }
-            if p.seen_writer.as_mut().map_or(true, |w| w.write_all(chunk_hash).is_err()) {
+            if p.seen_writer.as_mut().is_none_or(|w| w.write_all(chunk_hash).is_err()) {
                 tracing::warn!("embcas: put failed (seen.idx write)");
             }
             return;
@@ -405,7 +405,7 @@ mod tests {
 
         assert_eq!(cas.get(&h1), None, "miss before put");
 
-        let v1 = vec![0.5f32, -0.5, 0.7071];
+        let v1 = vec![0.5f32, -0.5, 0.71];
         let v2 = vec![1.0f32; 512];
         cas.put(&h1, &v1);
         cas.put(&h2, &v2);

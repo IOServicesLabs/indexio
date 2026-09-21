@@ -100,7 +100,7 @@ fn chunk_repo(
         .visible_docs()
         .into_iter()
         .filter(|(si, _, dm)| {
-            paths.map_or(true, |p| p.contains(&dm.path)) && doc_repo(shards, *si, dm.repo_id) == repo
+            paths.is_none_or(|p| p.contains(&dm.path)) && doc_repo(shards, *si, dm.repo_id) == repo
         })
         .collect();
     let per_doc: Vec<anyhow::Result<Vec<Work>>> = docs
@@ -261,7 +261,7 @@ pub fn reembed_due(data_dir: &Path, model_id: &str, texts_seen: Option<u64>) -> 
     let Some(now) = texts_seen else { return false };
     let p = built_stamp_path(&vec_dir(data_dir), model_id);
     let Ok(meta) = std::fs::metadata(&p) else { return false };
-    let young = meta.modified().ok().and_then(|m| m.elapsed().ok()).map_or(false, |age| age < REEMBED_MIN_AGE);
+    let young = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age < REEMBED_MIN_AGE);
     if young {
         return false;
     }
@@ -417,7 +417,7 @@ fn embed_incremental_with(
     if let Some((vset, _)) = &sets {
         for row in vset.live_rows() {
             let m = vset.row_meta(row);
-            if requested.contains(m.repo.as_str()) && only_paths.map_or(true, |p| p.contains(&m.path)) {
+            if requested.contains(m.repo.as_str()) && only_paths.is_none_or(|p| p.contains(&m.path)) {
                 existing
                     .entry((m.repo.clone(), m.path.clone()))
                     .or_default()
@@ -447,7 +447,7 @@ fn embed_incremental_with(
             let old = existing.remove(&(repo.to_string(), path));
             let mut new_hashes: Vec<[u8; 16]> = ws.iter().map(|w| w.hash).collect();
             new_hashes.sort_unstable();
-            let same = old.as_ref().map_or(false, |o| {
+            let same = old.as_ref().is_some_and(|o| {
                 let mut oh: Vec<[u8; 16]> = o.iter().map(|(_, h)| *h).collect();
                 oh.sort_unstable();
                 oh == new_hashes
@@ -720,7 +720,7 @@ impl CompactLock {
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|t| t.elapsed().ok())
-                        .map_or(true, |age| age.as_secs() > LOCK_STALE_SECS);
+                        .is_none_or(|age| age.as_secs() > LOCK_STALE_SECS);
                     if !stale {
                         return None;
                     }

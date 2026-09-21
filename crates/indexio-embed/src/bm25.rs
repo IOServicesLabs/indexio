@@ -428,7 +428,7 @@ impl ChunkBm25 {
     /// field length normalized against the combined average (k1 = 1.0,
     /// b = 0.35).
     pub fn search(&self, query: &str, k: usize) -> Vec<(u32, f32)> {
-        if k == 0 || self.n_rows == 0 || self.len() == 0 {
+        if k == 0 || self.n_rows == 0 || self.is_empty() {
             return Vec::new();
         }
         let terms = query_terms(query);
@@ -613,7 +613,7 @@ pub fn segment_paths(dir: &Path, ns: &str) -> Vec<PathBuf> {
                     && p
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map_or(false, |n| n.starts_with(&prefix))
+                        .is_some_and(|n| n.starts_with(&prefix))
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -753,7 +753,7 @@ impl Bm25Set {
     /// [`search`](Self::search) keeping only the global rows for which
     /// `keep` holds (SPEC-P10: a repo-scoped leg).
     pub fn search_where(&self, query: &str, k: usize, keep: &dyn Fn(u32) -> bool) -> Vec<(u32, f32)> {
-        if k == 0 || self.len() == 0 {
+        if k == 0 || self.is_empty() {
             return Vec::new();
         }
         let terms = query_terms(query);

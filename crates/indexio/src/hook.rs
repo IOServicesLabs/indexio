@@ -47,7 +47,7 @@ fn locate(repos: &[(String, PathBuf)], abs: &Path) -> Option<(String, String)> {
     for (name, root) in repos {
         if let Ok(rel) = abs.strip_prefix(root) {
             let depth = root.components().count();
-            if best.as_ref().map_or(true, |(d, _, _)| depth > *d) {
+            if best.as_ref().is_none_or(|(d, _, _)| depth > *d) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 best = Some((depth, name.clone(), rel));
             }
@@ -398,7 +398,7 @@ pub fn verdict(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
     // the deny is for the servable one, the rest is fine to rerun alone
     let others = split(command)
         .iter()
-        .filter(|p| p.first().map_or(false, |s| !s.starts_with("cd ") && s != "cd"))
+        .filter(|p| p.first().is_some_and(|s| !s.starts_with("cd ") && s != "cd"))
         .count();
     if others > 1 {
         reason.push_str(" The rest of this call is fine to run on its own.");
@@ -547,7 +547,7 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
         if engine.is_none() {
             engine = Engine::open(data_dir).ok();
         }
-        engine.as_ref().map_or(false, |e| e.outline(repo, rel).is_some())
+        engine.as_ref().is_some_and(|e| e.outline(repo, rel).is_some())
     };
     let mut cwd = cwd.to_path_buf();
     for pipeline in split(command) {
@@ -892,7 +892,7 @@ fn raw_is_retry(data_dir: &Path, session: &str, command: &str) -> bool {
         return false;
     }
     let hash = indexio_types::BlobId::from_content(without_raw(command).as_bytes()).hex();
-    std::fs::read_to_string(last_denied_path(data_dir, session)).map_or(false, |prev| prev.trim() == hash)
+    std::fs::read_to_string(last_denied_path(data_dir, session)).is_ok_and(|prev| prev.trim() == hash)
 }
 
 /// The verdict for one `Read` tool call (SPEC-P10 §16): a file the index
@@ -959,7 +959,7 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
 fn repeated_denial(data_dir: &Path, session: &str, command: &str) -> bool {
     let path = last_denied_path(data_dir, session);
     let hash = indexio_types::BlobId::from_content(without_raw(command).as_bytes()).hex();
-    let same = std::fs::read_to_string(&path).map_or(false, |prev| prev.trim() == hash);
+    let same = std::fs::read_to_string(&path).is_ok_and(|prev| prev.trim() == hash);
     if !same {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1043,7 +1043,7 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
     }
     // SPEC-P10 §31: a script or build runs through `indexio run`, which
     // keeps a long output in the runs source and returns a digest
-    if let Some(exe) = std::env::current_exe().ok() {
+    if let Ok(exe) = std::env::current_exe() {
         if let Some(rewritten) = runner_rewrite(&exe, command) {
             println!(
                 "{}",

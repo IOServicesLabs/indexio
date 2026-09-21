@@ -218,7 +218,7 @@ mod tests {
         // must win via the sqrt(1/(1+n)) length normalization.
         let short = tokens("vector search");
         let mut long = tokens("vector search");
-        long.extend(std::iter::repeat("filler".to_string()).take(50));
+        long.extend(std::iter::repeat_n("filler".to_string(), 50));
         let s_short = overlap_score(&tokens("vector"), &short);
         let s_long = overlap_score(&tokens("vector"), &long);
         assert!(s_short > s_long, "{s_short} vs {s_long}");

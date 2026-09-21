@@ -23,6 +23,8 @@
 //! - Tombstones trail the file as a length-prefixed bincode sorted
 //!   `Vec<u32>` rather than a `RoaringBitmap`, avoiding a new dependency;
 //!   the sidecar is rebuildable so the format is internal to this crate.
+
+#![allow(clippy::type_complexity)]
 #![deny(unsafe_code)]
 
 pub mod bm25;

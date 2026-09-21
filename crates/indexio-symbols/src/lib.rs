@@ -408,11 +408,10 @@ fn collect_symbols(
 
         // Language-specific filters and kind adjustments.
         match lang {
-            Lang::Rust => {
-                if kind == SymbolKind::Fn && has_ancestor(def_node, &["impl_item", "trait_item"]) {
+            Lang::Rust
+                if kind == SymbolKind::Fn && has_ancestor(def_node, &["impl_item", "trait_item"]) => {
                     kind = SymbolKind::Method;
                 }
-            }
             Lang::Python => {
                 if kind == SymbolKind::Fn && has_ancestor(def_node, &["class_definition"]) {
                     kind = SymbolKind::Method;
@@ -421,16 +420,14 @@ fn collect_symbols(
                     continue;
                 }
             }
-            Lang::TsJs => {
-                if kind == SymbolKind::Const && !is_const_decl(content, def_node) {
+            Lang::TsJs
+                if kind == SymbolKind::Const && !is_const_decl(content, def_node) => {
                     continue;
                 }
-            }
-            Lang::Java => {
-                if kind == SymbolKind::Const && !is_static_final(content, def_node) {
+            Lang::Java
+                if kind == SymbolKind::Const && !is_static_final(content, def_node) => {
                     continue;
                 }
-            }
             _ => {}
         }
 

@@ -468,14 +468,14 @@ impl Vocab {
     fn remove(&mut self, term: &str) {
         let i = Self::shard_of(term);
         self.shards[i].remove(term);
-        if self.base.as_ref().map_or(false, |b| b.get(term).is_some()) {
+        if self.base.as_ref().is_some_and(|b| b.get(term).is_some()) {
             self.removed.insert(term.to_string());
         }
     }
 
     /// Whether `term` is in the snapshot and not evicted.
     fn in_base(&self, term: &str) -> bool {
-        !self.removed.contains(term) && self.base.as_ref().map_or(false, |b| b.get(term).is_some())
+        !self.removed.contains(term) && self.base.as_ref().is_some_and(|b| b.get(term).is_some())
     }
 
     fn len(&self) -> usize {

@@ -3,6 +3,8 @@
 //!
 //! Contract: docs/SPEC.md, section "indexio — binary".
 
+#![allow(clippy::type_complexity)]
+
 mod impact_cli;
 mod mcp;
 mod hook;

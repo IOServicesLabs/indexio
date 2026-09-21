@@ -477,7 +477,7 @@ fn is_constant_like(ident: &str) -> bool {
 /// `OpenAlex`, `Engine`, `HttpClient`: a type name (capitalised, mixed case).
 fn is_type_like(ident: &str) -> bool {
     let mut chars = ident.chars();
-    chars.next().map_or(false, |c| c.is_ascii_uppercase()) && ident.chars().any(|c| c.is_ascii_lowercase())
+    chars.next().is_some_and(|c| c.is_ascii_uppercase()) && ident.chars().any(|c| c.is_ascii_lowercase())
 }
 
 /// Per-walk decompressed-content cache: many sites land in the same file.
@@ -605,7 +605,7 @@ impl Engine {
                     postings.retain(|(si, docid, _, line)| {
                         cache
                             .get(*si, *docid)
-                            .map_or(false, |(_, _, content)| site_plausible(&content_line(content, *line), name, shape))
+                            .is_some_and(|(_, _, content)| site_plausible(&content_line(content, *line), name, shape))
                     });
                 }
                 // Hub protection: over the per-symbol cap, sample the
@@ -1061,7 +1061,7 @@ mod tests {
         free.add_definition("spawn", "crates/x/src/net/mod.rs", Lang::Rust, "", "pub fn spawn(rt: &Runtime) -> Handle {");
         assert!(free.owners.contains("net"));
         assert!(!free.has_receiver);
-        assert!(site_plausible("    tokio::spawn(async move {", "spawn", &free) == false);
+        assert!(!site_plausible("    tokio::spawn(async move {", "spawn", &free));
         assert!(!site_plausible("    std::thread::spawn(move || {", "spawn", &free));
         assert!(!site_plausible("    let child = cmd.spawn()?;", "spawn", &free));
         assert!(site_plausible("    let h = net::spawn(&rt);", "spawn", &free));
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(!site_plausible("    asyncio.run(Engine.search(eng, \"heat pump\"))", "search", &search));
         assert!(site_plausible("    docs = await Crossref().search(_q(), ctx)", "search", &search));
         assert!(site_plausible("    res = await provider.search(q, ctx)", "search", &search));
-        assert!(site_plausible("    title = _RSS_FIELD[\"title\"].search(block)", "search", &search) == false);
+        assert!(!site_plausible("    title = _RSS_FIELD[\"title\"].search(block)", "search", &search));
         assert_eq!(trailing_ident("OpenAlex()"), "OpenAlex");
         assert_eq!(trailing_ident("_RSS_FIELD[\"title\"]"), "_RSS_FIELD");
         assert_eq!(trailing_ident("foo(a, b(c))"), "foo");

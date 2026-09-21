@@ -670,7 +670,7 @@ prescan gave no speed-up. These stay off by default.
 ## Development and releases
 
 ```
-cargo test --workspace                  # every crate, about 280 tests
+cargo test --workspace                  # every crate, 303 tests
 cargo clippy --workspace --all-targets
 tools/build-release.sh                  # release build; remaps local paths out of the binary
 ```

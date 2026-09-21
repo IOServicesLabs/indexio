@@ -39,7 +39,9 @@ impl std::fmt::Display for BlobId {
 /// Language identifier (stored as u16 in the doc table).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[repr(u16)]
+#[derive(Default)]
 pub enum Lang {
+    #[default]
     Unknown = 0,
     Rust = 1,
     Python = 2,
@@ -53,11 +55,6 @@ pub enum Lang {
     Text = 7,
 }
 
-impl Default for Lang {
-    fn default() -> Self {
-        Lang::Unknown
-    }
-}
 
 impl Lang {
     pub fn from_u16(v: u16) -> Lang {

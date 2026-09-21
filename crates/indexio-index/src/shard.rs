@@ -73,7 +73,7 @@ impl Shard {
             let k = get_u32(&mmap, e) as usize;
             let off = get_u64(&mmap, e + 8) as usize;
             let len = get_u64(&mmap, e + 16) as usize;
-            if off.checked_add(len).map_or(true, |end| end > mmap.len()) {
+            if off.checked_add(len).is_none_or(|end| end > mmap.len()) {
                 return Err(invalid("shard: section out of bounds"));
             }
             if k < kind::COUNT {
@@ -328,7 +328,7 @@ impl Shard {
         }
         let (off, len) = self.sections[kind::TOMBSTONES as usize]
             .ok_or_else(|| invalid("shard: missing TOMBSTONES section"))?;
-        if len < TOMBSTONES_LEN || off.checked_add(TOMBSTONES_LEN).map_or(true, |e| e > self.mmap.len()) {
+        if len < TOMBSTONES_LEN || off.checked_add(TOMBSTONES_LEN).is_none_or(|e| e > self.mmap.len()) {
             return Err(invalid("shard: TOMBSTONES section smaller than 64KiB"));
         }
         self.mmap[off..off + bytes.len()].copy_from_slice(&bytes);

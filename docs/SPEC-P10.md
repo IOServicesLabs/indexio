@@ -617,7 +617,7 @@ indexed paths of that repo with the same file name (else the same stem, up to fi
 ## 34. The Read baseline follows the file's version
 
 §22 charged the whole-file `Read` once per file per session, so a session that came
-back to the same files hour after hour (crewos: +40 % in its second day, −50 % overall)
+back to the same files hour after hour (one session: +40 % in its second day, −50 % overall)
 was scored as if the harness had read each file once and remembered it. The harness
 does not: an agent re-reads a file after editing it, and again after a compaction. The
 baseline now keys on the file's content id (`Engine::file_version`, the doc's blob):

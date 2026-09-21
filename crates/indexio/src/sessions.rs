@@ -128,7 +128,7 @@ pub fn import(claude_dir: &Path, out_dir: &Path, only_slug: Option<&str>) -> any
 
     for proj in fs::read_dir(&projects)?.flatten() {
         let slug = proj.file_name().to_string_lossy().into_owned();
-        if only_slug.map_or(false, |s| s != slug) {
+        if only_slug.is_some_and(|s| s != slug) {
             continue;
         }
         // one state file per project: servers of different sessions import

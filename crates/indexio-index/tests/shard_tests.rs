@@ -178,7 +178,7 @@ fn dict_used_when_over_100_docs() {
         .into_bytes();
         contents.push(content.clone());
         let (meta, _, art) = make_doc(i, 0, content);
-        w.add_doc(&meta, &contents.last().unwrap(), &art).unwrap();
+        w.add_doc(&meta, contents.last().unwrap(), &art).unwrap();
     }
     let path = w.finish(&["r".to_string()]).unwrap();
     let shard = Shard::open(&path).unwrap();

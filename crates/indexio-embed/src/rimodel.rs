@@ -80,7 +80,7 @@ pub fn is_snapshot(path: &Path) -> bool {
     let mut magic = [0u8; 8];
     fs::File::open(path)
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
-        .map_or(false, |_| &magic == MAGIC)
+        .is_ok_and(|_| &magic == MAGIC)
 }
 
 impl Snapshot {

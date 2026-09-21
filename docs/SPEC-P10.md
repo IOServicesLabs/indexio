@@ -636,7 +636,20 @@ bytes. When the session's repo has hits, other repos now contribute at most thre
 (pass repo: to search one)`. Without a session repo, or when it has no hits, every repo
 is listed as before, so a cross-repo lookup still works.
 
-## 36. Next
+## 36. Hidden folders that hold configuration
+
+A session asked `read_span` for `.github/workflows/ci.yml` and was told the file was not
+indexed. The walker skipped every dot-directory, so CI workflows, `.cargo/config.toml`,
+dev-container and editor configuration — tracked, small, and exactly what an agent asks
+about when a build fails — were never in the index. Worse, the HEAD-tree listing did not
+skip them while the working-tree listing did, so a HEAD sync added them and the next
+working-tree refresh tombstoned them. One rule now applies to HEAD trees, working trees
+and plain folders (`under_skipped_dir`): an allow-list of hidden folders is indexed
+(`.github`, `.gitlab`, `.circleci`, `.cargo`, `.devcontainer`, `.vscode`, `.config`,
+`.husky`, `.changeset`, `.storybook`, `.well-known`), every other dot-directory is
+skipped as before.
+
+## 37. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

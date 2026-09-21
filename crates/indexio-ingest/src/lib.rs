@@ -115,10 +115,11 @@ fn tree_files(repo: &gix::Repository, tree_id: gix::hash::ObjectId) -> anyhow::R
         if !r.mode.is_blob() {
             continue;
         }
-        out.push(TreeFile {
-            path: String::from_utf8_lossy(&r.filepath).into_owned(),
-            oid: r.oid,
-        });
+        let path = String::from_utf8_lossy(&r.filepath).into_owned();
+        if under_skipped_dir(&path) {
+            continue; // tracked build output or a hidden folder: same rule as the working tree
+        }
+        out.push(TreeFile { path, oid: r.oid });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -425,9 +426,31 @@ pub const SKIP_DIRS: &[&str] = &[
     "obj", "bin", "Pods", "DerivedData",
 ];
 
+/// Hidden directories that hold what an agent asks about — CI workflows,
+/// cargo and editor configuration, dev containers — and are indexed like
+/// any other folder (SPEC-P10 §36). Every other dot-directory (`.git`,
+/// `.venv`, `.idea`, `.next`, `.cache` …) is skipped.
+pub const KEEP_DOT_DIRS: &[&str] = &[
+    ".github", ".gitlab", ".circleci", ".cargo", ".devcontainer", ".vscode", ".config",
+    ".husky", ".changeset", ".storybook", ".well-known",
+];
+
 /// Whether a directory entry should be skipped by the plain-tree walker.
 pub fn skip_dir_name(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
+    SKIP_DIRS.contains(&name) || (name.starts_with('.') && !KEEP_DOT_DIRS.contains(&name))
+}
+
+/// Whether a repo-relative path lies under a skipped directory: the same
+/// rule for a HEAD tree, a working tree and a plain folder, so a delta
+/// between any two of them never adds and tombstones the same file.
+pub fn under_skipped_dir(rel: &str) -> bool {
+    let mut segs = rel.split('/').peekable();
+    while let Some(seg) = segs.next() {
+        if segs.peek().is_some() && skip_dir_name(seg) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `dir` is a cache/build-output directory by its own declaration
@@ -949,8 +972,8 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
     rels.dedup();
     let mut cache_dirs: HashMap<String, bool> = HashMap::new();
     for rel in rels {
-        if rel.split('/').any(|seg| skip_dir_name(seg) && seg != rel) {
-            continue; // build output that slipped past .gitignore
+        if under_skipped_dir(&rel) {
+            continue; // build output that slipped past .gitignore, or a hidden folder
         }
         if under_cache_dir(root, &rel, &mut cache_dirs) {
             continue; // a target dir under another name (CACHEDIR.TAG)
@@ -1350,6 +1373,28 @@ mod tests {
         let r = reindex_dir(&state, data.path(), &cas, None).unwrap();
         assert_eq!((r.docs_added, r.docs_deleted), (0, 1), "{r:?}");
         assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"]);
+    }
+
+    #[test]
+    fn hidden_folders_with_configuration_are_indexed_and_the_rest_skipped() {
+        assert!(!skip_dir_name(".github"));
+        assert!(!skip_dir_name(".cargo"));
+        assert!(skip_dir_name(".git"));
+        assert!(skip_dir_name(".venv"));
+        assert!(skip_dir_name("node_modules"));
+        assert!(!under_skipped_dir(".github/workflows/ci.yml"));
+        assert!(under_skipped_dir(".idea/workspace.xml"));
+        assert!(under_skipped_dir("src/target/x.rs"));
+        assert!(!under_skipped_dir(".gitignore"), "a hidden file at the root is a file, not a folder");
+        // a git repo: the workflow is indexed from HEAD and survives a worktree pass
+        let repo = make_repo(&[("src/main.rs", MAIN_RS), (".github/workflows/ci.yml", b"name: ci\non: push\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        index_repo(repo.path(), "r1", data.path(), &cas).unwrap();
+        assert_eq!(visible_paths(data.path(), "r1"), vec![".github/workflows/ci.yml", "src/main.rs"]);
+        let r = reindex_worktree("r1", data.path(), &cas).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (0, 0), "{r:?}");
+        assert_eq!(visible_paths(data.path(), "r1"), vec![".github/workflows/ci.yml", "src/main.rs"]);
     }
 
     #[test]

@@ -673,7 +673,9 @@ repository's README outlines in 1.4 KB instead of the 32 KB the file is, and `re
 on a heading line with no `end` returns that section, as it returns a whole function in
 code. The same session also sent `query` to `code_grep` and `symbol` to `who_calls` — the
 built-in tools' words — and lost a turn to each; `query`, `symbol` and `file` are now
-accepted as aliases of `pattern`, `name` and `path`.
+accepted as aliases of `pattern`, `name` and `path`. And `repo:path`, the form every
+answer prints, pasted back as the path (`Harmonica_finance:app/models/schemas.py`) is
+accepted when the prefix names the repo.
 
 ## 39. Credentials stay out of the index
 

@@ -1464,6 +1464,12 @@ fn internal(msg: impl Into<String>) -> (i64, String) {
     (INTERNAL_ERROR, msg.into())
 }
 
+/// `repo:path`, the form every answer prints, pasted back as the path
+/// (SPEC-P10 §38): the prefix is dropped when it names this repo.
+fn strip_repo_prefix<'a>(repo: &str, path: &'a str) -> &'a str {
+    path.strip_prefix(repo).and_then(|rest| rest.strip_prefix(':')).unwrap_or(path)
+}
+
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
     // the names agents reach for from the built-in tools (SPEC-P10 §38):
     // `query` for a grep pattern, `symbol` for a symbol name, `file` for a path
@@ -2015,7 +2021,7 @@ fn call_tool(
         }
         "file_outline" => {
             let repo = req_str(args, "repo")?;
-            let path = req_str(args, "path")?;
+            let path = strip_repo_prefix(repo, req_str(args, "path")?);
             let items = engine
                 .outline(repo, path)
                 .ok_or_else(|| not_indexed(engine, repo, path))?;
@@ -2029,7 +2035,7 @@ fn call_tool(
         }
         "read_span" => {
             let repo = req_str(args, "repo")?;
-            let path = req_str(args, "path")?;
+            let path = strip_repo_prefix(repo, req_str(args, "path")?);
             // no start (a worker omitted it) reads from the top, not an error
             let start = opt_usize(args, "start", 1)?.max(1);
             // SPEC-P9: no `end` → the enclosing definition's end (a whole
@@ -3022,6 +3028,12 @@ mod tests {
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert_eq!(v["error"]["code"], -32602);
         assert!(!v["error"]["message"].as_str().unwrap().contains("did you mean"), "{v}");
+        // the printed `repo:path` form pasted back as the path
+        let req = r#"{"jsonrpc":"2.0","id":470,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"alpha:src/foo.rs","start":2,"end":3}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert_eq!(payload_of(&v)["text"], "    helper(x)
+}
+", "{v}");
         // a guessed folder for a real file name: the miss names the real path
         let req = r#"{"jsonrpc":"2.0","id":471,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"lib/foo.rs","start":1}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());

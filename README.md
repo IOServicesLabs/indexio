@@ -614,6 +614,24 @@ data directory (`docs/SPEC-P10.md`):
 | `find_symbol`, `who_calls` | 12 ms | 0.5 ms |
 | Working-tree re-index after an edit | not available | about 25 ms |
 
+The same lookups through the shell and through the index (`bench/ab_speed.py`, this
+repository, a 1,300-file TypeScript application gives the same picture). Wall-clock,
+medians of 10, the index side includes the MCP transport:
+
+| Lookup | Shell | indexio |
+|---|---|---|
+| Identifier grep (`rg -n`) | 32 ms | 0.6 ms |
+| Regex grep (`rg -n`) | 34 ms | 2.5 ms |
+| `grep -rn` over an application | 26 to 860 ms | 0.7 ms |
+| Read 120 lines (`sed -n`) | 23 ms | 0.3 ms |
+| `find -name` | 25 to 410 ms | 0.9 ms |
+| Definition lookup | 33 ms | 0.1 ms |
+
+Each Bash tool call also pays about 15 ms for the shell and about 30 ms for the two
+PreToolUse hooks before its command runs. An MCP call pays neither. On real traffic
+(5,355 calls in 7 days) the median is 0 ms for `read_span`, 12 ms for `code_search` and
+29 ms for `code_grep`; the 90th percentile stays under 130 ms.
+
 Duplication, measured on a sandbox with 2 cores and 4 GB of RAM:
 
 | Scenario | Result |

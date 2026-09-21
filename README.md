@@ -133,7 +133,8 @@ A folder tree of 156 repositories and 17,530 files syncs as a no-op in 11 s.
 A running `indexio mcp` server does more on its own:
 
 - It watches the repository the session works in. It re-indexes the working tree before
-  each call when files changed. Uncommitted and untracked edits are searchable at once.
+  each call when files changed. Uncommitted and untracked edits are searchable at once;
+  their embeddings follow on a background thread within a few hundred milliseconds.
 - Every 10 minutes it probes the other repositories for a moved HEAD and re-indexes the
   ones that moved.
 - A session that starts before its folder is registered adopts the repository within one

@@ -115,10 +115,19 @@ pub struct McpServer {
     /// Engine whose sidecars were opened by `prewarm_sidecars`, waiting
     /// to be adopted.
     warm: Arc<Mutex<Option<Engine>>>,
-    /// Paths of the current repo whose semantic rows still need embedding
-    /// (an embed failed, e.g. another server was mid-append): retried on
-    /// the next call.
-    pending_embed: Mutex<std::collections::BTreeSet<String>>,
+    /// Paths of the current repo whose semantic rows still need embedding:
+    /// drained by the background embed thread (SPEC-P10 §37); what it
+    /// could not embed (another server mid-append) stays queued for the
+    /// next refresh.
+    pending_embed: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// The background embed of the current repo's changed files is running.
+    embed_busy: Arc<AtomicBool>,
+    /// Serialises this process's embeds (the auto-refresh thread and the
+    /// other-repos sync), so two never append to the plane at once.
+    embed_lock: Arc<Mutex<()>>,
+    /// The embed thread, joined at shutdown so an append is never left
+    /// half-written.
+    embedder_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// (count, total bytes, newest mtime) of the shard files at the last
     /// check; a change means another process wrote or merged shards.
     shards_seen: Mutex<(usize, u64, Option<std::time::SystemTime>)>,
@@ -217,7 +226,10 @@ impl McpServer {
             reload_needed: Arc::new(AtomicBool::new(false)),
             compactor: Mutex::new(None),
             warm: Arc::new(Mutex::new(None)),
-            pending_embed: Mutex::new(std::collections::BTreeSet::new()),
+            pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            embed_busy: Arc::new(AtomicBool::new(false)),
+            embed_lock: Arc::new(Mutex::new(())),
+            embedder_thread: Mutex::new(None),
             sessions_last: Mutex::new(None),
             sessions_busy: Arc::new(AtomicBool::new(false)),
             sessions_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
@@ -264,6 +276,7 @@ impl McpServer {
         let embedder = Arc::clone(&self.embedder);
         let busy = Arc::clone(&self.sync_busy);
         let reload = Arc::clone(&self.reload_needed);
+        let embed_lock = Arc::clone(&self.embed_lock);
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let Some(_lock) = indexio_ingest::SyncLock::try_acquire(&data_dir) else {
@@ -291,6 +304,7 @@ impl McpServer {
                 }
             }
             if !changed.is_empty() {
+                let _serial = embed_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(set) = indexio_index::ShardSet::open_dir(&data_dir.join("shards")) {
                     if let Err(e) = indexio_embed::pipeline::embed_repos_with(
                         &set,
@@ -452,50 +466,81 @@ impl McpServer {
         });
     }
 
-    /// Embed `paths` of the current repo into the semantic plane through
-    /// the engine's cached segment sets; paths that could not be embedded
-    /// stay queued for the next call.
+    /// Queue `paths` of the current repo for the semantic plane and embed
+    /// them on a background thread (SPEC-P10 §37): the call that triggered
+    /// the refresh needed the lexical index, which is already fresh; the
+    /// vectors follow within a few hundred milliseconds and the next call
+    /// adopts them through `reload_needed`. One thread at a time; a batch
+    /// that fails (another server mid-append) stays queued for the next
+    /// refresh.
     fn embed_current_paths(&self, repo: &str, data_dir: &std::path::Path, paths: &[String]) {
-        let mut queue = self.pending_embed.lock().expect("pending embed poisoned");
-        queue.extend(paths.iter().cloned());
-        if queue.is_empty() {
-            return;
-        }
-        let batch: Vec<String> = queue.iter().cloned().collect();
-        let set = match indexio_index::ShardSet::open_dir(&data_dir.join("shards")) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "auto-refresh: cannot open shards for embed");
+        {
+            let mut queue = self.pending_embed.lock().expect("pending embed poisoned");
+            queue.extend(paths.iter().cloned());
+            if queue.is_empty() {
                 return;
             }
-        };
-        // the engine's cached (already parsed) segment sets
-        let model = self.embedder.model_id();
-        let (vs, bs) = {
-            let eng = self.engine.read().expect("engine lock poisoned");
-            (eng.vec_index(model).ok().flatten(), eng.bm25_index(model).ok().flatten())
-        };
-        let sets = match (&vs, &bs) {
-            (Some(v), Some(b)) => Some((&**v, &**b)),
-            _ => None,
-        };
-        match indexio_embed::pipeline::embed_paths_with_sets(
-            &set,
-            data_dir,
-            repo,
-            &batch,
-            sets,
-            self.embedder.as_ref(),
-            indexio_embed::pipeline::MAX_CHARS,
-        ) {
-            Ok(_) => queue.clear(),
-            Err(e) => tracing::warn!(error = %e, pending = queue.len(), "auto-refresh: embed deferred"),
+        }
+        if self.embed_busy.swap(true, Ordering::AcqRel) {
+            return; // the running thread drains the queue
+        }
+        let repo = repo.to_string();
+        let data_dir = data_dir.to_path_buf();
+        let pending = Arc::clone(&self.pending_embed);
+        let busy = Arc::clone(&self.embed_busy);
+        let lock = Arc::clone(&self.embed_lock);
+        let embedder = Arc::clone(&self.embedder);
+        let reload = Arc::clone(&self.reload_needed);
+        let handle = std::thread::spawn(move || {
+            loop {
+                let batch: Vec<String> = pending.lock().map(|q| q.iter().cloned().collect()).unwrap_or_default();
+                if batch.is_empty() {
+                    break;
+                }
+                let t0 = std::time::Instant::now();
+                let _serial = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let done = indexio_index::ShardSet::open_dir(&data_dir.join("shards")).map_err(anyhow::Error::from).and_then(|set| {
+                    indexio_embed::pipeline::embed_paths_with_sets(
+                        &set,
+                        &data_dir,
+                        &repo,
+                        &batch,
+                        None,
+                        embedder.as_ref(),
+                        indexio_embed::pipeline::MAX_CHARS,
+                    )
+                });
+                match done {
+                    Ok(_) => {
+                        if let Ok(mut q) = pending.lock() {
+                            for p in &batch {
+                                q.remove(p);
+                            }
+                        }
+                        reload.store(true, Ordering::Release);
+                        tracing::debug!(paths = batch.len(), ms = t0.elapsed().as_millis() as u64, "auto-refresh: semantic plane updated");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, pending = batch.len(), "auto-refresh: embed deferred");
+                        break;
+                    }
+                }
+            }
+            busy.store(false, Ordering::Release);
+        });
+        if let Ok(mut slot) = self.embedder_thread.lock() {
+            if let Some(prev) = slot.replace(handle) {
+                let _ = prev.join(); // finished (busy was false); reap it
+            }
         }
     }
 
     /// Wait for a running background compaction and persist embedder state
     /// (graceful shutdown).
     pub fn finish_background_work(&self) {
+        if let Some(h) = self.embedder_thread.lock().expect("embed thread lock poisoned").take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.compactor.lock().expect("compactor lock poisoned").take() {
             let _ = h.join();
         }
@@ -808,9 +853,6 @@ impl McpServer {
             let pending = !self.pending_embed.lock().expect("pending embed poisoned").is_empty();
             if pending {
                 self.embed_current_paths(repo, &data_dir, &[]);
-                if let Err(e) = self.swap_engine(&data_dir) {
-                    tracing::warn!(error = %e, "auto-refresh: reopen failed");
-                }
             }
             return;
         }
@@ -825,18 +867,17 @@ impl McpServer {
         let mut cache = self.wt_cache.lock().expect("worktree cache poisoned");
         match indexio_ingest::reindex_worktree_cached(repo, &data_dir, &cas, Some(&mut cache)) {
             Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => {
-                // Semantic plane too (SPEC-P9 incremental embed): only the
-                // changed paths are chunked, diffed and appended.
-                let t_embed = std::time::Instant::now();
-                self.embed_current_paths(repo, &data_dir, &r.changed_paths);
-                let embed_ms = t_embed.elapsed().as_millis() as u64;
+                // the lexical plane is what this call needs: reopen now
                 if let Err(e) = self.swap_engine(&data_dir) {
                     tracing::warn!(error = %e, "auto-refresh: reopen failed");
                 }
+                // Semantic plane too (SPEC-P9 incremental embed): only the
+                // changed paths are chunked, diffed and appended — on a
+                // background thread, off this call (SPEC-P10 §37).
+                self.embed_current_paths(repo, &data_dir, &r.changed_paths);
                 drop(cache);
                 drop(watch);
                 self.maybe_compact();
-                tracing::debug!(embed_ms, "auto-refresh: semantic plane updated");
                 tracing::debug!(
                     repo,
                     added = r.docs_added,

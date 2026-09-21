@@ -159,7 +159,11 @@ fn add_folder_discovers_repos_then_sync_is_incremental() {
     assert_eq!(payload(1).as_array().unwrap().len(), 0, "not indexed before refresh");
     let r = payload(2);
     assert_eq!(r["reloaded"], true);
-    assert_eq!(r["changed_repos"], serde_json::json!(["web"]), "{r}");
+    // the server's first call also starts the background sync of the other
+    // repos, which may index the commit before refresh_index gets to it:
+    // either way the commit is picked up by this process
+    let changed = r["changed_repos"].as_array().unwrap();
+    assert!(changed.is_empty() || changed == &[serde_json::json!("web")], "{r}");
     assert_eq!(payload(3)[0]["path"], "src/fresh.ts", "visible after refresh, same process");
     let files: Vec<String> = payload(4)["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap().to_string()).collect();
     assert_eq!(files, vec!["src/app.ts".to_string(), "src/fresh.ts".to_string()]);

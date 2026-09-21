@@ -649,7 +649,21 @@ and plain folders (`under_skipped_dir`): an allow-list of hidden folders is inde
 `.husky`, `.changeset`, `.storybook`, `.well-known`), every other dot-directory is
 skipped as before.
 
-## 37. Next
+## 37. The embed leaves the call path too
+
+After an edit, the next call re-indexed the working tree and embedded the changed files
+before answering: 276 ms for a 3,000-line file, 149 of them the embed — for a call that
+wanted the lexical index. The two sessions on current binaries showed the shape as 750 ms
+stalls on the first call after a burst of edits. The lexical delta and the engine reopen
+stay on the call (134–175 ms for that file); the embed of the changed paths moves to a
+background thread that drains a queue (one thread at a time, serialised with the
+other-repos sync through one in-process lock, joined at shutdown) and sets
+`reload_needed`, so the vectors land about 250 ms later and the next call adopts them. A
+batch another server's append makes fail stays queued for the next refresh, as before.
+`tests/e2e_refresh.rs` pins both halves: an edit is lexically visible on the very next
+call and semantically within a few calls.
+
+## 38. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

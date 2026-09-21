@@ -1465,7 +1465,16 @@ fn internal(msg: impl Into<String>) -> (i64, String) {
 }
 
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
+    // the names agents reach for from the built-in tools (SPEC-P10 §38):
+    // `query` for a grep pattern, `symbol` for a symbol name, `file` for a path
+    let alias = match key {
+        "pattern" => Some("query"),
+        "name" => Some("symbol"),
+        "path" => Some("file"),
+        _ => None,
+    };
     args.get(key)
+        .or_else(|| alias.and_then(|a| args.get(a)))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid(format!("missing or invalid '{key}' parameter")))
@@ -3055,6 +3064,13 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","repo":"nosuchrepo"}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert!(payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
+        // `query` for the pattern, `symbol` for a name: the built-in tools' words
+        let req = r#"{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"code_grep","arguments":{"query":"foo_bar"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert!(!payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
+        let req = r#"{"jsonrpc":"2.0","id":67,"method":"tools/call","params":{"name":"who_calls","arguments":{"symbol":"foo_bar_123"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert_eq!(payload_of(&v).as_array().unwrap()[0]["path"], "src/caller.rs", "{v}");
         // Grep's head_limit is accepted as the per-file line cap
         let req = r#"{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","head_limit":1}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());

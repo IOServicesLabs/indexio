@@ -308,6 +308,74 @@ pub struct OutlineItem {
     pub end_line: u32,
 }
 
+/// The outline of a markdown document (SPEC-P10 §38): one item per ATX
+/// heading (`#` to `######`, outside fenced code), named by its text, kind
+/// `Section`, scoped by its ancestor headings (`Install::Windows`), and
+/// spanning to the line before the next heading of the same or a higher
+/// level. `read_span` with no `end` on a heading line then returns the
+/// whole section, as it returns a whole function in code.
+pub fn markdown_outline(content: &[u8]) -> Vec<OutlineItem> {
+    let text = String::from_utf8_lossy(content);
+    let mut heads: Vec<(u32, usize, String)> = Vec::new(); // (line, level, title)
+    let mut in_fence = false;
+    let mut total = 0u32;
+    for (i, raw) in text.lines().enumerate() {
+        total = i as u32 + 1;
+        let line = raw.trim_end();
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || !line.starts_with('#') {
+            continue;
+        }
+        let level = line.chars().take_while(|&c| c == '#').count();
+        if level > 6 || !line[level..].starts_with(' ') {
+            continue;
+        }
+        let title = line[level..].trim().trim_end_matches('#').trim();
+        if title.is_empty() {
+            continue;
+        }
+        heads.push((i as u32 + 1, level, title.to_string()));
+    }
+    let mut out = Vec::with_capacity(heads.len());
+    for (idx, (line, level, title)) in heads.iter().enumerate() {
+        let end = heads[idx + 1..]
+            .iter()
+            .find(|(_, l, _)| l <= level)
+            .map(|(next, _, _)| next - 1)
+            .unwrap_or(total)
+            .max(*line);
+        // ancestors: the nearest preceding heading of each higher level
+        let mut scope: Vec<&str> = Vec::new();
+        let mut want = level - 1;
+        for (_, l, t) in heads[..idx].iter().rev() {
+            if want == 0 {
+                break;
+            }
+            if *l == want {
+                scope.push(t);
+                want -= 1;
+            } else if *l < want {
+                want = *l;
+                scope.push(t);
+                want -= 1;
+            }
+        }
+        scope.reverse();
+        out.push(OutlineItem {
+            name: title.clone(),
+            kind: SymbolKind::Section,
+            scope: scope.join("::"),
+            start_line: *line,
+            end_line: end,
+        });
+    }
+    out
+}
+
 /// The definitions `extract` reports, each with the full range of its
 /// definition node. Sorted by (start_line asc, end_line desc) so containers
 /// precede their members. Empty for unsupported languages; never panics.
@@ -705,6 +773,22 @@ pub mod chunking;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_headings_become_sections_with_ranges_and_scopes() {
+        let md = b"# Title\n\nintro\n\n## Install\n\ntext\n\n### Windows\n\n```sh\n# not a heading\n```\n\n### Linux\n\nx\n\n## Use\n\ny\n";
+        let o = markdown_outline(md);
+        let names: Vec<&str> = o.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["Title", "Install", "Windows", "Linux", "Use"]);
+        assert!(o.iter().all(|i| i.kind == SymbolKind::Section));
+        let by = |n: &str| o.iter().find(|i| i.name == n).unwrap();
+        assert_eq!((by("Title").start_line, by("Title").end_line), (1, 21));
+        assert_eq!((by("Install").start_line, by("Install").end_line), (5, 18));
+        assert_eq!((by("Windows").start_line, by("Windows").end_line), (9, 14));
+        assert_eq!(by("Windows").scope, "Title::Install");
+        assert_eq!(by("Use").scope, "Title");
+        assert!(markdown_outline(b"no headings here\n").is_empty());
+    }
 
     fn sym<'a>(symbols: &'a [SymbolRec], name: &str, kind: SymbolKind) -> Option<&'a SymbolRec> {
         symbols.iter().find(|s| s.name == name && s.kind == kind)

@@ -169,6 +169,8 @@ pub enum SymbolKind {
     Method = 9,
     Var = 10,
     Interface = 11,
+    /// A markdown heading (SPEC-P10 §38): the outline of a document.
+    Section = 12,
 }
 
 impl SymbolKind {
@@ -185,6 +187,7 @@ impl SymbolKind {
             8 => SymbolKind::Type,
             9 => SymbolKind::Method,
             10 => SymbolKind::Var,
+            12 => SymbolKind::Section,
             _ => SymbolKind::Interface,
         }
     }
@@ -205,6 +208,7 @@ impl SymbolKind {
             SymbolKind::Method => "method",
             SymbolKind::Var => "var",
             SymbolKind::Interface => "interface",
+            SymbolKind::Section => "section",
         }
     }
 }

@@ -694,7 +694,13 @@ impl Engine {
             return Some(std::sync::Arc::clone(o));
         }
         let content = self.set.content(si, docid).ok()?;
-        let items = std::sync::Arc::new(ts_outline(dm.lang, &content));
+        let lower = dm.path.to_ascii_lowercase();
+        let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdx");
+        let items = std::sync::Arc::new(if dm.lang == Lang::Text && is_markdown {
+            indexio_symbols::markdown_outline(&content)
+        } else {
+            ts_outline(dm.lang, &content)
+        });
         if let Ok(mut cache) = self.outline_cache.lock() {
             if cache.len() >= CAP {
                 cache.clear();

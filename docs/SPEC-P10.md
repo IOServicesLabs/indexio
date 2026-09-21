@@ -663,7 +663,19 @@ batch another server's append makes fail stays queued for the next refresh, as b
 `tests/e2e_refresh.rs` pins both halves: an edit is lexically visible on the very next
 call and semantically within a few calls.
 
-## 38. Next
+## 38. Documents have an outline too; the built-in tools' argument names work
+
+A session asked `file_outline` for a README and got `0 definitions`, then read the whole
+file. Markdown has no symbols, but its headings are its outline: `markdown_outline` turns
+each ATX heading (outside fenced code) into a `section` item named by its text, scoped by
+its ancestors and spanning to the next heading of the same or a higher level. This
+repository's README outlines in 1.4 KB instead of the 32 KB the file is, and `read_span`
+on a heading line with no `end` returns that section, as it returns a whole function in
+code. The same session also sent `query` to `code_grep` and `symbol` to `who_calls` — the
+built-in tools' words — and lost a turn to each; `query`, `symbol` and `file` are now
+accepted as aliases of `pattern`, `name` and `path`.
+
+## 39. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

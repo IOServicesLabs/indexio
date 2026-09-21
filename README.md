@@ -269,7 +269,7 @@ To run a refused command as typed, add `# raw` to it and send it again, or set
 | `who_calls` | Every recorded caller of a symbol. |
 | `semantic_search` | Vector search only. |
 | `list_files` | A glob or substring over indexed paths, folded by directory. No pattern lists every file. |
-| `file_outline` | Every definition of a file with its start and end lines. A few hundred tokens instead of the file. |
+| `file_outline` | Every definition of a file with its start and end lines, or the headings of a markdown file. A few hundred tokens instead of the file. |
 | `read_span` | An exact line range of an indexed file. Without an end line, the whole definition at the start line. |
 | `impact_of_symbol` | The transitive callers of a symbol across all repositories. |
 | `impact_of_diff` | The callers and importers touched by a patch or by the uncommitted working tree. |

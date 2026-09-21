@@ -1233,6 +1233,7 @@ fn tools_list() -> Value {
                     "pattern": string_prop("regex (may end with repo:/path:/lang: filters)"),
                     "repo": string_prop("only this repo (optional; same as a repo: filter)"),
                     "path": string_prop("only paths containing this (optional; same as a path: filter)"),
+                    "head_limit": json!({ "type": "integer", "description": "alias of lines (Grep's name for it)", "minimum": 1 }),
                     "limit": limit_prop,
                     "lines": json!({ "type": "integer", "description": "matching lines per file (default 20, max 100)", "minimum": 1 }),
                 }),
@@ -1693,7 +1694,12 @@ fn call_tool(
             }
             let pattern = pattern.as_str();
             let limit = opt_limit(args)?;
-            let lines = opt_usize(args, "lines", GREP_LINES_PER_FILE)?.clamp(1, MAX_LINES_PER_FILE);
+            // Grep's `head_limit` (agents send it) caps the lines per file too
+            let default_lines = match args.get("head_limit").and_then(Value::as_u64) {
+                Some(n) if args.get("lines").is_none() => (n as usize).max(1),
+                _ => GREP_LINES_PER_FILE,
+            };
+            let lines = opt_usize(args, "lines", default_lines)?.clamp(1, MAX_LINES_PER_FILE);
             // an unbalanced parenthesis (`):.*=>` meaning a literal `)`) is
             // escaped and retried instead of failing the call (SPEC-P10 §33)
             let (query, note) = match grep_query(pattern) {
@@ -3008,6 +3014,15 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","repo":"nosuchrepo"}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert!(payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
+        // Grep's head_limit is accepted as the per-file line cap
+        let req = r#"{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"foo_bar","head_limit":1}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        let hits = payload_of(&v)["hits"].as_array().unwrap().clone();
+        let mut per_file = std::collections::HashMap::new();
+        for h in &hits {
+            *per_file.entry(h["path"].as_str().unwrap().to_string()).or_insert(0) += 1;
+        }
+        assert!(per_file.values().all(|&n| n == 1), "{v}");
     }
 
     #[test]

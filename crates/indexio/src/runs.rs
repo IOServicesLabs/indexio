@@ -194,6 +194,9 @@ pub fn run(data_dir: &Path, cwd: &Path, command: &str) -> anyhow::Result<i32> {
         }
         return Ok(exit);
     }
+    // the stored log is indexed and searchable for 30 days: secrets the
+    // command printed (an env dump, a connection string) stay out of it
+    let text = crate::redact::redact(&text).into_owned();
     let repo = repo_for(data_dir, cwd);
     let dir = data_dir.join(REPO).join(&repo);
     fs::create_dir_all(&dir)?;

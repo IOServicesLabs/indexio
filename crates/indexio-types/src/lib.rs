@@ -96,7 +96,41 @@ impl Lang {
             _ => Lang::Unknown,
         }
     }
+    /// Files that carry credentials or key material and are never indexed,
+    /// whatever their extension says (SPEC-P10 §39): environment files,
+    /// private keys and certificates, keystores, PGP material, Terraform
+    /// state, netrc. Matched on the file name only.
+    pub fn is_secret_path(path: &str) -> bool {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let lower = name.to_ascii_lowercase();
+        if lower == ".env"
+            || lower.starts_with(".env.")
+            || lower.ends_with(".env")
+            || lower == ".netrc"
+            || lower == ".pgpass"
+            || lower == ".npmrc"
+            || lower == ".pypirc"
+            || lower.starts_with("id_rsa")
+            || lower.starts_with("id_dsa")
+            || lower.starts_with("id_ecdsa")
+            || lower.starts_with("id_ed25519")
+        {
+            return !lower.ends_with(".pub") && !lower.ends_with(".example") && !lower.ends_with(".sample") && !lower.ends_with(".template");
+        }
+        let ext = match lower.rfind('.') {
+            Some(i) if i > 0 => &lower[i + 1..],
+            _ => "",
+        };
+        matches!(
+            ext,
+            "pem" | "key" | "p12" | "pfx" | "jks" | "keystore" | "gpg" | "pgp" | "asc" | "der" | "crt" | "cer" | "kdbx" | "ovpn" | "tfstate"
+        )
+    }
+
     pub fn from_path(path: &str) -> Lang {
+        if Lang::is_secret_path(path) {
+            return Lang::Unknown;
+        }
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         let lower = name.to_ascii_lowercase();
         // generated / lock / minified files: never worth a lookup
@@ -126,7 +160,7 @@ impl Lang {
             "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "c++" => Lang::Cpp,
             // docs, configs, data, scripts, markup, styles
             "md" | "markdown" | "mdx" | "rst" | "txt" | "adoc" | "org"
-            | "json" | "jsonc" | "json5" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "env" | "properties"
+            | "json" | "jsonc" | "json5" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "properties"
             | "xml" | "html" | "htm" | "css" | "scss" | "sass" | "less" | "svg" | "vue" | "svelte" | "astro"
             | "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "bat" | "cmd"
             | "sql" | "graphql" | "gql" | "proto" | "thrift"

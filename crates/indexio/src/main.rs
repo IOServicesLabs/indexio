@@ -9,6 +9,7 @@ mod impact_cli;
 mod mcp;
 mod hook;
 mod mcp_text;
+mod redact;
 mod runs;
 mod sessions;
 mod usage;

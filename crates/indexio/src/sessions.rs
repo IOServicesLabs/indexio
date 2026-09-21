@@ -220,7 +220,7 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
             }
             "summary" => {
                 if let Some(s) = o["summary"].as_str() {
-                    entries.push(format!("## compaction summary\n{}\n", cap(s, TEXT_CAP)));
+                    entries.push(format!("## compaction summary\n{}\n", crate::redact::redact(&cap(s, TEXT_CAP))));
                 }
             }
             "user" | "assistant" => {
@@ -289,6 +289,8 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
                     _ => {}
                 }
                 if !body.trim().is_empty() {
+                    // what the agent saw may include what it must not keep (§39)
+                    let body = crate::redact::redact(&body);
                     entries.push(format!("## {ts} {role}{side}\n{body}"));
                 }
             }

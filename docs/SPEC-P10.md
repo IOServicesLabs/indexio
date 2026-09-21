@@ -675,7 +675,34 @@ code. The same session also sent `query` to `code_grep` and `symbol` to `who_cal
 built-in tools' words — and lost a turn to each; `query`, `symbol` and `file` are now
 accepted as aliases of `pattern`, `name` and `path`.
 
-## 39. Next
+## 39. Credentials stay out of the index
+
+A check of a live data directory found an untracked `scratch/prod.env` with an API key, a
+database URL and an auth token indexed and embedded: `.env` was on the text-extension
+list, and a plain-folder or working-tree walk reads untracked files. Two rules now:
+
+- **A denylist by file name** (`Lang::is_secret_path`): `.env`, `.env.*`, `*.env`,
+  `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `id_rsa`-style private keys, and the
+  `pem`, `key`, `p12`, `pfx`, `jks`, `keystore`, `gpg`, `pgp`, `asc`, `der`, `crt`, `cer`,
+  `kdbx`, `ovpn` and `tfstate` extensions. `.env.example`, `*.sample`, `*.template` and
+  `*.pub` are kept. These files are never indexed, and a doc of that name indexed by an
+  earlier build is purged by the next delta whether or not the file still exists — unlike
+  a file type the running build merely does not know (§33). `indexio compact` then drops
+  the content from the shards.
+- **Redaction of what an agent saw** (`redact.rs`): the rendered transcripts and the
+  stored run logs carried the same values wherever a session had printed its environment
+  or a connection string. Before either is written, assignments to secret-looking names
+  (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `DATABASE_URL` …) lose their value when it is
+  long enough and carries a digit or is token-length, passwords inside URLs are masked,
+  and the well-known shapes (`sk-`, `AKIA`, `ghp_`, `xox*-`, `AIza`, JWTs, PEM private
+  keys, bearer tokens) are replaced wherever they appear. Names, ports, code and prose are
+  untouched: `let key = std::env::var("API_KEY")` is code. Existing renderings are
+  refreshed by deleting `sessions/*/.import-state.json` and running `indexio sessions`.
+
+What is not covered: a secret committed inside source code or a JSON/YAML config with an
+unremarkable name is indexed like any other line of that file, as `grep` would find it.
+
+## 40. Next
 
 - Product quantisation (≈256 B/chunk with the binary codes as the prescan) when the
   corpus outgrows int8.

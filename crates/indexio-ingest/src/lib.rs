@@ -774,10 +774,16 @@ fn delta_by_content(
         // newer binary indexed) is not a deleted file: leave it to the
         // binary that knows it, or two versions serving one data dir
         // add and tombstone the same docs in turns.
-        if Lang::from_path(old_path) == Lang::Unknown && state.path.join(old_path).is_file() {
+        if !Lang::is_secret_path(old_path) && Lang::from_path(old_path) == Lang::Unknown && state.path.join(old_path).is_file() {
             continue;
         }
         doomed.insert((*old_path).to_string());
+    }
+    // credentials indexed by an earlier build are purged, present or not
+    for (_, _, dm) in &prev_docs {
+        if Lang::is_secret_path(&dm.path) {
+            doomed.insert(dm.path.clone());
+        }
     }
     let mut changed_paths: Vec<String> = to_index.iter().map(|(p, _)| p.clone()).collect();
     changed_paths.extend(doomed.iter().cloned());
@@ -1141,6 +1147,12 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
                     doomed_paths.insert(old_path.clone());
                 }
             }
+            // credentials indexed by an earlier build are purged
+            for (_, _, dm) in &prev_docs {
+                if Lang::is_secret_path(&dm.path) {
+                    doomed_paths.insert(dm.path.clone());
+                }
+            }
 
             let contents = read_all(&repo, to_index)?;
             (extract_docs(contents, cas), Tombstones::Paths(doomed_paths))
@@ -1373,6 +1385,35 @@ mod tests {
         let r = reindex_dir(&state, data.path(), &cas, None).unwrap();
         assert_eq!((r.docs_added, r.docs_deleted), (0, 1), "{r:?}");
         assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"]);
+    }
+
+    #[test]
+    fn credential_files_are_never_indexed_and_old_ones_are_purged() {
+        assert!(Lang::is_secret_path("prod.env"));
+        assert!(Lang::is_secret_path("app/.env"));
+        assert!(Lang::is_secret_path(".env.production"));
+        assert!(Lang::is_secret_path("certs/server.pem"));
+        assert!(Lang::is_secret_path("infra/terraform.tfstate"));
+        assert!(!Lang::is_secret_path(".env.example"));
+        assert!(!Lang::is_secret_path("id_rsa.pub"));
+        assert!(!Lang::is_secret_path("src/config/secrets.ts"), "code that reads secrets is code");
+        assert_eq!(Lang::from_path("prod.env"), Lang::Unknown);
+        let dir = tempfile::tempdir().unwrap();
+        write_files(dir.path(), &[("util.py", UTIL_PY), ("prod.env", b"API_KEY=sk-live-0000\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        index_dir(dir.path(), "p1", data.path(), &cas).unwrap();
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"]);
+        // an earlier build indexed it: the next delta purges it, though the file exists
+        let mut docs = extract_docs(vec![("prod.py".to_string(), b"API_KEY=sk-live-0000\n".to_vec())], &cas);
+        docs[0].meta.path = "prod.env".to_string();
+        write_shard(&data.path().join("shards"), "p1", &docs).unwrap();
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["prod.env", "util.py"]);
+        let state = load_state(data.path(), "p1").unwrap();
+        let r = reindex_dir(&state, data.path(), &cas, None).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (0, 1), "{r:?}");
+        assert_eq!(visible_paths(data.path(), "p1"), vec!["util.py"]);
+        assert!(!content_contains(data.path(), "p1", b"sk-live-0000"));
     }
 
     #[test]

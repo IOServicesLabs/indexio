@@ -1495,6 +1495,7 @@ dependencies = [
  "indexio-symbols",
  "indexio-types",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

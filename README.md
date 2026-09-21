@@ -54,18 +54,19 @@ All data goes into one directory: `--data-dir`, `$INDEXIO_DATA_DIR`, or `~/.inde
 2. [Add sources](#add-sources)
 3. [Keep the index current](#keep-the-index-current)
 4. [Embeddings](#embeddings)
-5. [Secure the HTTP API](#secure-the-http-api)
-6. [Use indexio with Claude Code](#use-indexio-with-claude-code)
-7. [Token savings, measured](#token-savings-measured)
-8. [Impact analysis](#impact-analysis)
-9. [Use indexio from other tools](#use-indexio-from-other-tools)
-10. [Command reference](#command-reference)
-11. [Environment variables](#environment-variables)
-12. [Deploy with Docker](#deploy-with-docker)
-13. [Architecture](#architecture)
-14. [Measured performance](#measured-performance)
-15. [Limits](#limits)
-16. [Development and releases](#development-and-releases)
+5. [What is never indexed](#what-is-never-indexed)
+6. [Secure the HTTP API](#secure-the-http-api)
+7. [Use indexio with Claude Code](#use-indexio-with-claude-code)
+8. [Token savings, measured](#token-savings-measured)
+9. [Impact analysis](#impact-analysis)
+10. [Use indexio from other tools](#use-indexio-from-other-tools)
+11. [Command reference](#command-reference)
+12. [Environment variables](#environment-variables)
+13. [Deploy with Docker](#deploy-with-docker)
+14. [Architecture](#architecture)
+15. [Measured performance](#measured-performance)
+16. [Limits](#limits)
+17. [Development and releases](#development-and-releases)
 
 ## What indexio does
 
@@ -181,6 +182,24 @@ export INDEXIO_RERANK_BASE=http://rerank.internal.example:8081
 export INDEXIO_RERANK_MODEL=Qwen/Qwen3-Reranker-8B
 export INDEXIO_RERANK_KEY=...
 ```
+
+## What is never indexed
+
+- Files without a known code, document, configuration, script or data extension, such as
+  databases, images, archives and compiled output.
+- Binary content: a NUL byte in the first 8 KiB skips the file. Files over 4 MiB, and
+  text files over 256 KiB.
+- Build output, dependency and cache folders (`node_modules`, `target`, `dist`, `vendor`,
+  any folder with a `CACHEDIR.TAG`), git-ignored files, hidden folders except the
+  configuration ones (`.github`, `.cargo`, `.vscode`, `.devcontainer` …), lock, minified
+  and source-map files.
+- Credentials: `.env` files, private keys and certificates (`pem`, `key`, `p12`, `pfx`,
+  `jks`, `gpg` …), `.netrc`, `.npmrc`, Terraform state. A credential file indexed by an
+  earlier version is removed by the next sync. `.env.example` and `*.pub` are kept.
+
+The session transcripts and run logs that `recall` searches are redacted before they are
+stored: values of secret-looking settings, passwords in URLs, API keys, bearer tokens,
+JWTs and private-key blocks are replaced with `<redacted>`.
 
 ## Secure the HTTP API
 

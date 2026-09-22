@@ -36,6 +36,38 @@ function fetch(url, redirects = 5) {
   });
 }
 
+/// Unpack `file` into `dir`. On Windows the `tar` first on PATH is often
+/// Git's GNU tar, which reads `C:\...` as a remote host ("Cannot connect
+/// to C"), so the system bsdtar is called by its full path and PowerShell's
+/// Expand-Archive is the fallback. Elsewhere plain `tar` handles both.
+function extract(file, dir) {
+  const attempts = [];
+  if (process.platform === "win32") {
+    const sysTar = path.join(process.env.SystemRoot || "C:\Windows", "System32", "tar.exe");
+    if (fs.existsSync(sysTar)) {
+      attempts.push(() => execFileSync(sysTar, ["-xf", file, "-C", dir], { stdio: "inherit" }));
+    }
+    attempts.push(() =>
+      execFileSync(
+        "powershell",
+        ["-NoProfile", "-NonInteractive", "-Command", `Expand-Archive -LiteralPath '${file}' -DestinationPath '${dir}' -Force`],
+        { stdio: "inherit" }
+      )
+    );
+  }
+  attempts.push(() => execFileSync("tar", ["-xf", file, "-C", dir], { stdio: "inherit" }));
+  let last;
+  for (const run of attempts) {
+    try {
+      run();
+      return;
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last;
+}
+
 async function main() {
   if (process.env.INDEXIO_SKIP_DOWNLOAD) return;
   if (!platform || !arch) {
@@ -53,8 +85,7 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "indexio-"));
   const file = path.join(tmp, `${name}.${ext}`);
   fs.writeFileSync(file, archive);
-  // bsdtar on Windows 10+ and GNU tar both extract zip and tar.gz
-  execFileSync("tar", ["-xf", file, "-C", tmp], { stdio: "inherit" });
+  extract(file, tmp);
   fs.mkdirSync(vendor, { recursive: true });
   fs.copyFileSync(path.join(tmp, name, path.basename(exe)), exe);
   fs.chmodSync(exe, 0o755);

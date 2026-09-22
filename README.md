@@ -1,5 +1,10 @@
 # indexio
 
+[![release](https://img.shields.io/github/v/release/IOServicesLabs/indexio?label=release)](https://github.com/IOServicesLabs/indexio/releases)
+[![npm](https://img.shields.io/npm/v/indexio?label=npm)](https://www.npmjs.com/package/indexio)
+[![PyPI](https://img.shields.io/pypi/v/indexio-cli?label=pypi)](https://pypi.org/project/indexio-cli/)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 indexio is a code search engine for AI coding agents. It indexes all the repositories of an
 organization one time. It answers a query in milliseconds. It gives the index to agents as
 a tool through the Model Context Protocol (MCP) and through an HTTP API.
@@ -64,11 +69,15 @@ Pick one. Each one gives you the `indexio` command.
 | npm (any platform) | `npm install -g indexio` |
 | pip (any platform) | `pip install indexio-cli` |
 | Docker | `docker pull ghcr.io/ioserviceslabs/indexio` |
+| Homebrew, winget | not yet; use a script or a package above |
 | From source (Rust 1.85+) | `cargo install --git https://github.com/IOServicesLabs/indexio indexio` |
 
 The scripts and the npm package download the binary of the latest
 [release](https://github.com/IOServicesLabs/indexio/releases) for your OS and CPU and
-check its SHA-256. The pip wheels carry the binary inside them, one wheel per platform. `git` must be on the PATH. No service, no database and no model download
+check its SHA-256. The pip wheels carry the binary inside them, one wheel per platform.
+The pip package is called `indexio-cli` because `indexio` on PyPI belongs to an unrelated
+project; the command it installs is `indexio`. The container image works with no install
+at all: see [Deploy with Docker](#deploy-with-docker). `git` must be on the PATH. No service, no database and no model download
 is necessary.
 
 ## Quick start

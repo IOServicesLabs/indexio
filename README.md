@@ -21,7 +21,7 @@ to me. Do these steps in order and stop at the first failure with the exact erro
 1. Install the binary.
    - Linux or macOS:  curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh | sh
    - Windows (PowerShell):  irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 | iex
-   - If neither works, use `npm install -g indexio`, or `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
+   - If neither works, use `pip install indexio-cli`, `npm install -g indexio`, or `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
    The binary lands in ~/.local/bin (Linux, macOS) or %LOCALAPPDATA%\Programs\indexio (Windows).
    If `indexio --version` is not found afterwards, add that folder to PATH and open a new shell.
    `git` must be on PATH.
@@ -62,12 +62,13 @@ Pick one. Each one gives you the `indexio` command.
 | Linux, macOS | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
 | Windows (PowerShell) | `irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 \| iex` |
 | npm (any platform) | `npm install -g indexio` |
+| pip (any platform) | `pip install indexio-cli` |
 | Docker | `docker pull ghcr.io/ioserviceslabs/indexio` |
 | From source (Rust 1.85+) | `cargo install --git https://github.com/IOServicesLabs/indexio indexio` |
 
 The scripts and the npm package download the binary of the latest
 [release](https://github.com/IOServicesLabs/indexio/releases) for your OS and CPU and
-check its SHA-256. `git` must be on the PATH. No service, no database and no model download
+check its SHA-256. The pip wheels carry the binary inside them, one wheel per platform. `git` must be on the PATH. No service, no database and no model download
 is necessary.
 
 ## Quick start
@@ -758,9 +759,11 @@ Releases (`.github/workflows/release.yml`) come from `main`:
 2. Merge to `main`. In less than 90 seconds the workflow creates the tag `v<version>` and a
    GitHub release with generated notes. A merge without a version change does nothing.
 3. The same workflow then builds the binaries for Linux (x86_64, aarch64), macOS (Apple
-   silicon, Intel) and Windows (x86_64), attaches each archive with a `.sha256` to the
-   release, publishes the container image to `ghcr.io`, and publishes the npm package when
-   the `NPM_TOKEN` secret exists. These jobs compile Rust and take some minutes.
+   silicon, Intel) and Windows (x86_64), attaches each archive with a `.sha256` and a pip
+   wheel to the release, publishes the container image to `ghcr.io`, publishes the npm
+   package when the `NPM_TOKEN` secret exists, and publishes the `indexio-cli` wheels to
+   PyPI through trusted publishing when the `PYPI_PUBLISH` repository variable is `true`.
+   These jobs compile Rust and take some minutes.
 
 `tools/release-assets.sh` builds and attaches one asset from a maintainer machine, for a
 platform the workflow does not cover.

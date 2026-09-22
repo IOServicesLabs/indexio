@@ -20,7 +20,7 @@ jobs:
         run: |
           timeout --signal=KILL 90 bash -eo pipefail -c '
             cargo metadata --no-deps --format-version 1 > /dev/null
-            python3 -m py_compile bench/*.py tools/*.py
+            python3 -m py_compile bench/*.py tools/*.py pypi/src/indexio_cli/*.py
             bash -n install.sh tools/*.sh
             node --check npm/install.js npm/bin/indexio.js
             node -e "JSON.parse(require(\"fs\").readFileSync(\"npm/package.json\"))"

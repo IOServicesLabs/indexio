@@ -9,6 +9,9 @@ name: release
 #             assembled from the Linux binaries above
 #   npm       the `indexio` package (postinstall downloads the matching binary);
 #             only when the NPM_TOKEN secret exists
+#   pypi      the `indexio-cli` wheels (one per platform, binary bundled) through
+#             PyPI trusted publishing; only when the PYPI_PUBLISH variable is "true".
+#             The wheels are attached to the GitHub release either way.
 #
 # The asset jobs compile Rust, which cannot fit the 90-second budget of the
 # other workflows; they carry their own timeouts and run only when a release
@@ -77,11 +80,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   cross: false }
-          - { os: ubuntu-22.04,   target: aarch64-unknown-linux-gnu, name: linux-aarch64,  cross: true }
-          - { os: macos-14,       target: aarch64-apple-darwin,      name: macos-aarch64,  cross: false }
-          - { os: macos-14,       target: x86_64-apple-darwin,       name: macos-x86_64,   cross: false }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, cross: false }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   cross: false, pytag: manylinux_2_35_x86_64 }
+          - { os: ubuntu-22.04,   target: aarch64-unknown-linux-gnu, name: linux-aarch64,  cross: true,  pytag: manylinux_2_31_aarch64 }
+          - { os: macos-14,       target: aarch64-apple-darwin,      name: macos-aarch64,  cross: false, pytag: macosx_11_0_arm64 }
+          - { os: macos-14,       target: x86_64-apple-darwin,       name: macos-x86_64,   cross: false, pytag: macosx_10_12_x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, cross: false, pytag: win_amd64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
@@ -141,6 +144,33 @@ jobs:
         shell: bash
         run: gh release upload "$TAG" "dist/${ASSET}" "dist/${ASSET}.sha256" --clobber
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the pip wheel (binary bundled, platform-tagged)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.name }}" in
+            windows-*) bin=indexio.exe ;;
+            *) bin=indexio ;;
+          esac
+          mkdir -p pypi/src/indexio_cli/bin
+          cp "target/${{ matrix.target }}/release/${bin}" pypi/src/indexio_cli/bin/
+          sed -i.bak "s/^version = \"0.0.0\"/version = \"${VERSION}\"/" pypi/pyproject.toml && rm -f pypi/pyproject.toml.bak
+          python -m pip install --quiet build wheel
+          (cd pypi && python -m build --wheel)
+          python -m wheel tags --python-tag py3 --abi-tag none --platform-tag "${{ matrix.pytag }}" --remove pypi/dist/*.whl
+          ls pypi/dist
+          gh release upload "$TAG" pypi/dist/*.whl --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: pypi/dist/*.whl
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         if: startsWith(matrix.name, 'linux-')
         with:
@@ -189,6 +219,28 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.release.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
+
+  pypi:
+    needs: [release, binaries]
+    if: needs.release.outputs.build == 'true' && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
 
   npm:
     needs: [release, binaries]

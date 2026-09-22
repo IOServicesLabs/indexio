@@ -17,3 +17,6 @@ __pycache__/
 /npm/node_modules/
 # local agent state
 /.claude/
+/pypi/src/indexio_cli/bin/
+/pypi/dist/
+/pypi/build/

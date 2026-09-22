@@ -8,6 +8,51 @@ indexio is one binary, written in Rust. It does not need a database or an extern
 service. The index is a set of files in one data directory. You can copy that directory to
 another machine.
 
+## Let your agent install it
+
+Paste the block below to Claude Code, Cursor, Codex or any coding agent that can run
+shell commands. It installs indexio, indexes your code, registers the MCP server and
+verifies the result. Replace `~/code` with the folder that holds your repositories.
+
+````text
+Install indexio (https://github.com/IOServicesLabs/indexio) on this machine and connect it
+to me. Do these steps in order and stop at the first failure with the exact error.
+
+1. Install the binary.
+   - Linux or macOS:  curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh | sh
+   - Windows (PowerShell):  irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 | iex
+   - If neither works, use `npm install -g indexio`, or `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
+   The binary lands in ~/.local/bin (Linux, macOS) or %LOCALAPPDATA%\Programs\indexio (Windows).
+   If `indexio --version` is not found afterwards, add that folder to PATH and open a new shell.
+   `git` must be on PATH.
+
+2. Index my code:  indexio add ~/code
+   This registers every git repository under the folder at any depth and builds the index.
+   Nothing is uploaded; the index lives in ~/.indexio.
+
+3. Register the MCP server with the agent you are.
+   - Claude Code:  indexio setup claude --claude-md ~/.claude/CLAUDE.md
+     then  indexio hook install
+     (the hooks route file reads and greps through the index; scripts and builds run as before)
+   - Any other MCP client: add this server to its MCP configuration and restart the client:
+       command: indexio   args: ["mcp"]
+     Use the absolute path of the binary if the client does not search PATH.
+
+4. Verify. All four must succeed:
+   - indexio --version                  prints a version
+   - indexio stats                      lists the repositories and a file count above zero
+   - indexio search "TODO" --limit 3    returns hits from my code
+   - indexio usage                      prints a report (it is empty until I use the tools)
+
+5. Tell me what was installed, where the data directory is, which repositories were
+   indexed, and that I must restart my agent session so it picks up the new MCP server.
+   Do not modify any file inside my repositories.
+````
+
+What the agent gets afterwards: `code_search`, `code_grep`, `find_symbol`, `who_calls`,
+`file_outline`, `read_span`, `impact_of_symbol`, `impact_of_diff` and `recall` as tools,
+answered from the index in milliseconds. The [tools table](#the-tools) describes each one.
+
 ## Install
 
 Pick one. Each one gives you the `indexio` command.
@@ -50,23 +95,24 @@ All data goes into one directory: `--data-dir`, `$INDEXIO_DATA_DIR`, or `~/.inde
 
 ## Contents
 
-1. [What indexio does](#what-indexio-does)
-2. [Add sources](#add-sources)
-3. [Keep the index current](#keep-the-index-current)
-4. [Embeddings](#embeddings)
-5. [What is never indexed](#what-is-never-indexed)
-6. [Secure the HTTP API](#secure-the-http-api)
-7. [Use indexio with Claude Code](#use-indexio-with-claude-code)
-8. [Token savings, measured](#token-savings-measured)
-9. [Impact analysis](#impact-analysis)
-10. [Use indexio from other tools](#use-indexio-from-other-tools)
-11. [Command reference](#command-reference)
-12. [Environment variables](#environment-variables)
-13. [Deploy with Docker](#deploy-with-docker)
-14. [Architecture](#architecture)
-15. [Measured performance](#measured-performance)
-16. [Limits](#limits)
-17. [Development and releases](#development-and-releases)
+1. [Let your agent install it](#let-your-agent-install-it)
+2. [What indexio does](#what-indexio-does)
+3. [Add sources](#add-sources)
+4. [Keep the index current](#keep-the-index-current)
+5. [Embeddings](#embeddings)
+6. [What is never indexed](#what-is-never-indexed)
+7. [Secure the HTTP API](#secure-the-http-api)
+8. [Use indexio with Claude Code](#use-indexio-with-claude-code)
+9. [Token savings, measured](#token-savings-measured)
+10. [Impact analysis](#impact-analysis)
+11. [Use indexio from other tools](#use-indexio-from-other-tools)
+12. [Command reference](#command-reference)
+13. [Environment variables](#environment-variables)
+14. [Deploy with Docker](#deploy-with-docker)
+15. [Architecture](#architecture)
+16. [Measured performance](#measured-performance)
+17. [Limits](#limits)
+18. [Development and releases](#development-and-releases)
 
 ## What indexio does
 

@@ -3,8 +3,11 @@ name: release
 # A merge to main whose Cargo.toml version has no release yet gets one:
 #
 #   release   tag v<version> + GitHub release with generated notes (90 s cap)
-#   binaries  Linux x86_64/aarch64, macOS Apple silicon/Intel, Windows x86_64,
+#   binaries  Linux x86_64/aarch64, Windows x86_64,
 #             each a .tar.gz/.zip with a .sha256, attached to the release
+#             (macOS legs removed 2026-09-22: 10x billing, Darwin binaries
+#             not needed right now; npm postinstall / pip find no mac assets
+#             until the two matrix rows return from git history)
 #   docker    ghcr.io/<owner>/indexio:<version> and :latest, linux/amd64+arm64,
 #             assembled from the Linux binaries above
 #   npm       the `indexio` package (postinstall downloads the matching binary);
@@ -82,8 +85,6 @@ jobs:
         include:
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   cross: false, pytag: manylinux_2_35_x86_64 }
           - { os: ubuntu-22.04,   target: aarch64-unknown-linux-gnu, name: linux-aarch64,  cross: true,  pytag: manylinux_2_31_aarch64 }
-          - { os: macos-14,       target: aarch64-apple-darwin,      name: macos-aarch64,  cross: false, pytag: macosx_11_0_arm64 }
-          - { os: macos-14,       target: x86_64-apple-darwin,       name: macos-x86_64,   cross: false, pytag: macosx_10_12_x86_64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, cross: false, pytag: win_amd64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45

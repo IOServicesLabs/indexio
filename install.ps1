@@ -30,7 +30,10 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     Write-Host "downloading $name.zip"
     Invoke-WebRequest "$base/$name.zip" -OutFile (Join-Path $tmp "$name.zip") -UseBasicParsing
-    $want = ((Invoke-WebRequest "$base/$name.zip.sha256" -UseBasicParsing).Content -split '\s+')[0].ToLower()
+    # GitHub serves the .sha256 as application/octet-stream: decode the bytes
+    $raw = (Invoke-WebRequest "$base/$name.zip.sha256" -UseBasicParsing).Content
+    if ($raw -is [byte[]]) { $raw = [Text.Encoding]::ASCII.GetString($raw) }
+    $want = ($raw.Trim() -split '\s+')[0].ToLower()
     $have = (Get-FileHash (Join-Path $tmp "$name.zip") -Algorithm SHA256).Hash.ToLower()
     if ($want -ne $have) { throw 'checksum mismatch' }
 

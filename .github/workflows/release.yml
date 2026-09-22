@@ -276,5 +276,5 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           INDEXIO_SKIP_DOWNLOAD: "1"
         run: |
-          npm version --no-git-tag-version "${{ needs.release.outputs.version }}"
+          npm version --no-git-tag-version --allow-same-version "${{ needs.release.outputs.version }}"
           npm publish --access public

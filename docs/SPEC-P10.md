@@ -674,7 +674,7 @@ on a heading line with no `end` returns that section, as it returns a whole func
 code. The same session also sent `query` to `code_grep` and `symbol` to `who_calls` — the
 built-in tools' words — and lost a turn to each; `query`, `symbol` and `file` are now
 accepted as aliases of `pattern`, `name` and `path`. And `repo:path`, the form every
-answer prints, pasted back as the path (`Harmonica_finance:app/models/schemas.py`) is
+answer prints, pasted back as the path (`repo-c:app/models/schemas.py`) is
 accepted when the prefix names the repo.
 
 ## 39. Credentials stay out of the index

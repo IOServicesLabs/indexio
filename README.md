@@ -762,8 +762,8 @@ Releases (`.github/workflows/release.yml`) come from `main`:
    silicon, Intel) and Windows (x86_64), attaches each archive with a `.sha256` and a pip
    wheel to the release, publishes the container image to `ghcr.io`, publishes the npm
    package when the `NPM_TOKEN` secret exists, and publishes the `indexio-cli` wheels to
-   PyPI through trusted publishing when the `PYPI_PUBLISH` repository variable is `true`.
-   These jobs compile Rust and take some minutes.
+   PyPI when the `PYPI_API_TOKEN` secret exists. These jobs compile Rust and take some
+   minutes.
 
 `tools/release-assets.sh` builds and attaches one asset from a maintainer machine, for a
 platform the workflow does not cover.

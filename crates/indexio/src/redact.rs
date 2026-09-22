@@ -47,6 +47,11 @@ fn rules() -> &'static [(Regex, &'static str)] {
             (Regex::new(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b").unwrap(), MASK),
             (Regex::new(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b").unwrap(), MASK),
             (Regex::new(r"\bAIza[0-9A-Za-z_-]{30,}\b").unwrap(), MASK),
+            // registry publishing tokens
+            (Regex::new(r"\bnpm_[A-Za-z0-9]{30,}\b").unwrap(), MASK),
+            (Regex::new(r"\bpypi-[A-Za-z0-9_-]{40,}\b").unwrap(), MASK),
+            (Regex::new(r"\bglpat-[A-Za-z0-9_-]{16,}\b").unwrap(), MASK),
+            (Regex::new(r"\bdop_v1_[a-f0-9]{40,}\b").unwrap(), MASK),
             (Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b").unwrap(), MASK),
             // PEM private key bodies
             (
@@ -108,6 +113,14 @@ ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123
         assert!(r.contains("Bearer <redacted>"), "{r}");
         assert!(r.contains("redis://default:<redacted>@cache:6379/0"), "{r}");
         assert!(!r.contains("ghp_ABC"), "{r}");
+    }
+
+    #[test]
+    fn registry_publishing_tokens() {
+        let s = "npm_abcdefghijklmnopqrstuvwxyz0123456789 pypi-AgEIcHlwaS5vcmcCJGNiNWRjYzBiLTYzMTctNDA3Ny1iMTM0 glpat-abcdefghij1234567890";
+        let r = redact(s);
+        assert!(!r.contains("npm_abc") && !r.contains("pypi-AgEI") && !r.contains("glpat-abc"), "{r}");
+        assert_eq!(redact("npm_install and pypi-server are words").into_owned(), "npm_install and pypi-server are words");
     }
 
     #[test]

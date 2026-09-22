@@ -9,9 +9,9 @@ name: release
 #             assembled from the Linux binaries above
 #   npm       the `indexio` package (postinstall downloads the matching binary);
 #             only when the NPM_TOKEN secret exists
-#   pypi      the `indexio-cli` wheels (one per platform, binary bundled) through
-#             PyPI trusted publishing; only when the PYPI_PUBLISH variable is "true".
-#             The wheels are attached to the GitHub release either way.
+#   pypi      the `indexio-cli` wheels (one per platform, binary bundled);
+#             only when the PYPI_API_TOKEN secret exists. The wheels are attached
+#             to the GitHub release either way.
 #
 # The asset jobs compile Rust, which cannot fit the 90-second budget of the
 # other workflows; they carry their own timeouts and run only when a release
@@ -222,24 +222,29 @@ jobs:
 
   pypi:
     needs: [release, binaries]
-    if: needs.release.outputs.build == 'true' && vars.PYPI_PUBLISH == 'true'
+    if: needs.release.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
+    env:
+      HAS_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
     steps:
+      - name: Skip without PYPI_API_TOKEN
+        if: env.HAS_PYPI_TOKEN != 'true'
+        run: echo "PYPI_API_TOKEN secret not set; the wheels are on the GitHub release only"
+
       - uses: actions/download-artifact@v4
+        if: env.HAS_PYPI_TOKEN == 'true'
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
 
-      - name: Publish to PyPI (trusted publishing)
+      - name: Publish to PyPI
+        if: env.HAS_PYPI_TOKEN == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
 
   npm:

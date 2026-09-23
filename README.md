@@ -661,6 +661,58 @@ container — the service then binds the container's own loopback and published 
 cannot reach it. Keep the bind at `0.0.0.0`, set a token, and publish to
 `127.0.0.1:7717:7717` so only your machine can connect.
 
+### Continuously index one folder
+
+Say the code lives in `C:\codebuilds` and you want it re-indexed on a timer, with an
+agent querying it over MCP. You need no auth token for this: the token guards `serve`,
+the HTTP API, and this setup does not run it.
+
+Register the folder and build the index once. `add` records `/repos` as a persistent
+source, which is what later syncs re-read:
+
+```powershell
+docker run --rm -v indexio-data:/data -v C:/codebuilds:/repos:ro `
+  ghcr.io/ioserviceslabs/indexio add /repos
+```
+
+Then leave a container running that re-syncs on a loop. The image's entrypoint is the
+binary, so override it to get a shell:
+
+```powershell
+docker run -d --name indexio-sync --restart unless-stopped `
+  -v indexio-data:/data -v C:/codebuilds:/repos:ro `
+  --entrypoint /bin/sh ghcr.io/ioserviceslabs/indexio `
+  -c "while true; do indexio sync || true; sleep 900; done"
+```
+
+Point your agent at the same volume. The MCP server is stdio, so it needs no port and no
+token:
+
+```powershell
+claude mcp add indexio -- docker run -i --rm -v indexio-data:/data -v C:/codebuilds:/repos:ro ghcr.io/ioserviceslabs/indexio mcp
+```
+
+Check it with `docker run --rm -v indexio-data:/data ghcr.io/ioserviceslabs/indexio stats`,
+which should list every repository found under `C:\codebuilds`.
+
+Use forward slashes in the mount (`C:/codebuilds`), and make sure the drive is shared in
+Docker Desktop's file-sharing settings. Lower the `sleep` if 15 minutes is too coarse —
+but an edit is visible only after the next sync, so if you want the index to track your
+edits as you make them, run the host binary instead.
+
+To use `docker-compose.yml` for the same thing, set the folder and start only the sync
+service:
+
+```powershell
+$env:INDEXIO_REPOS = "C:/codebuilds"
+docker compose up -d sync
+docker compose exec sync indexio add /repos
+```
+
+Compose interpolates the whole file before it selects a service, so
+`INDEXIO_AUTH_TOKEN` must still be set for the file to parse even when you are not
+starting the `indexio` service. Set it as above, or use the plain `docker run` form.
+
 `docker-compose.yml` runs two services on one volume:
 
 - `indexio`: the HTTP API, published on localhost only.

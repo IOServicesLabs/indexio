@@ -38,7 +38,7 @@ services:
       INDEXIO_RERANK_MODEL: ${INDEXIO_RERANK_MODEL:-}
     volumes:
       - indexio-data:/data
-      - ./repos:/repos:ro
+      - ${INDEXIO_REPOS:-./repos}:/repos:ro
 
   sync:
     image: ghcr.io/ioserviceslabs/indexio:latest
@@ -55,7 +55,7 @@ services:
       INDEXIO_EMBED_DIM: ${INDEXIO_EMBED_DIM:-}
     volumes:
       - indexio-data:/data
-      - ./repos:/repos:ro
+      - ${INDEXIO_REPOS:-./repos}:/repos:ro
 
 volumes:
   indexio-data:

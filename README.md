@@ -581,6 +581,12 @@ The release workflow publishes `ghcr.io/ioserviceslabs/indexio` for `linux/amd64
 `linux/arm64`. The image runs as an unprivileged user. The data directory is `/data`.
 `git` and CA certificates are included.
 
+**If you are indexing your own machine for your own agent, install the binary instead.**
+The container is for a shared index that several people or machines query over HTTP. On
+your own laptop it costs you the Bash hooks, the instant working-tree refresh and a layer
+of path translation, and buys nothing. Use [Install](#install) above. The rest of this
+section is for the shared case, and for trying indexio without installing anything.
+
 Index a folder on this machine and search it, with nothing installed but Docker:
 
 ```bash
@@ -602,9 +608,58 @@ Give the container to an agent as an MCP server (stdio through `docker run -i`):
 claude mcp add indexio -- docker run -i --rm -v indexio-data:/data -v ~/code:/repos:ro ghcr.io/ioserviceslabs/indexio mcp
 ```
 
-The container sees your code under `/repos`, not under its host path. The hooks and the
-working-tree refresh of the session's own repository need the host binary. Use the
-container for a shared index; use the host binary next to the agent.
+### How the container indexes code on your machine
+
+The container has no access to your disk beyond what you bind-mount into it. Two mounts
+do the work, and they are not symmetric:
+
+| Mount | Purpose | Access needed |
+|---|---|---|
+| `-v ~/code:/repos:ro` | The code to index. Mount anything: one repository, a checkout root, several `-v` flags. | Read-only is enough. Indexing never writes to your source. |
+| `-v indexio-data:/data` | The index itself. | Writable. This is a Docker volume, not a folder on your host. |
+
+`indexio add /repos` walks the mount, registers every git repository under it at any
+depth, and indexes each one. A folder with no git repository in it is indexed as a plain
+tree. Each repository is recorded in `/data/repos/<name>.json` with the path **as the
+container sees it** — `/repos/my-service`, never `C:\Users\you\code\my-service`. Results
+are repository-relative (`my-service:src/main.rs`), so searching is unaffected, but the
+host path is nowhere in the index.
+
+Three consequences worth knowing before you build a large index:
+
+- **A container index and a host index are not interchangeable.** If you point the host
+  binary at a data directory built in a container, the recorded `/repos/...` paths do not
+  exist on the host, so re-indexing and `read_span` on unindexed content fail. Pick one
+  and stay with it, or keep two data directories.
+- **Freshness comes from the sync loop, not from a file watcher.** `indexio sync` on a
+  local folder re-discovers the repositories under the root and delta re-indexes whatever
+  is on disk right now. It does not clone, pull, or write to your source — only the remote
+  source kinds (`github:`, `azdo:`, a git URL) fetch anything. The `sync` service in
+  `docker-compose.yml` runs that every 15 minutes.
+- **The auto-refresh does not survive the mount.** `indexio mcp` normally watches the
+  current repository and re-indexes the working tree in about 25 ms after an edit.
+  Filesystem events do not cross a Docker Desktop bind mount from a Windows or macOS host
+  reliably, so in a container treat the index as fresh to the last `sync` or
+  `refresh_index` call, not to the last keystroke. This is the main reason to run the host
+  binary next to an agent that is editing code.
+
+The Bash hooks (`indexio hook install`) also need the host binary: they rewrite commands
+in your shell, which a container cannot see.
+
+On Windows, generate the serve token in PowerShell rather than with the bash line above:
+
+```powershell
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$env:INDEXIO_AUTH_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-','').ToLower()
+```
+
+The image sets `INDEXIO_BIND=0.0.0.0`, so `serve` refuses to start without
+`INDEXIO_AUTH_TOKEN` or `--acl-file`: an index of all your source is not something to
+publish unauthenticated. Do not "fix" that by setting `INDEXIO_BIND=127.0.0.1` in the
+container — the service then binds the container's own loopback and published ports
+cannot reach it. Keep the bind at `0.0.0.0`, set a token, and publish to
+`127.0.0.1:7717:7717` so only your machine can connect.
 
 `docker-compose.yml` runs two services on one volume:
 

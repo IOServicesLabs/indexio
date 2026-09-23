@@ -7,6 +7,18 @@
 #   curl -H "Authorization: Bearer $INDEXIO_AUTH_TOKEN" \
 #        'http://127.0.0.1:7717/search?q=auth%20token%20refresh&mode=hybrid'
 #
+# PowerShell has no `VAR=x cmd` prefix form, so the line above silently passes no
+# token and `serve` then refuses to bind 0.0.0.0. Set it first instead:
+#
+#   $bytes = New-Object byte[] 32
+#   [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+#   $env:INDEXIO_AUTH_TOKEN = [System.BitConverter]::ToString($bytes).Replace('-','').ToLower()
+#   docker compose up -d
+#
+# Code to index goes under ./repos and is mounted read-only at /repos; the index
+# lives in the indexio-data volume. Repos are recorded by their CONTAINER path,
+# so this data dir is not interchangeable with one built by a host binary.
+#
 # Optional neural embeddings / reranking: set INDEXIO_EMBED_BASE and
 # INDEXIO_RERANK_BASE in the environment (see README).
 

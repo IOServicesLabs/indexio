@@ -112,17 +112,18 @@ All data goes into one directory: `--data-dir`, `$INDEXIO_DATA_DIR`, or `~/.inde
 5. [Embeddings](#embeddings)
 6. [What is never indexed](#what-is-never-indexed)
 7. [Secure the HTTP API](#secure-the-http-api)
-8. [Use indexio with Claude Code](#use-indexio-with-claude-code)
-9. [Token savings, measured](#token-savings-measured)
-10. [Impact analysis](#impact-analysis)
-11. [Use indexio from other tools](#use-indexio-from-other-tools)
-12. [Command reference](#command-reference)
-13. [Environment variables](#environment-variables)
-14. [Deploy with Docker](#deploy-with-docker)
-15. [Architecture](#architecture)
-16. [Measured performance](#measured-performance)
-17. [Limits](#limits)
-18. [Development and releases](#development-and-releases)
+8. [Team indexing: live worktree overlays](#team-indexing-live-worktree-overlays)
+9. [Use indexio with Claude Code](#use-indexio-with-claude-code)
+10. [Token savings, measured](#token-savings-measured)
+11. [Impact analysis](#impact-analysis)
+12. [Use indexio from other tools](#use-indexio-from-other-tools)
+13. [Command reference](#command-reference)
+14. [Environment variables](#environment-variables)
+15. [Deploy with Docker](#deploy-with-docker)
+16. [Architecture](#architecture)
+17. [Measured performance](#measured-performance)
+18. [Limits](#limits)
+19. [Development and releases](#development-and-releases)
 
 ## What indexio does
 
@@ -285,6 +286,90 @@ With an ACL file:
 also set `--auth-token`, `$INDEXIO_AUTH_TOKEN` or `--acl-file`. The MCP server over stdio
 runs as the local user and has no authentication by design. Put a network-facing MCP
 server behind your own gateway.
+
+## Team indexing: live worktree overlays
+
+`indexio serve` can layer every developer's uncommitted changes on top of the
+shared index, so an agent answering *you* sees *your* working tree — edits,
+untracked files, deletions — while everyone else keeps seeing the pushed
+state. Nothing to install on the developer machine beyond a shell hook in
+the agent harness: no indexio client.
+
+### How it works
+
+1. The server indexes the pushed repositories (the usual `add` + `sync`).
+2. A `PreToolUse` hook in the agent harness runs
+   `integrations/claude-code/indexio-team-sync.sh` before every indexio tool
+   call. The script diffs the working tree (untracked files included)
+   against the merge-base with the remote default branch and POSTs the patch
+   to `/team/worktree`.
+3. The server applies the patch into a small overlay shard keyed by the
+   caller's user name, layered over the base shards: changed paths shadow
+   the base index, deleted paths are hidden, everything else reads from the
+   shared index. Applying uses git plumbing on a scratch index — no
+   checkouts, no worktrees.
+4. A hash of the last accepted patch is kept on disk, so repeated calls
+   with unchanged work cost nothing. The hook prints nothing and always
+   exits 0: it can never block a tool call or pollute the agent's context.
+
+Overlays expire after `INDEXIO_TEAM_TTL_DAYS` (default 7) without an update.
+
+### Server setup
+
+Serve with an ACL file whose tokens carry a `"user"` — that name keys the
+overlay:
+
+```bash
+cat > acl.json <<'EOF'
+{"tokens":{
+  "tok-alice":{"allow":["*"],"user":"alice"},
+  "tok-bob":  {"allow":["*"],"user":"bob"},
+  "tok-ci":   {"allow":["*"]}
+}}
+EOF
+indexio serve --acl-file acl.json --bind 0.0.0.0
+```
+
+A token without `"user"` works for reading but has no overlay (CI, above).
+With a single `--auth-token` instead of an ACL file, clients pick their user
+with the `X-Indexio-User` header.
+
+### Developer setup
+
+```bash
+indexio setup claude --team-sync              # writes the hook script, prints the entry
+export INDEXIO_URL=https://indexio.example.com
+export INDEXIO_TOKEN=tok-alice
+```
+
+`setup claude --team-sync` writes the hook script into the Claude config
+dir and prints the `PreToolUse` entry for `settings.json` — matcher
+`mcp__indexio__.*`, so the sync runs right before any indexio tool call.
+With one shared token instead of per-user tokens, also set `INDEXIO_USER`
+to the name to act as.
+
+### What is enforced server-side
+
+- Credential paths (`Lang::is_secret_path`) are never accepted into an
+  overlay, and neither are patches over 32 MiB.
+- ACL `allow` patterns filter what each user reads — on the documents
+  themselves for MCP (rendered text cannot be un-shown), as hit-filtering
+  on the REST API.
+- Overlay user names are constrained to `[A-Za-z0-9._-]`, no leading dot,
+  so overlay state stays path-safe.
+
+### Limits
+
+- Overlays are lexical planes. Vector search ranks the base content; edits
+  to tracked files surface through every tool, while brand-new untracked
+  files and deletions are visible to the lexical, symbol and outline tools.
+- The base must be a commit the server has (the merge-base with
+  `origin/HEAD`, else `origin/main`, `origin/master`, or the upstream
+  branch), otherwise the upload is refused with HTTP 409 and retried on the
+  next call. The server fetches the origin itself, rate-limited to once a
+  minute.
+- The hook ships tuned for Claude Code; the `PreToolUse` contract is the
+  one other harnesses are converging on, but only Claude Code is tested.
 
 ## Use indexio with Claude Code
 
@@ -521,6 +606,7 @@ indexio serve                               # HTTP on 127.0.0.1:7717
 indexio serve --port 8080 --auth-token $(openssl rand -hex 32)
 indexio serve --bind 0.0.0.0 --auth-token "$TOKEN"          # beyond localhost: a token is mandatory
 indexio serve --acl-file acl.json
+# team worktree overlays: POST /team/worktree (see "Team indexing" above)
 ```
 
 ### Agent setup
@@ -528,6 +614,7 @@ indexio serve --acl-file acl.json
 ```bash
 indexio setup claude
 indexio setup claude --claude-md ~/.claude/CLAUDE.md
+indexio setup claude --team-sync            # also install the team worktree-sync hook
 indexio hook install
 indexio hook install --print-only
 indexio sessions                            # import Claude Code transcripts for recall
@@ -564,6 +651,8 @@ indexio cas-stats
 | `INDEXIO_REPO` | The repository an MCP session works in. Default: the one that contains the working directory. |
 | `INDEXIO_BIND` | Bind address of `serve`. Not loopback needs a token or an ACL. |
 | `INDEXIO_AUTH_TOKEN` | Bearer token of `serve`. |
+| `INDEXIO_TEAM_TTL_DAYS` | Days a team worktree overlay is kept without an update. Default 7. |
+| `INDEXIO_URL`, `INDEXIO_TOKEN`, `INDEXIO_USER` | The team-sync hook's server, bearer token, and user to act as (only with a shared token). |
 | `INDEXIO_EMBED_BASE`, `INDEXIO_EMBED_MODEL`, `INDEXIO_EMBED_DIM`, `INDEXIO_EMBED_KEY` | An OpenAI-compatible embeddings endpoint. |
 | `INDEXIO_RERANK_BASE`, `INDEXIO_RERANK_MODEL`, `INDEXIO_RERANK_KEY` | A reranker endpoint. |
 | `GITHUB_TOKEN` or `GH_TOKEN`, `AZDO_TOKEN` | Credentials for remote sources. Never written to disk. |

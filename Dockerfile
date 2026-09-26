@@ -14,6 +14,8 @@ WORKDIR /src
 # dependency layer: build once per Cargo.lock change
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# embedded in the binary by `setup claude --team-sync` (include_str!)
+COPY integrations ./integrations
 RUN cargo build --release -p indexio --locked \
     && strip target/release/indexio
 

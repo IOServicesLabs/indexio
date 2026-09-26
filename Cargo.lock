@@ -1568,6 +1568,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "blake3",
  "gix",
  "indexio-core",
  "indexio-index",

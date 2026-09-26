@@ -678,6 +678,24 @@ impl Engine {
         })
     }
 
+    /// An engine over `data_dir`'s shards with `upper` shard dirs layered on
+    /// top (team worktree overlays): upper docs shadow base docs of the same
+    /// (repo, path) and `view` hides what they deleted. The semantic plane
+    /// and repo states stay the base's; a semantic row of a file the overlay
+    /// changed resolves to the overlay's doc, one it deleted to nothing.
+    pub fn open_layered(data_dir: &Path, upper: &[PathBuf], view: indexio_index::Visibility) -> io::Result<Self> {
+        let mut dirs = upper.to_vec();
+        dirs.push(data_dir.join("shards"));
+        Ok(Engine {
+            set: ShardSet::open_layers(&dirs, view)?,
+            data_dir: Some(data_dir.to_path_buf()),
+            sidecars: RwLock::new(SidecarCache::default()),
+            doc_map: std::sync::OnceLock::new(),
+            outline_cache: Mutex::new(HashMap::new()),
+            content_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Take over `from`'s opened semantic sidecars (SPEC-P9): a reloaded
     /// engine then reuses every parsed segment whose file is unchanged
     /// instead of re-parsing gigabytes after each refresh.

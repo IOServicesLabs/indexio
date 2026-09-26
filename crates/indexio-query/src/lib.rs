@@ -1281,6 +1281,22 @@ impl Engine {
         map.get(&(repo.to_string(), path.to_string())).copied()
     }
 
+    /// Repos with at least one live doc in this view, sorted (a layered
+    /// engine with an ACL sees only its allowed repos; `stats` counts every
+    /// shard's).
+    pub fn visible_repos(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .set
+            .visible_slice()
+            .iter()
+            .map(|(si, _, dm)| self.repo_name(*si, dm))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Indexed file paths matching `pattern` (SPEC-P8 `list_files`): a glob
     /// when it contains `*` or `?` (`**` crosses directories, `*`/`?` do
     /// not; anchored, case-insensitive), otherwise a case-insensitive

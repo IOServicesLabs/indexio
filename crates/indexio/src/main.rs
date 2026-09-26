@@ -871,7 +871,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     "--bind {bind} is not a loopback address: pass --auth-token (or $INDEXIO_AUTH_TOKEN) or --acl-file before exposing the index beyond this host"
                 );
             }
-            serve::run_server(data_dir, bind, port, auth).await?;
+            let users = match acl_file.as_deref() {
+                Some(p) => serve::load_acl_users(p)?,
+                None => Default::default(),
+            };
+            serve::run_server(data_dir, bind, port, auth, users).await?;
         }
         Commands::Mcp { repo } => {
             let engine = Engine::open(&data_dir)

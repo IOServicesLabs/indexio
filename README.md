@@ -113,17 +113,18 @@ All data goes into one directory: `--data-dir`, `$INDEXIO_DATA_DIR`, or `~/.inde
 6. [What is never indexed](#what-is-never-indexed)
 7. [Secure the HTTP API](#secure-the-http-api)
 8. [Team indexing: live worktree overlays](#team-indexing-live-worktree-overlays)
-9. [Use indexio with Claude Code](#use-indexio-with-claude-code)
-10. [Token savings, measured](#token-savings-measured)
-11. [Impact analysis](#impact-analysis)
-12. [Use indexio from other tools](#use-indexio-from-other-tools)
-13. [Command reference](#command-reference)
-14. [Environment variables](#environment-variables)
-15. [Deploy with Docker](#deploy-with-docker)
-16. [Architecture](#architecture)
-17. [Measured performance](#measured-performance)
-18. [Limits](#limits)
-19. [Development and releases](#development-and-releases)
+9. [Enterprise setup](#enterprise-setup)
+10. [Use indexio with Claude Code](#use-indexio-with-claude-code)
+11. [Token savings, measured](#token-savings-measured)
+12. [Impact analysis](#impact-analysis)
+13. [Use indexio from other tools](#use-indexio-from-other-tools)
+14. [Command reference](#command-reference)
+15. [Environment variables](#environment-variables)
+16. [Deploy with Docker](#deploy-with-docker)
+17. [Architecture](#architecture)
+18. [Measured performance](#measured-performance)
+19. [Limits](#limits)
+20. [Development and releases](#development-and-releases)
 
 ## What indexio does
 
@@ -355,8 +356,8 @@ to the name to act as.
 - ACL `allow` patterns filter what each user reads — on the documents
   themselves for MCP (rendered text cannot be un-shown), as hit-filtering
   on the REST API.
-- Overlay user names are constrained to `[A-Za-z0-9._-]`, no leading dot,
-  so overlay state stays path-safe.
+- Overlay user names are constrained to `[A-Za-z0-9._@-]`, no leading dot,
+  so overlay state stays path-safe (SSO identities are usually emails).
 
 ### Limits
 
@@ -370,6 +371,107 @@ to the name to act as.
   minute.
 - The hook ships tuned for Claude Code; the `PreToolUse` contract is the
   one other harnesses are converging on, but only Claude Code is tested.
+
+## Enterprise setup
+
+Everything above runs on one machine. The same binary scales to a team
+server or an organization-wide deployment; the moving parts are the
+network edge and authentication.
+
+### Inside the network (LAN / VPN)
+
+The simplest topology: one indexio server on an internal host, bound to a
+private interface; TLS optional on a trusted network.
+
+```bash
+indexio serve --bind 10.0.0.5 --acl-file acl.json
+```
+
+Developers aim their team-sync hook at it with `INDEXIO_URL` +
+`INDEXIO_TOKEN`. Start with an ACL file; move to SSO (below) when
+handing out tokens becomes the chore.
+
+### Facing the internet
+
+The server speaks plain HTTP and refuses to bind wide without
+credentials, so put it behind a reverse proxy that terminates TLS and
+forwards to the loopback port. A minimal Caddy site:
+
+```
+indexio.example.com {
+	reverse_proxy 127.0.0.1:7717
+}
+```
+
+Then serve with SSO rather than static tokens: a short-lived identity
+token beats a long-lived bearer on a laptop.
+
+### SSO with an OIDC provider (Entra ID, Google, Keycloak)
+
+`--oidc-issuer` + `--oidc-audience` replace the static-token modes. The
+server discovers the provider at
+`<issuer>/.well-known/openid-configuration`, caches its JWKS, and
+validates every bearer token (RS256, issuer, audience, expiry) before
+looking the identity up — fail closed:
+
+```bash
+cat > users.json <<'EOF'
+{"users":{
+  "alice@corp.example":{"allow":["*"],"user":"alice"},
+  "bob@corp.example":{"allow":["payments-*"]}
+}}
+EOF
+indexio serve \
+  --oidc-issuer https://login.microsoftonline.com/<tenant-id>/v2.0 \
+  --oidc-audience <application-id-uri> \
+  --acl-file users.json --bind 0.0.0.0
+```
+
+- The identity is the token's `email` claim (else `sub`). An identity
+  not present in `users.json` gets HTTP 401: provisioning is your
+  existing directory, mirrored into this file by hand or by a sync job.
+- `allow` works exactly like the token ACL; `/admin` still needs `*`.
+  `"user"` sets the team-overlay name — without it the email is used.
+- IdP specifics. Entra ID: an app registration with an exposed API; the
+  audience is the Application ID URI. Google Workspace: a Web
+  application OAuth client; the audience is the client ID. Keycloak: a
+  confidential client in your realm; the audience is the client ID and
+  the issuer `https://<host>/realms/<realm>`.
+- Signing keys rotate without a restart: an unknown `kid` refetches the
+  JWKS on demand.
+- OIDC mode supersedes `--auth-token`/`INDEXIO_AUTH_TOKEN`; leave them
+  unset. `--oidc-audience` requires `--oidc-issuer`.
+
+### GitHub
+
+GitHub is not a general OIDC provider for your own API, but two
+patterns cover it:
+
+- **GitHub Actions → indexio is OIDC already.** A job with
+  `permissions: id-token: write` requests a JWT (issuer
+  `https://token.actions.githubusercontent.com`, audience of your
+  choosing) and hands it to indexio clients as the bearer token. The
+  server validates it like any OIDC token:
+
+  ```bash
+  indexio serve --oidc-issuer https://token.actions.githubusercontent.com \
+    --oidc-audience indexio --acl-file users.json
+  ```
+
+  CI machines hold no static token, and the allow list in `users.json`
+  scopes what each workflow may read.
+- **Humans with GitHub accounts.** Put an OIDC gateway in front
+  (oauth2-proxy configured for GitHub) and keep ACL-file tokens between
+  gateway and indexio, or move human access to Entra ID / Google, where
+  directory-backed provisioning belongs.
+
+### Humans vs agents
+
+Keep the two populations on different credentials: humans on SSO
+short-lived tokens, agents and CI on ACL-file tokens scoped to the
+repositories they touch (`allow: ["payments-*"]`). Revoking a human is
+disabling their directory account; revoking an agent is deleting one
+line of the ACL file.
 
 ## Use indexio with Claude Code
 
@@ -606,6 +708,7 @@ indexio serve                               # HTTP on 127.0.0.1:7717
 indexio serve --port 8080 --auth-token $(openssl rand -hex 32)
 indexio serve --bind 0.0.0.0 --auth-token "$TOKEN"          # beyond localhost: a token is mandatory
 indexio serve --acl-file acl.json
+indexio serve --oidc-issuer https://idp.example.com --oidc-audience indexio-api --acl-file users.json
 # team worktree overlays: POST /team/worktree (see "Team indexing" above)
 ```
 

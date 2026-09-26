@@ -275,6 +275,59 @@ fn git(repo: &Path, index: Option<&Path>, args: &[&str], stdin: Option<&[u8]>) -
     Ok(out.stdout)
 }
 
+/// Least time between two on-demand fetches of one repo: an unknown base
+/// from a client must not turn every request into a network round trip.
+const FETCH_EVERY: Duration = Duration::from_secs(60);
+/// Longest an on-demand fetch may run before it is killed.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// True (and the attempt recorded) when `repo` was not fetched on demand
+/// within [`FETCH_EVERY`]; the marker is `team/.fetch/<repo>`'s mtime.
+fn fetch_due(data_dir: &Path, repo: &str) -> bool {
+    let dir = data_dir.join("team").join(".fetch");
+    let marker = dir.join(repo);
+    let recent = fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < FETCH_EVERY);
+    if recent {
+        return false;
+    }
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(&marker, b"");
+    true
+}
+
+/// `git fetch origin` that never prompts and is killed after
+/// [`FETCH_TIMEOUT`] (an unreachable remote must not hold a request).
+fn fetch_origin(repo: &Path) {
+    let child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--quiet", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return };
+    let deadline = Instant::now() + FETCH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                warn!(repo = %repo.display(), "on-demand fetch timed out");
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
 fn has_commit(repo: &Path, commit: &str) -> bool {
     git(repo, None, &["cat-file", "-e", &format!("{commit}^{{commit}}")], None).is_ok()
 }
@@ -401,7 +454,9 @@ pub fn apply_worktree_patch(
     // picked up yet.
     let clone = state.path.as_path();
     if !has_commit(clone, &base) {
-        let _ = git(clone, None, &["fetch", "--quiet", "origin"], None);
+        if fetch_due(data_dir, repo) {
+            fetch_origin(clone);
+        }
         if !has_commit(clone, &base) {
             return Err(OverlayError::UnknownBase(base).into());
         }

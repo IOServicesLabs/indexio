@@ -1209,6 +1209,89 @@ pub fn server_instructions(engine: &Engine, current: Option<&str>) -> String {
     )
 }
 
+/// Tools a remote (HTTP) client does not get: they act on the server's own
+/// machine (its checkouts, its transcripts) or list every repo regardless
+/// of the caller's ACL.
+const REMOTE_EXCLUDED_TOOLS: &[&str] = &["refresh_index", "recall", "impact_of_diff", "index_stats"];
+
+/// MCP protocol versions the HTTP transport answers with (the client's own
+/// when it is one of these).
+const REMOTE_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// One JSON-RPC message from a remote MCP client (streamable HTTP, team
+/// server). `engine` is the caller's view: the shared index with their
+/// worktree overlay on top and their ACL applied, so every tool answers
+/// from what that user may see and is editing. `None` = notification.
+pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Reranker, msg: &Value) -> Option<Value> {
+    let id = msg.get("id").cloned()?;
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "initialize" => {
+            let asked = msg["params"]["protocolVersion"].as_str().unwrap_or("");
+            let version = REMOTE_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == asked)
+                .copied()
+                .unwrap_or(REMOTE_PROTOCOL_VERSIONS[1]);
+            Some(result_response(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "indexio", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": remote_instructions(engine),
+                }),
+            ))
+        }
+        "ping" => Some(result_response(id, json!({}))),
+        "tools/list" => {
+            let mut list = tools_list();
+            if let Some(tools) = list["tools"].as_array_mut() {
+                tools.retain(|t| !REMOTE_EXCLUDED_TOOLS.contains(&t["name"].as_str().unwrap_or("")));
+            }
+            Some(result_response(id, list))
+        }
+        "tools/call" => {
+            let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() || REMOTE_EXCLUDED_TOOLS.contains(&name) {
+                return Some(error_response(id, INVALID_PARAMS, &format!("unknown tool: {name}")));
+            }
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let res = opt_format(&args, OutputFormat::from_env()).and_then(|format| {
+                call_tool(engine, embedder, reranker, name, &args, format, None, &Mutex::new(HashMap::new()), &mut None)
+            });
+            Some(match res {
+                Ok(v) => result_response(id, v),
+                Err((code, message)) => error_response(id, code, &message),
+            })
+        }
+        _ => Some(error_response(id, METHOD_NOT_FOUND, &format!("method not found: {method}"))),
+    }
+}
+
+/// `initialize` instructions for a remote client: the repos this caller
+/// can see (not the whole server's), and how their own edits get in.
+fn remote_instructions(engine: &Engine) -> String {
+    let repos = engine.visible_repos();
+    let shown: Vec<&str> = repos.iter().take(80).map(String::as_str).collect();
+    let more = if repos.len() > 80 { format!(" … and {} more", repos.len() - 80) } else { String::new() };
+    format!(
+        "indexio is a shared, pre-built index of {} repo(s): lexical + symbols + call graph + \
+         semantic search over source and every other text file. Repos: {}{more}. Paths are \
+         repo-relative. Your own uncommitted edits are synced to it before each call when the \
+         team hook is installed, so results show your working tree over everyone's latest \
+         default branch.\n\
+         PREFER these tools over grep/rg/Glob/find/Read for anything in these repos: \
+         code_search (\"hybrid\" for questions, \"lexical\" for identifiers/regex) or code_grep \
+         instead of grep; find_symbol/who_calls for definitions and call sites; list_files \
+         instead of Glob; file_outline then read_span instead of reading whole files; \
+         impact_of_symbol BEFORE changing a function/type.",
+        repos.len(),
+        shown.join(", "),
+    )
+}
+
 fn result_response(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

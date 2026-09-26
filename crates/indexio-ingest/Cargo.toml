@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true }
 memchr = { workspace = true }
+blake3 = { workspace = true }
 zstd = { workspace = true }
 ureq = { version = "2", features = ["json"] }
 base64 = { workspace = true }

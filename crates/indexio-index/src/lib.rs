@@ -25,7 +25,7 @@ mod set;
 mod shard;
 mod writer;
 
-pub use set::ShardSet;
+pub use set::{ShardSet, Visibility};
 pub use shard::Shard;
 pub use writer::ShardWriter;
 

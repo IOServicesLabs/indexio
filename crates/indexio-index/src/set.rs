@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use indexio_types::codec::PostingCursor;
 use indexio_types::{DocMeta, ExtractedArtifact, SymbolKind, SymbolRec, CallRec};
@@ -19,13 +19,30 @@ use crate::{invalid, Shard, ShardWriter};
 const STALE_EXT: &str = "stale";
 
 pub struct ShardSet {
-    /// Newest-first (by created_unix in the shard header).
+    /// Newest-first (by created_unix in the shard header); in a layered set
+    /// ([`open_layers`](Self::open_layers)) newest-first within each layer,
+    /// top layer first.
     shards: Vec<Shard>,
     /// Live-doc view, computed on first use and dropped by every mutation
     /// (`delete_docs`, `merge`). Every fan-out lookup used to rescan all
     /// shards to build this; on a 40-repo set that was the dominant cost
     /// of a query (one full scan per n-gram).
     visible: OnceLock<VisibleCache>,
+    /// What this view hides on top of tombstones (team overlays, ACLs).
+    view: Visibility,
+    /// Opened from several directories: never compacted as one.
+    layered: bool,
+}
+
+/// Docs a view hides beyond tombstones and newest-wins (team worktree
+/// overlays): a `hidden` (repo, path) is a file the overlay deleted, so the
+/// base doc under it must not surface; `allow` limits the view to the repos
+/// a token may see. Every lookup goes through the visible set, so both
+/// apply to search, symbols, calls, spans and the semantic legs alike.
+#[derive(Clone, Default)]
+pub struct Visibility {
+    pub hidden: HashSet<(String, String)>,
+    pub allow: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 /// Cached result of the newest-wins / tombstone-aware doc scan.
@@ -36,6 +53,29 @@ struct VisibleCache {
 
 impl ShardSet {
     pub fn open_dir(dir: &Path) -> io::Result<Self> {
+        Ok(ShardSet {
+            shards: Self::load_dir(dir)?,
+            visible: OnceLock::new(),
+            view: Visibility::default(),
+            layered: false,
+        })
+    }
+
+    /// One view over several shard directories, `dirs[0]` on top: a doc of
+    /// an upper layer shadows a doc with the same (repo, path) below it, and
+    /// `view` hides what the upper layers deleted. The lower layers are only
+    /// read (their tombstones honoured, never written), so a shared base
+    /// can sit under any number of per-user layers.
+    pub fn open_layers(dirs: &[PathBuf], view: Visibility) -> io::Result<Self> {
+        let mut shards = Vec::new();
+        for d in dirs {
+            shards.extend(Self::load_dir(d)?);
+        }
+        Ok(ShardSet { shards, visible: OnceLock::new(), view, layered: true })
+    }
+
+    /// The shards of one directory, newest first.
+    fn load_dir(dir: &Path) -> io::Result<Vec<Shard>> {
         let mut shards = Vec::new();
         if dir.exists() {
             for entry in fs::read_dir(dir)? {
@@ -57,7 +97,7 @@ impl ShardSet {
                 .cmp(&a.created_unix())
                 .then_with(|| b.path().cmp(a.path()))
         });
-        Ok(ShardSet { shards, visible: OnceLock::new() })
+        Ok(shards)
     }
 
     fn cache(&self) -> &VisibleCache {
@@ -148,14 +188,23 @@ impl ShardSet {
     /// Duplicate suppression: same (repo, path) — the newest shard wins;
     /// tombstoned docs are skipped.
     fn scan_visible(&self) -> Vec<(usize, u32, DocMeta)> {
-        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut seen: HashSet<(String, String)> = self.view.hidden.clone();
         let mut out = Vec::new();
         for (si, shard) in self.shards.iter().enumerate() {
+            let allowed: Vec<bool> = shard
+                .meta()
+                .repos
+                .iter()
+                .map(|r| self.view.allow.as_ref().is_none_or(|f| f(r)))
+                .collect();
             for docid in 0..shard.doc_count() as u32 {
                 if shard.tombstones().contains(docid) {
                     continue;
                 }
                 let Some(dm) = shard.doc(docid) else { continue };
+                if !allowed.get(dm.repo_id as usize).copied().unwrap_or(false) {
+                    continue;
+                }
                 let repo = Self::repo_name(shard, dm.repo_id);
                 if seen.insert((repo, dm.path.clone())) {
                     out.push((si, docid, dm));
@@ -270,6 +319,9 @@ impl ShardSet {
     /// atomic rename) before the merged files are removed; the set is then
     /// updated in place.
     pub fn merge(&mut self, out_dir: &Path, max_shards: usize) -> io::Result<()> {
+        if self.layered {
+            return Err(invalid("a layered shard set is compacted one layer at a time"));
+        }
         if max_shards == 0 || self.shards.len() <= max_shards {
             return Ok(());
         }

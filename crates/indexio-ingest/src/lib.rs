@@ -32,6 +32,7 @@ pub use cas::Cas;
 
 pub mod org_sync;
 pub mod sources;
+pub mod team;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -248,12 +249,12 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
     })
 }
 
-/// Write `docs` as one shard (repo_id = 0, repos = [name]).
-/// No shard is written when there is nothing to add (delta with zero
+/// Write `docs` as one shard (repo_id = 0, repos = [name]) and return its
+/// path. No shard is written when there is nothing to add (delta with zero
 /// indexable changes).
-fn write_shard(shards_dir: &Path, name: &str, docs: &[PreparedDoc]) -> anyhow::Result<()> {
+fn write_shard(shards_dir: &Path, name: &str, docs: &[PreparedDoc]) -> anyhow::Result<Option<PathBuf>> {
     if docs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut writer = ShardWriter::new(shards_dir)?;
     for d in docs {
@@ -261,7 +262,7 @@ fn write_shard(shards_dir: &Path, name: &str, docs: &[PreparedDoc]) -> anyhow::R
     }
     let path = writer.finish(&[name.to_string()])?;
     debug!(?path, docs = docs.len(), "shard written");
-    Ok(())
+    Ok(Some(path))
 }
 
 /// Read blob contents for the given tree files (sequential object-store

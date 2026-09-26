@@ -332,6 +332,12 @@ enum Commands {
         /// Only print what would be done.
         #[arg(long)]
         print_only: bool,
+        /// Also install the team worktree-sync hook: write the script into the
+        /// Claude config dir and print the PreToolUse settings.json entry that
+        /// sends the caller's uncommitted work to the indexio server before
+        /// each indexio MCP tool call (needs INDEXIO_URL in the environment).
+        #[arg(long)]
+        team_sync: bool,
     },
     /// Impact analysis (SPEC-P6): what else does a change touch? Exactly
     /// one of --symbol / --diff / --diff-file / --file selects the target.
@@ -395,6 +401,65 @@ pub(crate) fn validate_impact_target(
     if diff_file.is_some() && repo.is_none() {
         anyhow::bail!("--diff-file requires --repo");
     }
+    Ok(())
+}
+
+/// `setup claude --team-sync`: materialise the worktree-sync hook script in
+/// the Claude config dir and print the PreToolUse settings.json entry that
+/// runs it before every indexio MCP tool call, so the shared server always
+/// sees the caller's uncommitted work (team overlays, SPEC-P11).
+fn install_team_sync_hook(print_only: bool) -> anyhow::Result<()> {
+    // `*.sh` is `eol=lf` in .gitattributes, so this embeds LF line endings.
+    const SCRIPT: &str = include_str!("../../../integrations/claude-code/indexio-team-sync.sh");
+    let script = if print_only {
+        None
+    } else {
+        let dir = sessions::default_claude_dir()
+            .context("resolving the Claude config dir (set CLAUDE_CONFIG_DIR)")?;
+        let script = dir.join("hooks").join("indexio-team-sync.sh");
+        std::fs::create_dir_all(script.parent().expect("hooks dir"))
+            .with_context(|| format!("creating {}", script.parent().expect("hooks dir").display()))?;
+        if std::fs::read_to_string(&script).unwrap_or_default() != SCRIPT {
+            std::fs::write(&script, SCRIPT)
+                .with_context(|| format!("writing {}", script.display()))?;
+            println!("wrote {}", script.display());
+        } else {
+            println!("{} is already up to date", script.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        Some(script)
+    };
+    let command = match &script {
+        Some(p) => format!("bash \"{}\"", p.display()),
+        None => "bash ~/.claude/hooks/indexio-team-sync.sh".to_string(),
+    };
+    // The command string is embedded in a JSON double-quoted string.
+    let json_command = command.replace('\\', "\\\\").replace('"', "\\\"");
+    println!();
+    if print_only {
+        println!("Team worktree sync (nothing written with --print-only): the script would go to");
+        println!("~/.claude/hooks/indexio-team-sync.sh. To use it, the environment needs");
+    } else {
+        let path = script.as_ref().expect("written");
+        println!("Team worktree sync: add this PreToolUse entry to your Claude Code settings.json");
+        println!("({}). The environment needs", path.display());
+    }
+    println!("INDEXIO_URL (the server), and with one shared token also INDEXIO_TOKEN + INDEXIO_USER:");
+    println!();
+    println!("  \"hooks\": {{");
+    println!("    \"PreToolUse\": [");
+    println!("      {{");
+    println!("        \"matcher\": \"mcp__indexio__.*\",");
+    println!("        \"hooks\": [");
+    println!("          {{ \"type\": \"command\", \"command\": \"{json_command}\", \"timeout\": 60 }}");
+    println!("        ]");
+    println!("      }}");
+    println!("    ]");
+    println!("  }}");
     Ok(())
 }
 
@@ -901,6 +966,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             scope,
             claude_md,
             print_only,
+            team_sync,
         } => {
             if harness != "claude" {
                 anyhow::bail!("unknown harness '{harness}' (supported: claude)");
@@ -914,19 +980,30 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 exe.display(),
                 data_dir.display()
             );
+            if team_sync {
+                install_team_sync_hook(print_only)?;
+            }
             if print_only {
                 println!("{cmd}");
             } else {
                 println!("running: {cmd}");
-                let status = std::process::Command::new("claude")
+                let out = std::process::Command::new("claude")
                     .args(["mcp", "add", "--scope", &scope, "indexio", "--"])
                     .arg(&exe)
                     .arg("mcp")
                     .arg("--data-dir")
                     .arg(&data_dir)
-                    .status()
+                    .output()
                     .context("running `claude` (is Claude Code installed and on PATH?)")?;
-                anyhow::ensure!(status.success(), "claude mcp add failed ({status})");
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    anyhow::ensure!(
+                        stderr.contains("already exists"),
+                        "claude mcp add failed ({status}): {stderr}",
+                        status = out.status
+                    );
+                    println!("claude mcp add: indexio is already registered, continuing");
+                }
             }
             if let Some(path) = claude_md {
                 if !print_only {
@@ -1917,11 +1994,16 @@ mod tests {
     fn parse_setup() {
         let cli = Cli::try_parse_from(["indexio", "setup", "claude", "--scope", "project", "--print-only"]).unwrap();
         match cli.command {
-            Commands::Setup { harness, scope, claude_md, print_only } => {
+            Commands::Setup { harness, scope, claude_md, print_only, team_sync } => {
                 assert_eq!(harness, "claude");
                 assert_eq!(scope, "project");
-                assert!(claude_md.is_none() && print_only);
+                assert!(claude_md.is_none() && print_only && !team_sync);
             }
+            _ => panic!("expected setup"),
+        }
+        let cli = Cli::try_parse_from(["indexio", "setup", "claude", "--team-sync", "--print-only"]).unwrap();
+        match cli.command {
+            Commands::Setup { team_sync, print_only, .. } => assert!(team_sync && print_only),
             _ => panic!("expected setup"),
         }
         assert!(Cli::try_parse_from(["indexio", "setup"]).is_err());

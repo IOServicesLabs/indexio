@@ -84,13 +84,16 @@ pub enum OverlayError {
     Invalid(String),
 }
 
-/// A user name safe to use as a directory name: 1-64 of `[A-Za-z0-9._-]`,
-/// not starting with a dot.
+/// A user name safe to use as a directory name: 1-64 of `[A-Za-z0-9._@-]`,
+/// not starting with a dot. `@` is included so OIDC identities (email
+/// addresses) can key team overlays directly.
 pub fn valid_user(user: &str) -> bool {
     !user.is_empty()
         && user.len() <= 64
         && !user.starts_with('.')
-        && user.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
 }
 
 fn is_hex_commit(s: &str) -> bool {
@@ -662,7 +665,9 @@ mod tests {
     #[test]
     fn user_names_are_path_safe() {
         assert!(valid_user("alice.smith-2"));
-        for bad in ["", ".hidden", "a/b", "..", "a b", "x\\y"] {
+        // OIDC identities (emails) are valid overlay keys
+        assert!(valid_user("alice.smith@corp.example"));
+        for bad in ["", ".hidden", "a/b", "..", "a b", "x\\y", "a@b/c"] {
             assert!(!valid_user(bad), "{bad}");
         }
     }

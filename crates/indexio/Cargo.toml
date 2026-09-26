@@ -31,6 +31,8 @@ anyhow = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+ureq = { version = "2", features = ["json"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -79,6 +79,199 @@ pub enum AuthConfig {
     Token(String),
     /// `--acl-file`: token -> repo allow patterns (supersedes Token).
     Acl(Arc<HashMap<String, Vec<String>>>),
+    /// OIDC SSO: JWT bearer tokens validated against the identity
+    /// provider's JWKS; the ACL file's "users" section maps identities to
+    /// allow patterns (SPEC-P12).
+    Oidc(Arc<OidcAuth>),
+}
+
+/// An OIDC-authenticated identity from the ACL file's "users" section:
+/// `{"alice@corp": {"allow": ["team-*"], "user": "alice"}}`. The optional
+/// "user" overrides the team-overlay name (otherwise the identity itself is
+/// used, so emails work as overlay keys).
+#[derive(Clone)]
+pub struct OidcUser {
+    pub allow: Vec<String>,
+    pub user: Option<String>,
+}
+
+/// Identity -> allow patterns for OIDC mode (SPEC-P12 §2).
+pub fn load_acl_oidc_users(
+    path: &std::path::Path,
+) -> anyhow::Result<HashMap<String, OidcUser>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading ACL file {}", path.display()))?;
+    let v: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing ACL file {} as JSON", path.display()))?;
+    let users = v
+        .get("users")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("ACL file missing top-level \"users\" object"))?;
+    let mut map = HashMap::with_capacity(users.len());
+    for (ident, spec) in users {
+        let allow = spec
+            .get("allow")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("ACL user \"{ident}\" missing \"allow\" array"))?;
+        let mut pats = Vec::with_capacity(allow.len());
+        for p in allow {
+            pats.push(
+                p.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("ACL user \"{ident}\" allow entries must be strings"))?
+                    .to_string(),
+            );
+        }
+        let user = spec
+            .get("user")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let name = user.as_deref().unwrap_or(ident);
+        anyhow::ensure!(
+            indexio_ingest::team::valid_user(name),
+            "ACL user \"{ident}\" maps to an invalid user name \"{name}\""
+        );
+        map.insert(ident.clone(), OidcUser { allow: pats, user });
+    }
+    Ok(map)
+}
+
+/// OIDC bearer-token validation (SPEC-P12 §2): discovery at
+/// `<issuer>/.well-known/openid-configuration`, JWKS cached and refetched on
+/// `kid` miss, RS256 only, issuer/audience/expiry enforced, identity must be
+/// in the users map (fail closed). Plain blocking HTTP — call through
+/// `tokio::task::spawn_blocking`.
+pub struct OidcAuth {
+    issuer: String,
+    audience: String,
+    jwks_uri: String,
+    /// Cached RSA signing keys, refetched when an unknown `kid` arrives.
+    keys: std::sync::Mutex<Vec<OidcJwk>>,
+    /// Identity (email, else `sub`) -> allow patterns + overlay-name override.
+    users: HashMap<String, OidcUser>,
+}
+
+struct OidcJwk {
+    kid: String,
+    n: String,
+    e: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OidcClaims {
+    email: Option<String>,
+    sub: Option<String>,
+}
+
+impl OidcAuth {
+    /// Discover the provider and prefill the key cache. A provider that is
+    /// briefly unreachable at startup is not fatal: the cache stays empty
+    /// and the first `kid` miss retries the fetch.
+    pub fn discover(
+        issuer: &str,
+        audience: &str,
+        users: HashMap<String, OidcUser>,
+    ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(!users.is_empty(), "OIDC mode needs at least one entry in the ACL file's \"users\" section");
+        let issuer = issuer.trim_end_matches('/').to_string();
+        anyhow::ensure!(issuer.starts_with("http"), "--oidc-issuer must be a URL");
+        let doc: Value = ureq::get(&format!("{issuer}/.well-known/openid-configuration"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()?
+            .into_json()?;
+        let jwks_uri = doc
+            .get("jwks_uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("OIDC discovery document has no jwks_uri"))?
+            .to_string();
+        let auth = Arc::new(Self {
+            issuer,
+            audience: audience.to_string(),
+            jwks_uri,
+            keys: std::sync::Mutex::new(Vec::new()),
+            users,
+        });
+        if let Err(e) = auth.refresh_keys() {
+            tracing::warn!("OIDC JWKS prefetch failed (will retry on demand): {e:#}");
+        }
+        Ok(auth)
+    }
+
+    fn refresh_keys(&self) -> anyhow::Result<()> {
+        let v: Value = ureq::get(&self.jwks_uri)
+            .timeout(std::time::Duration::from_secs(5))
+            .call()?
+            .into_json()?;
+        let mut keys = Vec::new();
+        for k in v
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("JWKS response has no \"keys\" array"))?
+        {
+            if k.get("kty").and_then(Value::as_str) != Some("RSA") {
+                continue;
+            }
+            let (Some(kid), Some(n), Some(e)) = (
+                k.get("kid").and_then(Value::as_str),
+                k.get("n").and_then(Value::as_str),
+                k.get("e").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            keys.push(OidcJwk {
+                kid: kid.to_string(),
+                n: n.to_string(),
+                e: e.to_string(),
+            });
+        }
+        anyhow::ensure!(!keys.is_empty(), "JWKS contained no usable RSA keys");
+        *self.keys.lock().expect("jwks mutex") = keys;
+        Ok(())
+    }
+
+    fn decoding_key(&self, kid: &str) -> Option<jsonwebtoken::DecodingKey> {
+        let found = self
+            .keys
+            .lock()
+            .expect("jwks mutex")
+            .iter()
+            .find(|k| k.kid == kid)
+            .map(|k| jsonwebtoken::DecodingKey::from_rsa_components(&k.n, &k.e))
+            .and_then(|r| r.ok());
+        if found.is_none() {
+            // key rotation: refetch once, then retry the lookup
+            if self.refresh_keys().is_ok() {
+                return self
+                    .keys
+                    .lock()
+                    .expect("jwks mutex")
+                    .iter()
+                    .find(|k| k.kid == kid)
+                    .map(|k| jsonwebtoken::DecodingKey::from_rsa_components(&k.n, &k.e))
+                    .and_then(|r| r.ok());
+            }
+        }
+        found
+    }
+
+    /// Validate a bearer token; returns the team-overlay user name and the
+    /// allow patterns, or `None` for every failure mode (fail closed).
+    pub fn validate(&self, token: &str) -> Option<(String, Arc<Vec<String>>)> {
+        let header = jsonwebtoken::decode_header(token).ok()?;
+        if header.alg != jsonwebtoken::Algorithm::RS256 {
+            tracing::warn!(alg = ?header.alg, "OIDC token with disallowed algorithm");
+            return None;
+        }
+        let kid = header.kid?;
+        let key = self.decoding_key(&kid)?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_issuer(std::slice::from_ref(&self.issuer));
+        validation.set_audience(std::slice::from_ref(&self.audience));
+        let claims = jsonwebtoken::decode::<OidcClaims>(token, &key, &validation).ok()?;
+        let identity = claims.claims.email.or(claims.claims.sub)?;
+        let user = self.users.get(&identity)?;
+        let name = user.user.clone().unwrap_or_else(|| identity.clone());
+        Some((name, Arc::new(user.allow.clone())))
+    }
 }
 
 /// Allow patterns of the authenticated ACL token, attached to the request
@@ -242,6 +435,20 @@ async fn auth_middleware(
             if let Some(u) = state.users.get(&tok) {
                 req.extensions_mut().insert(TeamUser(u.clone()));
             }
+            next.run(req).await
+        }
+        AuthConfig::Oidc(oidc) => {
+            // JWT verification and the JWKS refetch are blocking HTTP/crypto.
+            let oidc = oidc.clone();
+            let outcome = tokio::task::spawn_blocking(move || oidc.validate(&tok)).await;
+            let Some((user, allow)) = outcome.ok().flatten() else {
+                return unauthorized();
+            };
+            if req.uri().path().starts_with("/admin/") && !allow.iter().any(|p| p == "*") {
+                return forbidden();
+            }
+            req.extensions_mut().insert(AclAllow(allow));
+            req.extensions_mut().insert(TeamUser(user));
             next.run(req).await
         }
     }
@@ -1619,5 +1826,207 @@ mod tests {
         // a token without a mapped user cannot upload
         let (status, _) = post_patch("tok-app", "app", &base, &patch);
         assert_eq!(status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // SPEC-P12: enterprise SSO (OIDC) over the whole surface
+    // -----------------------------------------------------------------------
+
+    /// Static 2048-bit RSA test key (PKCS#1); the mock provider serves the
+    /// matching public JWK. Test material only, never a real key.
+    const OIDC_TEST_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+        MIIEpAIBAAKCAQEArHXrrl2UXuUJ/neaJ//qwFM8uwm3tkc/1ciJlnDNY62pi/gZ\n\
+        HhwRkNCRDDCgiWmANxA0oynVXggesmNM0ASiNipcW71QY1MxyT9o9kUlhgtVLKi9\n\
+        Z7QYeFeyGx84XpQq75BL0NxnYCrMULjUUYE9tJkaFKJYpt2Lm14avb5Ok9C7ED24\n\
+        gbMUXSF0eE1jQ23nry4QpsboKMKtdelAWkx6hj6paltQ5HE/U23Xec4K7358ha4T\n\
+        /J9Q2Pf9qvuz8dYEilrby66XrsH57WVCUgfVPy6zrPxDPyYcU8gbCNmlq4zBUkpi\n\
+        C4VazaQOm7cOFW4KfOOk8dOaYQJiru0EeElXdwIDAQABAoIBABc2Y/t7Iv5Gy7qR\n\
+        dJFPs9QhH/p4y15gZqoqrMIv+qUg+cIaKZ9Q3dhlCjDe1qzII3bF2p/fgJWAeElA\n\
+        blVNWlv6BaZfa9OCnh/dRg5nri5FljhFmgC8T9La0uEtqZOpU8Ic5Od+0vcxq4Bt\n\
+        8D3sLFcDiGwgkdgb16+Y0faaB8+DPyLeZIE8d0o5m6juwl/CVfw2QBBXoyrKgRQr\n\
+        vp1JKqx+4Bp11bOO0/E7iJgbjwNuxv5uxw43Kc2/mcY1FLetr8w5ECwWnO/0sSVt\n\
+        +I4o2raXk5BygfGU1B4fYKDEVy6Q/ozH1MKmosMhfFZT/7O2JgQhw7LEMXTjnVfX\n\
+        6cFmbrkCgYEA2PEOT03cj3dm4D/tI/gQ8CSbM4iKVGmigSQMWzUElRUYNWP+HHGL\n\
+        XncBCRhu5uhOvsN9JOFYVZ7crcqasYnSJCCCeNwxC87jW+ztH5lllFxhotVgBo3P\n\
+        H884PCQbQ3pnwWK/1dZGYSslsIQPlrytOUoBY8/potxNCEbXog9RbZMCgYEAy4K2\n\
+        0Kzqyj0z+tqnI2O4gjhKXBIV0YVwrtbuqZ8P4rlIN5AhtK8hrW7TUNBnb/pdcB6a\n\
+        TCZxus0tO3NoJqHfYfCRW+hqVVOIGcaRU61NsCRaQGh0jZo+wxXb6iZVYnwhoT6d\n\
+        ONCWYFlhgaY6UJx3DVLQYcuivcNOWTt/s86CfQ0CgYEAw1RIDh+M96AKgN8OJdS1\n\
+        a4OKOlw2MMrsBlruxTB3b8QOiAQASJvzYJrF0+qr8Dw6qohZpVtArdbb258Qqcnt\n\
+        65lZ4HhhsMAW9i3dUxZK38pOHs8AJuaIF5v8hin8YkVUJktDbsX/mH3A8a32W0KG\n\
+        tY5ssfIB6yFwOoOOo9wm9QECgYB9xrOmFLindVwC1dAmlyMZmCCc9rB1ZbtW0499\n\
+        VclDnq97Z6DtQq/VuIDxmVvUYTAOc1t5ZOk1QkmKTLE57yFYLo4n92SAh7e99nMq\n\
+        /BjfnBgLZoNiYMoZWBEqjbaHv6ApP8F7s668rYEN1+aCm7EYku4nAuv5zBNIIvWx\n\
+        8xfCoQKBgQDXbZYandHlOdMwmew3plr7BDmGJcP+eDTYnx5qlUMvotIZ42ZW8rKG\n\
+        5IGDZInNfrqIiY6aQ9ikiuoQhQlzTSJ6jn7GxeCi/53PAml22gVwahtNgXvDuWV3\n\
+        nDN6H28w8LD8F5pdfHCRsWJ/Rnmvvi7YfQNOi6vMYAG1sW8jgqH6Wg==\n\
+        -----END RSA PRIVATE KEY-----\n";
+    const OIDC_TEST_KID: &str = "pilot-test-key-1";
+    const OIDC_TEST_N: &str = "rHXrrl2UXuUJ_neaJ__qwFM8uwm3tkc_1ciJlnDNY62pi_gZHhwRkNCRDDCgiWmANxA0oynVXggesmNM0ASiNipcW71QY1MxyT9o9kUlhgtVLKi9Z7QYeFeyGx84XpQq75BL0NxnYCrMULjUUYE9tJkaFKJYpt2Lm14avb5Ok9C7ED24gbMUXSF0eE1jQ23nry4QpsboKMKtdelAWkx6hj6paltQ5HE_U23Xec4K7358ha4T_J9Q2Pf9qvuz8dYEilrby66XrsH57WVCUgfVPy6zrPxDPyYcU8gbCNmlq4zBUkpiC4VazaQOm7cOFW4KfOOk8dOaYQJiru0EeElXdw";
+    const OIDC_TEST_E: &str = "AQAB";
+
+    /// A throwaway OIDC provider: discovery document + JWKS holding the
+    /// static test key.
+    async fn start_oidc_provider() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(move || {
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "jwks_uri": format!("http://127.0.0.1:{port}/jwks"),
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/jwks",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "keys": [{
+                        "kty": "RSA", "use": "sig", "alg": "RS256",
+                        "kid": OIDC_TEST_KID, "n": OIDC_TEST_N, "e": OIDC_TEST_E,
+                    }] }))
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    /// Sign a bearer token the way an IdP would: RS256 over the test RSA key,
+    /// or HS256 for the algorithm-rejection case.
+    fn oidc_sign(
+        kid: &str,
+        email: &str,
+        iss: &str,
+        aud: &str,
+        exp_in_secs: i64,
+        alg: jsonwebtoken::Algorithm,
+    ) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = serde_json::json!({
+            "sub": format!("sub-{email}"),
+            "email": email,
+            "iss": iss,
+            "aud": aud,
+            "iat": now - 60,
+            "nbf": now - 60,
+            "exp": now + exp_in_secs,
+        });
+        let mut header = jsonwebtoken::Header::new(alg);
+        header.kid = Some(kid.to_string());
+        let key = match alg {
+            jsonwebtoken::Algorithm::HS256 => jsonwebtoken::EncodingKey::from_secret(b"oidc-test-hs256-secret"),
+            _ => jsonwebtoken::EncodingKey::from_rsa_pem(OIDC_TEST_PEM.as_bytes()).unwrap(),
+        };
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oidc_sso_gates_mcp_rest_team_and_admin() {
+        let oidc_port = start_oidc_provider().await;
+        let issuer = format!("http://127.0.0.1:{oidc_port}");
+        let users: HashMap<String, OidcUser> = [
+            (
+                "alice@corp.example".to_string(),
+                OidcUser { allow: vec!["*".to_string()], user: Some("alice".to_string()) },
+            ),
+            (
+                "bob@corp.example".to_string(),
+                OidcUser { allow: vec!["app".to_string()], user: None },
+            ),
+        ]
+        .into();
+        let oidc = OidcAuth::discover(&issuer, "indexio-api", users).unwrap();
+        let (_src, data, dev, base) = team_fixture();
+        let (_data, port) = start_server_in(AuthConfig::Oidc(oidc), data).await;
+
+        let alice = oidc_sign(OIDC_TEST_KID, "alice@corp.example", &issuer, "indexio-api", 3600, jsonwebtoken::Algorithm::RS256);
+        let bob = oidc_sign(OIDC_TEST_KID, "bob@corp.example", &issuer, "indexio-api", 3600, jsonwebtoken::Algorithm::RS256);
+
+        // alice (allow `*`) works over MCP and REST, and reaches /admin.
+        let a = mcp_call(port, &alice, "code_search", json!({ "query": "shared_entry" }));
+        assert!(a.contains("src/lib.rs"), "{a}");
+        let (status, body) = http_req(port, "GET", "/search?q=classified_routine", Some(&alice));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(hit_repos(&body), vec!["secret".to_string()]);
+        let (status, _) = http_req(port, "POST", "/admin/reload", Some(&alice));
+        assert_eq!(status, 200);
+
+        // bob (allow `app`) is hit-filtered on REST and MCP, and is not admin.
+        let (status, body) = http_req(port, "GET", "/search?q=classified_routine", Some(&bob));
+        assert_eq!(status, 200, "{body}");
+        assert!(hit_repos(&body).is_empty(), "bob saw a repo outside his allow: {body}");
+        let b = mcp_call(port, &bob, "list_files", json!({ "pattern": "**/*" }));
+        assert!(!b.contains("keys.py"), "{b}");
+        let (status, _) = http_req(port, "POST", "/admin/reload", Some(&bob));
+        assert_eq!(status, 403);
+
+        // team overlays key on the SSO identity (or its override): alice's
+        // overlay is "alice", bob's is his bare email.
+        std::fs::write(dev.join("src/draft.rs"), "pub fn alice_sso_draft() {}\n").unwrap();
+        let patch = hook_patch(&dev, &base);
+        let auth = format!("Bearer {alice}");
+        let (status, out) = http_raw(
+            port,
+            "POST",
+            "/team/worktree",
+            &[("Authorization", &auth), ("X-Indexio-Repo", "app"), ("X-Indexio-Base", &base)],
+            &patch,
+        );
+        assert_eq!(status, 200, "{out}");
+        let (status, body) = http_req(port, "GET", "/team/overlays", Some(&alice));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"user\":\"alice\""), "override not applied: {body}");
+        // bob has no overlay: alice's WIP is invisible to him.
+        let b = mcp_call(port, &bob, "code_search", json!({ "query": "alice_sso_draft" }));
+        assert!(!b.contains("src/draft.rs"), "{b}");
+        // bob pushes his own overlay under his email identity.
+        let authb = format!("Bearer {bob}");
+        let (status, out) = http_raw(
+            port,
+            "POST",
+            "/team/worktree",
+            &[("Authorization", &authb), ("X-Indexio-Repo", "app"), ("X-Indexio-Base", &base)],
+            &patch,
+        );
+        assert_eq!(status, 200, "{out}");
+        let (status, body) = http_req(port, "GET", "/team/overlays", Some(&bob));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("bob@corp.example"), "{body}");
+
+        // every failure mode is a plain 401 (fail closed).
+        let carol = oidc_sign(OIDC_TEST_KID, "carol@corp.example", &issuer, "indexio-api", 3600, jsonwebtoken::Algorithm::RS256);
+        let bad_aud = oidc_sign(OIDC_TEST_KID, "alice@corp.example", &issuer, "other-api", 3600, jsonwebtoken::Algorithm::RS256);
+        let bad_iss = oidc_sign(OIDC_TEST_KID, "alice@corp.example", "http://evil.example", "indexio-api", 3600, jsonwebtoken::Algorithm::RS256);
+        let expired = oidc_sign(OIDC_TEST_KID, "alice@corp.example", &issuer, "indexio-api", -3600, jsonwebtoken::Algorithm::RS256);
+        let hs256 = oidc_sign(OIDC_TEST_KID, "alice@corp.example", &issuer, "indexio-api", 3600, jsonwebtoken::Algorithm::HS256);
+        let wrong_kid = oidc_sign("rotated-key", "alice@corp.example", &issuer, "indexio-api", 3600, jsonwebtoken::Algorithm::RS256);
+        // a valid token with one payload char changed: signature no longer matches
+        let mut tampered = alice.clone();
+        let dot = tampered.find('.').unwrap();
+        let idx = tampered[dot..].find('a').map(|i| dot + i).unwrap();
+        tampered.replace_range(idx..idx + 1, "b");
+        for (label, tok) in [
+            ("unknown user", &carol),
+            ("wrong audience", &bad_aud),
+            ("wrong issuer", &bad_iss),
+            ("expired", &expired),
+            ("HS256", &hs256),
+            ("unknown kid", &wrong_kid),
+            ("tampered payload", &tampered),
+        ] {
+            let (status, body) = http_req(port, "GET", "/search?q=x", Some(tok));
+            assert_eq!(status, 401, "{label} unexpectedly accepted: {body}");
+        }
+        let (status, _) = http_req(port, "GET", "/search?q=x", None);
+        assert_eq!(status, 401);
+        // /health stays open.
+        let (status, _) = http_req(port, "GET", "/health", None);
+        assert_eq!(status, 200);
     }
 }

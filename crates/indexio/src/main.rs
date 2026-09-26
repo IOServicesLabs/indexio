@@ -308,6 +308,17 @@ enum Commands {
         /// admin-route gating (allow must contain exactly "*").
         #[arg(long, value_name = "PATH")]
         acl_file: Option<PathBuf>,
+        /// OIDC issuer URL for enterprise SSO (Entra ID, Google Workspace,
+        /// Keycloak, ...). Bearer tokens must be RS256 JWTs from this
+        /// issuer, validated against its JWKS; the ACL file's "users"
+        /// section maps identities (email or sub) to allow patterns.
+        /// Supersedes --acl-file/--auth-token.
+        #[arg(long, value_name = "URL")]
+        oidc_issuer: Option<String>,
+        /// OIDC audience (the client/application ID tokens are issued for).
+        /// Required with --oidc-issuer.
+        #[arg(long, value_name = "ID")]
+        oidc_audience: Option<String>,
     },
     /// Run the MCP server over stdio (newline-delimited JSON-RPC 2.0).
     Mcp {
@@ -926,8 +937,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             bind,
             auth_token,
             acl_file,
+            oidc_issuer,
+            oidc_audience,
         } => {
-            let auth = resolve_auth_config(auth_token, acl_file.as_deref())?;
+            let auth = resolve_auth_config(
+                auth_token,
+                acl_file.as_deref(),
+                oidc_issuer.as_deref(),
+                oidc_audience.as_deref(),
+            )?;
             let bind = bind
                 .or_else(|| std::env::var("INDEXIO_BIND").ok().and_then(|s| s.trim().parse().ok()))
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
@@ -1187,12 +1205,31 @@ pub(crate) fn validate_rerank_flag(mode: SearchMode, rerank: bool) -> anyhow::Re
     Ok(())
 }
 
-/// Serve auth selection (SPEC-P3 §3): --acl-file supersedes --auth-token;
-/// --auth-token falls back to $INDEXIO_AUTH_TOKEN; neither -> open.
+/// Serve auth selection (SPEC-P3 §3, SPEC-P12 §2): --oidc-issuer supersedes
+/// --acl-file, which supersedes --auth-token; --auth-token falls back to
+/// $INDEXIO_AUTH_TOKEN; neither -> open.
 pub(crate) fn resolve_auth_config(
     auth_token: Option<String>,
     acl_file: Option<&Path>,
+    oidc_issuer: Option<&str>,
+    oidc_audience: Option<&str>,
 ) -> anyhow::Result<serve::AuthConfig> {
+    if let Some(issuer) = oidc_issuer {
+        let audience = oidc_audience.ok_or_else(|| {
+            anyhow::anyhow!("--oidc-audience is required with --oidc-issuer")
+        })?;
+        let users = serve::load_acl_oidc_users(
+            acl_file.ok_or_else(|| {
+                anyhow::anyhow!("OIDC mode needs --acl-file with a \"users\" section")
+            })?,
+        )?;
+        return Ok(serve::AuthConfig::Oidc(serve::OidcAuth::discover(
+            issuer, audience, users,
+        )?));
+    }
+    if let Some(aud) = oidc_audience {
+        anyhow::bail!("--oidc-audience requires --oidc-issuer (got audience '{aud}')");
+    }
     if let Some(path) = acl_file {
         let map = serve::load_acl_file(path)?;
         return Ok(serve::AuthConfig::Acl(Arc::new(map)));
@@ -1598,11 +1635,14 @@ mod tests {
                 bind,
                 auth_token,
                 acl_file,
+                oidc_issuer,
+                oidc_audience,
             } => {
                 assert_eq!(port, 7717);
                 assert!(bind.is_none(), "loopback unless asked");
                 assert!(auth_token.is_none());
                 assert!(acl_file.is_none());
+                assert!(oidc_issuer.is_none() && oidc_audience.is_none());
             }
             _ => panic!("expected serve"),
         }
@@ -1624,6 +1664,7 @@ mod tests {
                 bind: _,
                 auth_token,
                 acl_file,
+                ..
             } => {
                 assert_eq!(port, 9000);
                 assert_eq!(auth_token.as_deref(), Some("tok"));
@@ -1638,6 +1679,26 @@ mod tests {
             }
             _ => panic!("expected serve"),
         }
+        let cli = Cli::try_parse_from([
+            "indexio",
+            "serve",
+            "--oidc-issuer",
+            "https://idp.example.com",
+            "--oidc-audience",
+            "indexio-api",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { oidc_issuer, oidc_audience, .. } => {
+                assert_eq!(oidc_issuer.as_deref(), Some("https://idp.example.com"));
+                assert_eq!(oidc_audience.as_deref(), Some("indexio-api"));
+            }
+            _ => panic!("expected serve"),
+        }
+        // --oidc-audience without --oidc-issuer is an error at resolve time,
+        // but parsing itself must succeed so the error message is clean
+        let cli = Cli::try_parse_from(["indexio", "serve", "--oidc-audience", "x"]).unwrap();
+        assert!(matches!(cli.command, Commands::Serve { .. }));
     }
 
     #[test]
@@ -1646,21 +1707,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let acl = tmp.path().join("acl.json");
         std::fs::write(&acl, r#"{"tokens":{"t":{"allow":["*"]}}}"#).unwrap();
-        let cfg = resolve_auth_config(Some("tok".to_string()), Some(&acl)).unwrap();
+        let cfg = resolve_auth_config(Some("tok".to_string()), Some(&acl), None, None).unwrap();
         assert!(matches!(cfg, serve::AuthConfig::Acl(_)));
         // token flag without acl-file
-        let cfg = resolve_auth_config(Some("tok".to_string()), None).unwrap();
+        let cfg = resolve_auth_config(Some("tok".to_string()), None, None, None).unwrap();
         assert!(matches!(cfg, serve::AuthConfig::Token(ref t) if t == "tok"));
         // env fallback when the flag is absent
         std::env::set_var("INDEXIO_AUTH_TOKEN", "env-tok");
-        let cfg = resolve_auth_config(None, None).unwrap();
+        let cfg = resolve_auth_config(None, None, None, None).unwrap();
         assert!(matches!(cfg, serve::AuthConfig::Token(ref t) if t == "env-tok"));
         // neither flag nor env -> open
         std::env::remove_var("INDEXIO_AUTH_TOKEN");
-        let cfg = resolve_auth_config(None, None).unwrap();
+        let cfg = resolve_auth_config(None, None, None, None).unwrap();
         assert!(matches!(cfg, serve::AuthConfig::Open));
         // missing acl file -> error, not panic
-        assert!(resolve_auth_config(None, Some(Path::new("/definitely/missing.json"))).is_err());
+        assert!(resolve_auth_config(None, Some(Path::new("/definitely/missing.json")), None, None).is_err());
+        // OIDC requires --acl-file with a "users" section and an audience
+        assert!(resolve_auth_config(None, Some(&acl), Some("https://idp.example"), None).is_err());
+        assert!(resolve_auth_config(None, None, Some("https://idp.example"), Some("aud")).is_err());
+        let users_acl = tmp.path().join("users-acl.json");
+        std::fs::write(&users_acl, r#"{"users":{"a@b.c":{"allow":["*"]}}}"#).unwrap();
+        assert!(resolve_auth_config(None, Some(&users_acl), Some("https://idp.example"), Some("aud")).is_err());
     }
 
     #[test]

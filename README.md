@@ -442,6 +442,47 @@ indexio serve \
 - OIDC mode supersedes `--auth-token`/`INDEXIO_AUTH_TOKEN`; leave them
   unset. `--oidc-audience` requires `--oidc-issuer`.
 
+### Try it: Google Workspace in ten minutes
+
+The exact flow, verified end-to-end against a live server on 2026-09-27.
+
+1. Google Cloud console: create a project (`indexio-pilot`, say).
+2. **APIs & Services → OAuth consent screen**: External; app name
+   `indexio pilot`; scopes `openid` and `email`; add your own Google
+   account under **Test users** — while the app is in "Testing", only
+   test users can consent. This is the step everyone forgets.
+3. **Credentials → Create OAuth client ID → Web application**: add
+   authorized redirect URI `https://developers.google.com/oauthplayground`.
+4. Mint a real ID token at
+   https://developers.google.com/oauthplayground: gear icon → "Use your
+   own OAuth credentials" → paste the client ID and secret → scope
+   `openid email` → **Authorize APIs** → consent → **Exchange
+   authorization code for tokens** → copy the `id_token`.
+5. Serve with the client ID as the audience and your email in the users
+   file:
+
+   ```bash
+   cat > users.json <<'EOF'
+   {"users":{"you@corp.example":{"allow":["*"],"user":"pilot-you"}}}
+   EOF
+   indexio serve --bind 0.0.0.0 \
+     --oidc-issuer https://accounts.google.com \
+     --oidc-audience <client-id>.apps.googleusercontent.com \
+     --acl-file users.json
+   ```
+
+6. Smoke test from anywhere:
+
+   ```bash
+   curl -H "Authorization: Bearer $ID_TOKEN" http://indexio.example.com:7717/search?q=parse
+   # 200 with the token; 401 without. The token lives one hour — re-run
+   # the playground exchange for a fresh one.
+   ```
+
+Beyond the playground, anything that can run the OAuth consent flow can
+produce a bearer the server accepts: an IDE plugin, a small login page
+in front of the server, or a CI job.
+
 ### GitHub
 
 GitHub is not a general OIDC provider for your own API, but two

@@ -120,6 +120,8 @@ pub struct McpServer {
     /// could not embed (another server mid-append) stays queued for the
     /// next refresh.
     pending_embed: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// (repo, path) the coverage repair already tried in this process.
+    repair_tried: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
     /// The background embed of the current repo's changed files is running.
     embed_busy: Arc<AtomicBool>,
     /// Serialises this process's embeds (the auto-refresh thread and the
@@ -227,6 +229,7 @@ impl McpServer {
             compactor: Mutex::new(None),
             warm: Arc::new(Mutex::new(None)),
             pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            repair_tried: Arc::new(Mutex::new(std::collections::HashSet::new())),
             embed_busy: Arc::new(AtomicBool::new(false)),
             embed_lock: Arc::new(Mutex::new(())),
             embedder_thread: Mutex::new(None),
@@ -277,6 +280,7 @@ impl McpServer {
         let busy = Arc::clone(&self.sync_busy);
         let reload = Arc::clone(&self.reload_needed);
         let embed_lock = Arc::clone(&self.embed_lock);
+        let tried = Arc::clone(&self.repair_tried);
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let Some(_lock) = indexio_ingest::SyncLock::try_acquire(&data_dir) else {
@@ -289,12 +293,10 @@ impl McpServer {
                 .filter(|n| current.as_deref() != Some(n.as_str()) && n != crate::sessions::REPO)
                 .filter(|n| indexio_ingest::head_moved(&data_dir, n))
                 .collect();
-            if moved.is_empty() {
-                busy.store(false, Ordering::Release);
-                return;
-            }
             let mut changed: Vec<String> = Vec::new();
-            if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
+            if moved.is_empty() {
+                // nothing to sync; the coverage repair below still runs
+            } else if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
                 for n in &moved {
                     match indexio_ingest::reindex_repo(n, &data_dir, &cas) {
                         Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => changed.push(n.clone()),
@@ -317,6 +319,32 @@ impl McpServer {
                     }
                 }
                 reload.store(true, Ordering::Release);
+            }
+            // coverage repair: docs a lexical-only writer indexed (the Bash
+            // hook's pre-deny reindex, a CLI reindex, an older server) have
+            // no vector rows, and no later pass sees them as changed. Each
+            // doc is tried once per process (some chunk to nothing).
+            let repaired = {
+                let _serial = embed_lock.lock().unwrap_or_else(|e| e.into_inner());
+                indexio_index::ShardSet::open_dir(&data_dir.join("shards")).map_err(anyhow::Error::from).and_then(|set| {
+                    let missing = indexio_embed::pipeline::unembedded_docs(&set, &data_dir, embedder.model_id())?;
+                    let todo: Vec<(String, String)> = {
+                        let mut t = tried.lock().unwrap_or_else(|e| e.into_inner());
+                        missing.into_iter().filter(|d| t.insert(d.clone())).collect()
+                    };
+                    if !todo.is_empty() {
+                        indexio_embed::pipeline::embed_docs(&set, &data_dir, &todo, embedder.as_ref(), indexio_embed::pipeline::MAX_CHARS)?;
+                    }
+                    Ok(todo.len())
+                })
+            };
+            match repaired {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(docs = n, "coverage repair: embedded docs without vector rows");
+                    reload.store(true, Ordering::Release);
+                }
+                Err(e) => tracing::warn!(error = %e, "coverage repair failed"),
             }
             tracing::info!(
                 probed = moved.len(),
@@ -1791,28 +1819,50 @@ fn call_tool(
                 SearchMode::Hybrid => {
                     let n = if current.is_some() { limit.saturating_mul(3) } else { limit.saturating_mul(2) };
                     let scope = repo_scope(engine, q);
-                    let mut fused = if rerank {
-                        engine
-                            .search_hybrid_fused_reranked(q, n, embedder, reranker, fusion)
-                            .map_err(|e| internal(format!("hybrid rerank failed: {e}")))?
-                    } else {
-                        engine
-                            .search_hybrid_in(q, n, embedder, fusion, scope.as_deref())
-                            .map_err(|e| internal(format!("hybrid search failed: {e}")))?
-                    };
+                    // no explicit repo: the session's own repo gets a pass of
+                    // its own — in the global ranking a sibling corpus can
+                    // push every one of its rows out (SPEC-P10 §35 for hybrid)
+                    let own = current.filter(|_| scope.is_none() && !rerank && !wants_sessions(q));
+                    let (fused, scoped) = std::thread::scope(|s| {
+                        let scoped = own.map(|cur| s.spawn(move || engine.search_hybrid_in(q, limit, embedder, fusion, Some(cur))));
+                        let fused = if rerank {
+                            engine
+                                .search_hybrid_fused_reranked(q, n, embedder, reranker, fusion)
+                                .map_err(|e| internal(format!("hybrid rerank failed: {e}")))
+                        } else {
+                            engine
+                                .search_hybrid_in(q, n, embedder, fusion, scope.as_deref())
+                                .map_err(|e| internal(format!("hybrid search failed: {e}")))
+                        };
+                        (fused, scoped.and_then(|h| h.join().ok()).and_then(Result::ok))
+                    });
+                    let mut fused = fused?;
                     if !wants_sessions(q) {
                         fused.retain(|h| h.hit.repo != crate::sessions::REPO);
                     }
+                    let mut folded = Folded::default();
                     if let Some(cur) = current {
                         // stable: the fused order is kept inside each half
                         let (mut here, rest): (Vec<_>, Vec<_>) =
                             fused.into_iter().partition(|h| h.hit.repo == cur);
-                        here.extend(rest);
+                        match scoped.filter(|s| !s.is_empty()) {
+                            Some(own_hits) => {
+                                here = own_hits;
+                                let (kept, left) = split_other_rows(rest, OTHER_REPO_ROWS, |h| (&h.hit.repo, &h.hit.path));
+                                folded.rows = left.len();
+                                folded.repos = left.iter().map(|h| h.hit.repo.as_str()).collect::<std::collections::HashSet<_>>().len();
+                                here.truncate(limit.saturating_sub(kept.len().min(limit / 2)));
+                                here.extend(kept);
+                            }
+                            None => here.extend(rest),
+                        }
                         fused = here;
                     }
                     fused.truncate(limit);
                     if text {
-                        return Ok(plain_result(mcp_text::hybrid_hits(&fused, "hits")));
+                        let mut out = mcp_text::hybrid_hits(&fused, "hits");
+                        out.push_str(&folded.note());
+                        return Ok(plain_result(out));
                     }
                     Ok(text_result(
                         json!({ "hits": fused.iter().map(crate::serve::hybrid_hit_to_json).collect::<Vec<_>>() }),

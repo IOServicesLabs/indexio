@@ -323,6 +323,47 @@ pub fn embed_repos_with(
     embed_incremental(shards, data_dir, repos, None, embedder, max_chars)
 }
 
+/// Visible docs with no live row in the semantic plane, as (repo, path):
+/// what a lexical-only writer (the Bash hook's pre-deny reindex, a CLI
+/// `reindex`, an older binary) indexed and nothing embedded since. Their
+/// files are invisible to the semantic and BM25 legs. Empty without a plane.
+pub fn unembedded_docs(shards: &ShardSet, data_dir: &Path, model_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let Some((vset, _)) = open_sets(data_dir, model_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut have: HashSet<(String, String)> = HashSet::new();
+    for row in vset.live_rows() {
+        let m = vset.row_meta(row);
+        have.insert((m.repo.clone(), m.path.clone()));
+    }
+    Ok(shards
+        .visible_docs()
+        .into_iter()
+        .map(|(si, _, dm)| (doc_repo(shards, si, dm.repo_id), dm.path))
+        .filter(|k| !have.contains(k))
+        .collect())
+}
+
+/// Embed `docs` (repo, path) — the [`unembedded_docs`] repair. Docs that
+/// chunk to nothing (an empty `__init__.py`) stay unembedded.
+pub fn embed_docs(
+    shards: &ShardSet,
+    data_dir: &Path,
+    docs: &[(String, String)],
+    embedder: &dyn Embedder,
+    max_chars: usize,
+) -> anyhow::Result<Vec<EmbedReport>> {
+    let mut repos: Vec<String> = docs.iter().map(|(r, _)| r.clone()).collect();
+    repos.sort();
+    repos.dedup();
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+    // paths of other repos in the set are carried unchanged (same hashes)
+    let paths: HashSet<String> = docs.iter().map(|(_, p)| p.clone()).collect();
+    embed_incremental(shards, data_dir, &repos, Some(&paths), embedder, max_chars)
+}
+
 /// Embed only `paths` of `repo` (SPEC-P9 auto-refresh): the docs at those
 /// paths are chunked and diffed against their live rows; paths without a
 /// visible doc are treated as deleted. Files not named are untouched.
@@ -946,6 +987,44 @@ mod tests {
         assert!(rep.chunks >= 3, "{rep:?}");
         let idx = crate::index::VecSet::open(&tmp.path().join("vec"), e.model_id()).unwrap().unwrap();
         assert_eq!(idx.len() as u64, rep.chunks, "every chunk has a row: {rep:?}");
+    }
+
+    /// A doc indexed after the last embed (a lexical-only writer) has no
+    /// rows until the repair embeds it; an empty doc stays unembedded, and
+    /// other docs' rows are untouched.
+    #[test]
+    fn coverage_repair_embeds_docs_without_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = build_shardset(tmp.path(), &["r1", "r2"], &[(0, "src/a.rs", b"fn alpha_function() {}\n"), (1, "src/b.rs", b"fn beta_function() {}\n")]);
+        let e = HashEmbedder::new(512);
+        embed_repo(&v1, tmp.path(), "r1", &e).unwrap();
+        embed_repo(&v1, tmp.path(), "r2", &e).unwrap();
+        drop(v1);
+        for f in std::fs::read_dir(tmp.path().join("shards")).unwrap() {
+            let p = f.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("cidx") {
+                std::fs::remove_file(p).unwrap();
+            }
+        }
+        let v2 = build_shardset(
+            tmp.path(),
+            &["r1", "r2"],
+            &[(0, "src/a.rs", b"fn alpha_function() {}\n"), (0, "src/new.rs", b"fn gamma_function() {}\n"), (0, "src/empty.py", b""), (1, "src/b.rs", b"fn beta_function() {}\n")],
+        );
+        let mut missing = unembedded_docs(&v2, tmp.path(), "hash-v1").unwrap();
+        missing.sort();
+        assert!(missing.contains(&("r1".into(), "src/new.rs".into())), "{missing:?}");
+        assert!(!missing.iter().any(|(_, p)| p == "src/a.rs" || p == "src/b.rs"), "{missing:?}");
+        let live_before = VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap().len();
+        embed_docs(&v2, tmp.path(), &missing, &e, MAX_CHARS).unwrap();
+        let after = unembedded_docs(&v2, tmp.path(), "hash-v1").unwrap();
+        assert!(after.iter().all(|(_, p)| p == "src/empty.py"), "{after:?}");
+        let idx = VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap();
+        assert_eq!(idx.len(), live_before + 1, "only new.rs was added");
+        // nothing left to do: no new segment
+        let segs = idx.segments().len();
+        embed_docs(&v2, tmp.path(), &after, &e, MAX_CHARS).unwrap();
+        assert_eq!(VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap().segments().len(), segs);
     }
 
     #[test]

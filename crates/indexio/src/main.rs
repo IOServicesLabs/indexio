@@ -205,6 +205,10 @@ enum Commands {
         /// Print stats as JSON.
         #[arg(long)]
         json: bool,
+        /// Per repo: indexed files without a live vector row (the semantic
+        /// and BM25 legs cannot find them), with sample paths.
+        #[arg(long)]
+        coverage: bool,
     },
     /// Find a symbol by name (exact, substring fallback).
     Symbol { name: String },
@@ -796,7 +800,38 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let report = indexio_ingest::org_sync::sync_org(&opts, &data_dir, &cas)?;
             print_org_sync_report(&report);
         }
-        Commands::EmbcasStats { json } => {
+        Commands::EmbcasStats { coverage: true, .. } => {
+            let embedder = select_embedder(None, &data_dir)?;
+            let engine = Engine::open(&data_dir).with_context(|| format!("opening index at {}", data_dir.display()))?;
+            let Some(idx) = engine.vec_index(embedder.model_id())? else {
+                anyhow::bail!("no vector plane for {}", embedder.model_id());
+            };
+            let mut embedded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            for row in idx.live_rows() {
+                let m = idx.row_meta(row);
+                embedded.insert((m.repo.clone(), m.path.clone()));
+            }
+            let (files, _) = engine.list_paths("**", None, usize::MAX);
+            let mut per: std::collections::BTreeMap<String, (usize, Vec<String>)> = std::collections::BTreeMap::new();
+            for (repo, path) in files {
+                let e = per.entry(repo.clone()).or_default();
+                e.0 += 1;
+                if !embedded.contains(&(repo, path.clone())) {
+                    e.1.push(path);
+                }
+            }
+            let (mut tot, mut miss) = (0, 0);
+            println!("{:<28}{:>7}{:>9}  sample", "repo", "files", "no vector");
+            for (repo, (n, missing)) in &per {
+                tot += n;
+                miss += missing.len();
+                if !missing.is_empty() {
+                    println!("{repo:<28}{n:>7}{:>9}  {}", missing.len(), missing.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+                }
+            }
+            println!("total: {miss} of {tot} indexed files have no vector row");
+        }
+        Commands::EmbcasStats { json, .. } => {
             let embedder = select_embedder(None, &data_dir)?;
             let cas = EmbedCas::open_for(&data_dir, embedder.as_ref());
             let (entries, bytes) = cas.stats();

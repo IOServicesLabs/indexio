@@ -1408,10 +1408,12 @@ fn tools_list() -> Value {
                  asking again: earlier decisions, findings, commands that worked, what a build said, \
                  what another session did here; especially after a context compaction. Hits are \
                  `sessions:<project>/<session>.md` or `runs:<repo>/<log>` + `line: text`; a lone \
-                 hit comes with its exchange, else read_span for it.",
+                 hit comes with its exchange, else read_span for it. brief:true: whole \
+                 session summaries instead (asks, files, commits, outcome); query \"\" = latest here.",
                 json!({
                     "query": string_prop("what to look for (natural language or exact words)"),
-                    "limit": json!({ "type": "integer", "minimum": 1, "description": "max hits (default 8)" }),
+                    "limit": json!({ "type": "integer", "minimum": 1, "description": "max hits (default 8; brief 2)" }),
+                    "brief": json!({ "type": "boolean" }),
                     "all_projects": json!({ "type": "boolean", "description": "every project's sessions (default: this project first)" }),
                 }),
                 &["query"],
@@ -1985,6 +1987,12 @@ fn call_tool(
             Ok(text_result(json!(hits)))
         }
         "recall" => {
+            if args.get("brief").and_then(Value::as_bool).unwrap_or(false) {
+                // "" is a valid brief query: the latest sessions here
+                let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+                let limit = opt_usize(args, "limit", 2)?;
+                return Ok(plain_result(recall_cards(engine, embedder, q, limit)));
+            }
             let q = req_str(args, "query")?;
             let limit = opt_usize(args, "limit", 8)?;
             // every leg scoped to the transcripts (SPEC-P10): before, the
@@ -2010,6 +2018,8 @@ fn call_tool(
                 .map(|h| h.hit)
                 // an earlier recall of the same question is not an answer
                 .filter(|h| !h.snippet.contains("mcp__indexio__recall"))
+                // cards are the brief:true answer; lines come from the parts
+                .filter(|h| !h.path.ends_with(crate::sessions::CARD_SUFFIX))
                 .collect();
             // this project's sessions and runs first (stable), then the others
             let mine = |h: &indexio_types::SearchHit| {
@@ -2228,6 +2238,76 @@ fn fold_other_repos(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&s
     }
     hits.truncate(limit);
     folded
+}
+
+/// `recall {brief:true}`: whole session cards (sessions::Card) — the
+/// compressed form of a session — ranked for `q`, this project's first; an
+/// empty `q` lists this project's latest sessions.
+fn recall_cards(engine: &Engine, embedder: &dyn Embedder, q: &str, limit: usize) -> String {
+    let Some(root) = engine.data_dir().map(|d| d.join("sessions")) else {
+        return "no sessions indexed".into();
+    };
+    let slug = std::env::current_dir().ok().map(|d| crate::sessions::project_slug(&d));
+    let mut paths: Vec<String> = Vec::new();
+    if q.trim().is_empty() {
+        let dir = slug.as_ref().map(|s| root.join(s));
+        let mut cards: Vec<(std::time::SystemTime, String)> = dir
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let t = e.metadata().ok()?.modified().ok()?;
+                n.ends_with(crate::sessions::CARD_SUFFIX).then(|| (t, format!("{}/{n}", slug.as_deref().unwrap_or(""))))
+            })
+            .collect();
+        cards.sort_by(|a, b| b.0.cmp(&a.0));
+        paths.extend(cards.into_iter().map(|(_, p)| p));
+    } else {
+        let fused = engine
+            .search_hybrid_in(q, limit.saturating_mul(10).max(40), embedder, FusionAlgo::Rrf, Some(crate::sessions::REPO))
+            .unwrap_or_default();
+        // a session scores the sum of its hits (card and parts): one stray
+        // line must not outrank a session that discussed the topic at length
+        let mut score: HashMap<String, f64> = HashMap::new();
+        for h in &fused {
+            let p = &h.hit.path;
+            let card = match p.strip_suffix(crate::sessions::CARD_SUFFIX) {
+                Some(_) => p.clone(),
+                None => {
+                    let stem = p.trim_end_matches(".md");
+                    let stem = stem.split_once(".part").map_or(stem, |(s, _)| s);
+                    format!("{stem}{}", crate::sessions::CARD_SUFFIX)
+                }
+            };
+            *score.entry(card).or_default() += h.rrf as f64;
+        }
+        let mut ranked: Vec<(String, f64)> = score.into_iter().filter(|(c, _)| root.join(c).is_file()).collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+        paths.extend(ranked.into_iter().map(|(c, _)| c));
+        if let Some(s) = &slug {
+            let (mut here, rest): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.starts_with(&format!("{s}/")));
+            here.extend(rest);
+            paths = here;
+        }
+    }
+    let mut out = String::new();
+    for p in paths.iter().take(limit) {
+        if let Ok(body) = std::fs::read_to_string(root.join(p)) {
+            if !out.is_empty() {
+                out.push_str("\n---\n");
+            }
+            out.push_str(&format!("sessions:{p}\n{}", body.trim_end()));
+        }
+    }
+    if out.is_empty() {
+        return "no session cards match (try recall without brief)".into();
+    }
+    if paths.len() > limit {
+        out.push_str(&format!("\n-- {} more session{} (raise limit)", paths.len() - limit, if paths.len() - limit == 1 { "" } else { "s" }));
+    }
+    out
 }
 
 /// Rows of the lexical no-hit hybrid fallback (SPEC-P10 §25): a ranking

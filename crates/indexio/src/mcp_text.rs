@@ -232,19 +232,30 @@ pub fn files(list: &[(String, String)], truncated: bool) -> String {
 }
 
 /// Outline: `start-end kind name`, indented by scope depth.
+/// Items a test container must hold before they are folded onto its line.
+const COLLAPSE_TESTS_FROM: usize = 3;
+
+/// `mod tests` / `mod test` (Rust) or a `Test…` class (Python unittest).
+fn is_test_container(it: &OutlineItem) -> bool {
+    match it.kind.name() {
+        "mod" => it.name == "tests" || it.name == "test",
+        "class" => it.name.starts_with("Test") && it.name.len() > 4,
+        _ => false,
+    }
+}
+
 pub fn outline(repo: &str, path: &str, items: &[OutlineItem]) -> String {
     let mut out = format!(
         "{repo}:{path}  {} definition{}\n",
         items.len(),
         plural(items.len())
     );
-    for it in items {
-        let depth = if it.scope.is_empty() {
-            0
-        } else {
-            it.scope.split("::").count()
-        };
-        let _ = writeln!(
+    let depth_of = |it: &OutlineItem| if it.scope.is_empty() { 0 } else { it.scope.split("::").count() };
+    let mut i = 0;
+    while i < items.len() {
+        let it = &items[i];
+        let depth = depth_of(it);
+        let _ = write!(
             out,
             "{}{}-{} {} {}",
             "  ".repeat(depth),
@@ -253,6 +264,22 @@ pub fn outline(repo: &str, path: &str, items: &[OutlineItem]) -> String {
             it.kind.name(),
             it.name
         );
+        i += 1;
+        // a test module's items on its own line, `name start` each: ~29% of
+        // real outline tokens were test rows, rarely what the outline is
+        // for; read_span from a start line still returns that test whole
+        if is_test_container(it) {
+            let n = items[i..]
+                .iter()
+                .take_while(|c| c.start_line >= it.start_line && c.start_line <= it.end_line && depth_of(c) > depth)
+                .count();
+            if n >= COLLAPSE_TESTS_FROM {
+                let names: Vec<String> = items[i..i + n].iter().map(|c| format!("{} {}", c.name, c.start_line)).collect();
+                let _ = write!(out, ": {}", names.join(", "));
+                i += n;
+            }
+        }
+        out.push('\n');
     }
     out.truncate(out.trim_end().len());
     out
@@ -697,6 +724,26 @@ fn human_bytes(b: u64) -> String {
 mod tests {
     use super::*;
     use indexio_types::Lang;
+
+    #[test]
+    fn outline_folds_test_modules_onto_one_line() {
+        use indexio_types::SymbolKind;
+        let it = |name: &str, kind, scope: &str, s, e| OutlineItem { name: name.into(), kind, scope: scope.into(), start_line: s, end_line: e };
+        let items = vec![
+            it("run", SymbolKind::Fn, "", 1, 5),
+            it("tests", SymbolKind::Mod, "", 10, 40),
+            it("helper", SymbolKind::Fn, "tests", 12, 14),
+            it("a_works", SymbolKind::Fn, "tests", 16, 20),
+            it("b_works", SymbolKind::Fn, "tests", 22, 39),
+            it("after", SymbolKind::Fn, "", 42, 44),
+            it("TestTwo", SymbolKind::Class, "", 50, 60),
+            it("test_x", SymbolKind::Method, "TestTwo", 51, 55),
+        ];
+        assert_eq!(
+            outline("r", "a.rs", &items),
+            "r:a.rs  8 definitions\n1-5 fn run\n10-40 mod tests: helper 12, a_works 16, b_works 22\n42-44 fn after\n50-60 class TestTwo\n  51-55 method test_x"
+        );
+    }
 
     fn hit(repo: &str, path: &str, line: u32, snip: &str) -> SearchHit {
         SearchHit {

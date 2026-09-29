@@ -777,10 +777,11 @@ pub fn hook_command(exe: &Path, args: &str) -> String {
 }
 
 /// The hooks this binary provides: (event, tool matcher, args, timeout s).
-const HOOKS: [(&str, Option<&str>, &str, u64); 3] = [
+const HOOKS: [(&str, Option<&str>, &str, u64); 4] = [
     ("PreToolUse", Some("Bash"), "hook bash", 10),
     ("PreToolUse", Some("Read"), "hook read", 10),
     ("PreCompact", None, "sessions --quiet", 120),
+    ("SessionStart", None, "hook session-start", 10),
 ];
 
 /// Add (or repair) indexio's hooks in a Claude Code `settings.json` value;
@@ -1246,7 +1247,7 @@ mod tests {
             ]}
         });
         let changes = install_settings(&mut s, exe);
-        assert_eq!(changes.len(), 3, "{changes:?}");
+        assert_eq!(changes.len(), 4, "{changes:?}");
         let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 3);
         assert_eq!(pre[0]["hooks"][0]["command"], "rtk hook claude");
@@ -1255,6 +1256,7 @@ mod tests {
         assert_eq!(pre[2]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook read");
         assert_eq!(s["hooks"]["PreCompact"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe sessions --quiet");
         assert!(s["hooks"]["PreCompact"][0].get("matcher").is_none());
+        assert_eq!(s["hooks"]["SessionStart"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook session-start");
         assert_eq!(s["permissions"]["allow"][0], "mcp__indexio");
         // idempotent
         assert!(install_settings(&mut s, exe).is_empty());

@@ -1698,6 +1698,11 @@ impl Engine {
         if !names.iter().any(|n| n == "sessions") {
             names.push("sessions".to_string());
         }
+        // an exact name wins: `repo:indexio` must not fall back to every
+        // repo because `themlisten_indexio` contains it too
+        if let Some(exact) = names.iter().find(|n| n.to_ascii_lowercase() == want) {
+            return Some(exact.clone());
+        }
         let mut hits = names.into_iter().filter(|n| n.to_ascii_lowercase().contains(&want));
         let first = hits.next()?;
         if hits.next().is_some() {
@@ -2054,6 +2059,25 @@ mod tests {
 
         let engine = Engine::open(tmp.path()).unwrap();
         (tmp, engine)
+    }
+
+    /// `repo:indexio` names `indexio` although `themlisten_indexio` contains
+    /// it too; a unique substring still scopes, an ambiguous one does not.
+    #[test]
+    fn repo_scope_prefers_an_exact_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shards = tmp.path().join("shards");
+        std::fs::create_dir_all(&shards).unwrap();
+        let doc = |p: &'static str| Doc { path: p, lang: Lang::Rust, content: "fn a() {}\n".into(), symbols: vec![], calls: vec![] };
+        write_shard(&shards, &[doc("a.rs")], &["indexio".to_string()]);
+        write_shard(&shards, &[doc("b.rs")], &["themlisten_indexio".to_string()]);
+        write_shard(&shards, &[doc("c.rs")], &["indexio_extra".to_string()]);
+        let e = Engine::open(tmp.path()).unwrap();
+        assert_eq!(e.repo_scope("x repo:indexio").as_deref(), Some("indexio"));
+        assert_eq!(e.repo_scope("x repo:IndexIO").as_deref(), Some("indexio"));
+        assert_eq!(e.repo_scope("x repo:themlisten").as_deref(), Some("themlisten_indexio"));
+        assert_eq!(e.repo_scope("x repo:index"), None);
+        assert_eq!(e.repo_scope("x"), None);
     }
 
     fn write_shard(dir: &Path, docs: &[Doc], repos: &[String]) {

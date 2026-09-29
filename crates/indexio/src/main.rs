@@ -875,6 +875,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     tracing::debug!(error = %e, "hook read: allowing");
                 }
             }
+            "session-start" => {
+                // never fail the session start: any error means "no context"
+                if let Some(claude) = claude_dir.clone().or_else(sessions::default_claude_dir) {
+                    if let Err(e) = hook::run_session_start_hook(&claude) {
+                        tracing::debug!(error = %e, "hook session-start: no context");
+                    }
+                }
+            }
             "install" => {
                 let claude = match claude_dir.or_else(sessions::default_claude_dir) {
                     Some(d) => d,
@@ -883,7 +891,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let exe = std::env::current_exe().context("locating the indexio binary")?;
                 hook::install(&claude, &exe, print_only)?;
             }
-            other => anyhow::bail!("unknown hook '{other}' (expected: bash, read or install)"),
+            other => anyhow::bail!("unknown hook '{other}' (expected: bash, read, session-start or install)"),
         },
         Commands::Run { cwd, command } => {
             let cwd = match cwd {

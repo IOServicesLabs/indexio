@@ -954,6 +954,31 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Entry point for `hook session-start` (SessionStart): hook JSON on stdin,
+/// a few lines of past context as `additionalContext` on stdout
+/// (sessions::session_start_context). Prints nothing when there is none.
+pub fn run_session_start_hook(claude_dir: &Path) -> anyhow::Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    let cwd = v["cwd"].as_str().map(PathBuf::from).unwrap_or(std::env::current_dir()?);
+    let session = v["session_id"].as_str().unwrap_or("");
+    let transcript = v["transcript_path"].as_str().map(PathBuf::from);
+    let source = v["source"].as_str().unwrap_or("startup");
+    if let Some(ctx) = crate::sessions::session_start_context(claude_dir, &cwd, session, transcript.as_deref(), source) {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": ctx,
+                }
+            })
+        );
+    }
+    Ok(())
+}
+
 /// Whether this exact command was the last one denied in `session`; records
 /// it either way.
 fn repeated_denial(data_dir: &Path, session: &str, command: &str) -> bool {

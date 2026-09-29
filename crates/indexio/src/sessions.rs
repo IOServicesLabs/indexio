@@ -383,6 +383,20 @@ fn commit_message(cmd: &str) -> Option<String> {
 /// Render one transcript into ≤ [`PART_BYTES`] Markdown parts, plus its
 /// card (`None` when the session asked nothing).
 fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let r = render_full(path, slug, session_id)?;
+    let card = r.card.render(session_id, &r.title, &r.cwd, slug);
+    Ok((r.parts, card))
+}
+
+/// A rendered transcript: its parts and what its card is made of.
+struct Rendered {
+    parts: Vec<String>,
+    card: Card,
+    title: String,
+    cwd: String,
+}
+
+fn render_full(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Rendered> {
     let file = fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead as _;
@@ -514,7 +528,96 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<(Vec<Stri
     if cur.len() > header.len() {
         parts.push(cur);
     }
-    Ok((parts, card.render(session_id, &title, &cwd, slug)))
+    Ok(Rendered { parts, card, title, cwd })
+}
+
+/// Caps of the session-start context (it is paid on every start).
+const START_FILES: usize = 12;
+const START_COMMITS: usize = 5;
+/// A previous session older than this is not worth pointing at.
+const START_MAX_AGE_DAYS: u64 = 14;
+
+/// Relative path of `f` under `cwd`, else `None`.
+fn under(cwd: &str, f: &str) -> Option<String> {
+    let root = cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let f = f.replace('\\', "/");
+    (!root.is_empty() && f.to_lowercase().starts_with(&format!("{root}/"))).then(|| f[root.len() + 1..].to_string())
+}
+
+/// `hook session-start` (SessionStart): a few lines of past context, so a
+/// session starts from pointers instead of re-exploring.
+/// - `startup` / `clear`: the previous session in this project — title,
+///   when, how much it changed, its last commit — and the `recall` call that
+///   returns its card. ~50 tokens.
+/// - `compact`: this session's working set (files changed, commits), which a
+///   compaction summary tends to lose. ~150-300 tokens.
+/// - `resume` (or anything else): nothing; the session has its history.
+pub fn session_start_context(claude_dir: &Path, cwd: &Path, session_id: &str, transcript: Option<&Path>, source: &str) -> Option<String> {
+    let slug = project_slug(cwd);
+    match source {
+        "compact" => {
+            let path = transcript.map(Path::to_path_buf).unwrap_or_else(|| claude_dir.join("projects").join(&slug).join(format!("{session_id}.jsonl")));
+            let r = render_full(&path, &slug, session_id).ok()?;
+            let cwd_s = if r.cwd.is_empty() { cwd.to_string_lossy().into_owned() } else { r.cwd.clone() };
+            let mut files: Vec<(String, usize)> = r.card.files.iter().filter_map(|(f, k)| under(&cwd_s, f).map(|p| (p, *k))).collect();
+            if files.is_empty() && r.card.commits.is_empty() {
+                return None;
+            }
+            files.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut s = String::from("indexio — this session before compaction:");
+            if !files.is_empty() {
+                let shown: Vec<String> = files.iter().take(START_FILES).map(|(f, k)| if *k > 1 { format!("{f} ×{k}") } else { f.clone() }).collect();
+                s.push_str(&format!("\nfiles changed: {}", shown.join(", ")));
+                if files.len() > START_FILES {
+                    s.push_str(&format!(", +{} more", files.len() - START_FILES));
+                }
+            }
+            if !r.card.commits.is_empty() {
+                let skip = r.card.commits.len().saturating_sub(START_COMMITS);
+                s.push_str(&format!("\ncommits: {}", r.card.commits[skip..].join(" | ")));
+            }
+            Some(crate::redact::redact(&s).into_owned())
+        }
+        "startup" | "clear" => {
+            // the newest other transcript of this project that asked something
+            let dir = claude_dir.join("projects").join(&slug);
+            let now = std::time::SystemTime::now();
+            let mut cands: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&dir)
+                .ok()?
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+                .filter(|e| e.path().file_stem().and_then(|s| s.to_str()) != Some(session_id))
+                .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+                .filter(|(t, _)| now.duration_since(*t).map(|d| d.as_secs() < START_MAX_AGE_DAYS * 86_400).unwrap_or(true))
+                .collect();
+            cands.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, path) in cands.into_iter().take(4) {
+                let id = path.file_stem()?.to_string_lossy().into_owned();
+                let Ok(r) = render_full(&path, &slug, &id) else { continue };
+                if r.card.asks.is_empty() {
+                    continue;
+                }
+                let cwd_s = if r.cwd.is_empty() { cwd.to_string_lossy().into_owned() } else { r.cwd.clone() };
+                let files = r.card.files.iter().filter(|(f, _)| under(&cwd_s, f).is_some()).count();
+                let title = if r.title.is_empty() { cap(&r.card.asks[0].replace('\n', " "), 80) } else { r.title.clone() };
+                let mut s = format!("indexio — previous session here: \"{title}\" ({} → {})", r.card.first_ts, r.card.last_ts);
+                if files > 0 {
+                    s.push_str(&format!(", {files} file{} changed", if files == 1 { "" } else { "s" }));
+                }
+                let n = r.card.commits.len();
+                if n > 0 {
+                    s.push_str(&format!(", {n} commit{}", if n == 1 { "" } else { "s" }));
+                }
+                if let Some(c) = r.card.commits.last() {
+                    s.push_str(&format!(", last: \"{}\"", cap(c, 90)));
+                }
+                s.push_str(".\nIts summary (asks, files, commits, outcome): mcp__indexio__recall {brief:true, query:\"\"}");
+                return Some(crate::redact::redact(&s).into_owned());
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// `2026-09-15T14:03:22.123Z` -> `2026-09-15 14:03`.
@@ -701,6 +804,33 @@ mod tests {
         assert_eq!(import(tmp.path(), &out, None).unwrap().sessions_imported, 1);
         assert!(card.exists());
         assert_eq!(import(tmp.path(), &out, None).unwrap().sessions_imported, 0);
+    }
+
+    /// SessionStart: `startup` points at the newest OTHER session of the
+    /// project, `compact` lists this session's own files and commits,
+    /// `resume` adds nothing.
+    #[test]
+    fn session_start_context_by_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = Path::new(r"C:\x");
+        let proj = tmp.path().join("projects").join(project_slug(cwd));
+        fs::create_dir_all(&proj).unwrap();
+        let prev = [
+            r#"{"type":"ai-title","aiTitle":"Retry policy"}"#,
+            r#"{"type":"user","cwd":"C:\\x","timestamp":"2099-01-01T10:00:00Z","message":{"role":"user","content":"add retries"}}"#,
+            r#"{"type":"assistant","timestamp":"2099-01-01T10:05:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\x\\src\\up.rs"}},{"type":"tool_use","name":"Bash","input":{"command":"git commit -m \"feat: retries\""}}]}}"#,
+        ];
+        fs::write(proj.join("old.jsonl"), prev.join("\n")).unwrap();
+        let now = r#"{"type":"user","cwd":"C:\\x","timestamp":"2099-01-02T10:00:00Z","message":{"role":"user","content":"next task"}}"#;
+        fs::write(proj.join("cur.jsonl"), now).unwrap();
+
+        let s = session_start_context(tmp.path(), cwd, "cur", None, "startup").unwrap();
+        assert!(s.contains("\"Retry policy\" (2099-01-01 10:00 → 2099-01-01 10:05), 1 file changed, 1 commit, last: \"feat: retries\""), "{s}");
+        assert!(s.contains("recall {brief:true"), "{s}");
+        let c = session_start_context(tmp.path(), cwd, "old", None, "compact").unwrap();
+        assert!(c.contains("files changed: src/up.rs") && c.contains("commits: feat: retries"), "{c}");
+        assert_eq!(session_start_context(tmp.path(), cwd, "cur", None, "compact"), None, "nothing changed yet");
+        assert_eq!(session_start_context(tmp.path(), cwd, "cur", None, "resume"), None);
     }
 
     #[test]

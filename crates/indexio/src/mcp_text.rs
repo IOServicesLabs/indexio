@@ -234,6 +234,8 @@ pub fn files(list: &[(String, String)], truncated: bool) -> String {
 /// Outline: `start-end kind name`, indented by scope depth.
 /// Items a test container must hold before they are folded onto its line.
 const COLLAPSE_TESTS_FROM: usize = 3;
+/// Most folded test names shown on the line; the rest become `+N more`.
+const MAX_FOLDED_TESTS: usize = 30;
 
 /// `mod tests` / `mod test` (Rust) or a `Test…` class (Python unittest).
 fn is_test_container(it: &OutlineItem) -> bool {
@@ -274,8 +276,14 @@ pub fn outline(repo: &str, path: &str, items: &[OutlineItem]) -> String {
                 .take_while(|c| c.start_line >= it.start_line && c.start_line <= it.end_line && depth_of(c) > depth)
                 .count();
             if n >= COLLAPSE_TESTS_FROM {
-                let names: Vec<String> = items[i..i + n].iter().map(|c| format!("{} {}", c.name, c.start_line)).collect();
+                // cap the folded list: a 150-test module is a 6k-token line
+                // otherwise, and the names past the first few carry little
+                let shown = n.min(MAX_FOLDED_TESTS);
+                let names: Vec<String> = items[i..i + shown].iter().map(|c| format!("{} {}", c.name, c.start_line)).collect();
                 let _ = write!(out, ": {}", names.join(", "));
+                if n > shown {
+                    let _ = write!(out, ", +{} more", n - shown);
+                }
                 i += n;
             }
         }

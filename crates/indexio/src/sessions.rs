@@ -139,6 +139,10 @@ pub fn import(claude_dir: &Path, out_dir: &Path, only_slug: Option<&str>) -> any
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         let Ok(rd) = fs::read_dir(proj.path()) else { continue };
+        // transcripts rendered before cards existed: render each once more
+        // (a marker, not a state field — older binaries rewrite the state)
+        let cards_marker = out_dir.join(&slug).join(CARDS_MARKER);
+        let backfill = !cards_marker.exists();
         let retain = crate::runs::retain_days();
         let cutoff_ms = (retain > 0).then(|| {
             std::time::SystemTime::now()
@@ -167,15 +171,19 @@ pub fn import(claude_dir: &Path, out_dir: &Path, only_slug: Option<&str>) -> any
                 }
                 continue;
             }
-            if state.files.get(&key) == Some(&stamp) {
+            if !backfill && state.files.get(&key) == Some(&stamp) {
                 continue;
             }
             match render(&path, &slug, &session_id) {
-                Ok(parts) => {
+                Ok((parts, card)) => {
                     let dir = out_dir.join(&slug);
                     fs::create_dir_all(&dir)?;
                     // drop stale parts of an earlier, longer import
                     remove_parts(&dir, &session_id);
+                    if let Some(card) = card {
+                        report.bytes_written += card.len() as u64;
+                        fs::write(dir.join(format!("{session_id}{CARD_SUFFIX}")), card)?;
+                    }
                     let n = parts.len();
                     for (i, text) in parts.into_iter().enumerate() {
                         let name = if n == 1 {
@@ -197,18 +205,191 @@ pub fn import(claude_dir: &Path, out_dir: &Path, only_slug: Option<&str>) -> any
             fs::create_dir_all(parent)?;
         }
         fs::write(&state_path, serde_json::to_vec(&state)?)?;
+        if backfill {
+            fs::write(&cards_marker, b"")?;
+        }
     }
     Ok(report)
 }
 
-/// Render one transcript into ≤ [`PART_BYTES`] Markdown parts.
-fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<String>> {
+/// File name suffix of a session card, next to its parts.
+pub const CARD_SUFFIX: &str = ".card.md";
+/// Per-project marker: every transcript there has been rendered with cards.
+const CARDS_MARKER: &str = ".cards-v1";
+
+/// Caps of a session card (the compressed form of a whole session).
+const CARD_ASKS: usize = 8;
+const CARD_ASK_CAP: usize = 220;
+const CARD_FILES: usize = 25;
+const CARD_COMMITS: usize = 12;
+const CARD_END_CAP: usize = 900;
+
+/// What a session did, gathered while rendering it: the few hundred tokens a
+/// later session needs to pick up where it left off (`recall {brief:true}`,
+/// `hook session-start`), instead of the transcript's hundreds of kB.
+#[derive(Default)]
+struct Card {
+    first_ts: String,
+    last_ts: String,
+    turns: usize,
+    tool_calls: usize,
+    asks: Vec<String>,
+    /// edited file -> edits, in first-edit order
+    files: Vec<(String, usize)>,
+    commits: Vec<String>,
+    last_answer: String,
+}
+
+impl Card {
+    fn note_ask(&mut self, t: &str) {
+        // harness turns (background-task wakeups, local-command echoes) are
+        // not requests; a pasted table or log starts at its first worded line
+        let t = t.trim();
+        if t.is_empty() || ["[Request interrupted", "Caveat:", "<task-notification>", "<local-command"].iter().any(|p| t.starts_with(p)) {
+            return;
+        }
+        // a bare slash command (`/clear`, `/model`) asks nothing
+        // (rendered "command: /clear  clear": the name, then its message)
+        if let Some(c) = t.strip_prefix("command: /") {
+            let w: Vec<&str> = c.split_whitespace().collect();
+            if w.len() == 1 || (w.len() == 2 && w[0] == w[1]) {
+                return;
+            }
+        }
+        self.turns += 1;
+        let tabular = |l: &str| l.trim_start().starts_with('|') || l.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c));
+        let worded = t.lines().find(|l| !tabular(l) && l.chars().filter(|c| c.is_alphabetic()).count() >= 3).unwrap_or(t);
+        let t = &t[t.find(worded).unwrap_or(0)..];
+        let a = cap(t, CARD_ASK_CAP * 2);
+        // a /loop re-fires the same prompt every tick
+        if !self.asks.contains(&a) {
+            self.asks.push(a);
+        }
+    }
+
+    fn tool_use(&mut self, name: &str, input: &Value) {
+        self.tool_calls += 1;
+        match name {
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+                let p = input["file_path"].as_str().or_else(|| input["notebook_path"].as_str());
+                if let Some(p) = p {
+                    match self.files.iter_mut().find(|(f, _)| f == p) {
+                        Some((_, n)) => *n += 1,
+                        None => self.files.push((p.to_string(), 1)),
+                    }
+                }
+            }
+            "Bash" | "PowerShell" => {
+                if let Some(m) = input["command"].as_str().and_then(commit_message) {
+                    if !self.commits.contains(&m) {
+                        self.commits.push(m);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render(&self, session_id: &str, title: &str, cwd: &str, slug: &str) -> Option<String> {
+        if self.asks.is_empty() {
+            return None;
+        }
+        let mut s = format!(
+            "# card {session_id}{}\nproject: {} ({slug})\nwhen: {} → {}; {} turns, {} tool calls\n",
+            if title.is_empty() { String::new() } else { format!(" — {title}") },
+            if cwd.is_empty() { "?" } else { cwd },
+            self.first_ts,
+            self.last_ts,
+            self.turns,
+            self.tool_calls,
+        );
+        s.push_str("\n## asked\n");
+        // the first requests set the task, the last ones where it ended
+        let n = self.asks.len();
+        let half = CARD_ASKS / 2;
+        for (i, a) in self.asks.iter().enumerate() {
+            if n > CARD_ASKS && i == half {
+                s.push_str(&format!("- … {} more\n", n - CARD_ASKS));
+            }
+            if n <= CARD_ASKS || i < half || i >= n - half {
+                s.push_str(&format!("- {}\n", cap(&a.replace('\n', " "), CARD_ASK_CAP)));
+            }
+        }
+        // project files, most-edited first; scratch files elsewhere are counted
+        let root = cwd.replace('\\', "/").trim_end_matches('/').to_lowercase();
+        let mut inside: Vec<(String, usize)> = Vec::new();
+        let mut outside = 0;
+        for (f, k) in &self.files {
+            let f = f.replace('\\', "/");
+            if !root.is_empty() && f.to_lowercase().starts_with(&format!("{root}/")) {
+                inside.push((f[root.len() + 1..].to_string(), *k));
+            } else if root.is_empty() {
+                inside.push((f, *k));
+            } else {
+                outside += 1;
+            }
+        }
+        inside.sort_by(|a, b| b.1.cmp(&a.1));
+        if !inside.is_empty() || outside > 0 {
+            s.push_str("\n## changed\n");
+            for (f, k) in inside.iter().take(CARD_FILES) {
+                s.push_str(&format!("- {f}{}\n", if *k > 1 { format!(" ×{k}") } else { String::new() }));
+            }
+            if inside.len() > CARD_FILES {
+                s.push_str(&format!("- … {} more\n", inside.len() - CARD_FILES));
+            }
+            if outside > 0 {
+                s.push_str(&format!("- ({outside} file{} outside the project)\n", if outside == 1 { "" } else { "s" }));
+            }
+        }
+        if !self.commits.is_empty() {
+            s.push_str("\n## commits\n");
+            let skip = self.commits.len().saturating_sub(CARD_COMMITS);
+            for c in &self.commits[skip..] {
+                s.push_str(&format!("- {c}\n"));
+            }
+        }
+        if !self.last_answer.is_empty() {
+            s.push_str(&format!("\n## ended with\n{}\n", cap(&self.last_answer, CARD_END_CAP)));
+        }
+        Some(crate::redact::redact(&s).into_owned())
+    }
+}
+
+/// The subject line of a `git commit -m …` command, if it is one.
+fn commit_message(cmd: &str) -> Option<String> {
+    let i = cmd.find("git commit")?;
+    let rest = &cmd[i..];
+    let m = rest.find(" -m")? + 3;
+    let rest = rest[m..].trim_start();
+    // -m "$(cat <<'EOF' … EOF)" : the first line of the heredoc body
+    let (body, quote) = if rest.starts_with("\"$(") || rest.starts_with("$(") || rest.starts_with("@'") {
+        (rest.split_once('\n').map(|(_, b)| b).unwrap_or(""), None)
+    } else {
+        let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'');
+        (rest.trim_start_matches(['"', '\'']), q)
+    };
+    let mut line = body.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // a one-line message ends at its closing quote (then `&& git push …`)
+    if let Some(q) = quote {
+        if let Some(j) = line.find(q) {
+            line = &line[..j];
+        }
+    }
+    let line = line.trim_end_matches(['"', '\'']).trim();
+    (!line.is_empty()).then(|| cap(line, 140))
+}
+
+/// Render one transcript into ≤ [`PART_BYTES`] Markdown parts, plus its
+/// card (`None` when the session asked nothing).
+fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let file = fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     use std::io::BufRead as _;
     let mut title = String::new();
     let mut cwd = String::new();
     let mut entries: Vec<String> = Vec::new();
+    let mut card = Card::default();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
         let Ok(o) = serde_json::from_str::<Value>(&line) else { continue };
@@ -232,6 +413,13 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
                 let side = if o["isSidechain"].as_bool().unwrap_or(false) { " (subagent)" } else { "" };
                 let ts = o["timestamp"].as_str().map(short_ts).unwrap_or_default();
                 let role = o["type"].as_str().unwrap_or("");
+                if !ts.is_empty() {
+                    if card.first_ts.is_empty() {
+                        card.first_ts = ts.clone();
+                    }
+                    card.last_ts = ts.clone();
+                }
+                let main_thread = side.is_empty();
                 let mut body = String::new();
                 match &o["message"]["content"] {
                     Value::String(s) => {
@@ -239,6 +427,9 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
                         if !t.is_empty() {
                             body.push_str(&cap(&t, TEXT_CAP));
                             body.push('\n');
+                            if main_thread && role == "user" {
+                                card.note_ask(&t);
+                            }
                         }
                     }
                     Value::Array(blocks) => {
@@ -249,10 +440,16 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
                                     if !t.is_empty() {
                                         body.push_str(&cap(&t, TEXT_CAP));
                                         body.push('\n');
+                                        if main_thread && role == "user" {
+                                            card.note_ask(&t);
+                                        } else if main_thread && role == "assistant" {
+                                            card.last_answer = t;
+                                        }
                                     }
                                 }
                                 "tool_use" => {
                                     let name = b["name"].as_str().unwrap_or("?");
+                                    card.tool_use(name, &b["input"]);
                                     let input = b["input"].to_string();
                                     body.push_str(&format!("-> {name} {}\n", cap(&input, TOOL_INPUT_CAP)));
                                 }
@@ -317,7 +514,7 @@ fn render(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Vec<Strin
     if cur.len() > header.len() {
         parts.push(cur);
     }
-    Ok(parts)
+    Ok((parts, card.render(session_id, &title, &cwd, slug)))
 }
 
 /// `2026-09-15T14:03:22.123Z` -> `2026-09-15 14:03`.
@@ -455,6 +652,55 @@ mod tests {
         let r = import(claude.path(), out.path(), None).unwrap();
         assert_eq!((r.sessions_rolled_off, r.sessions_imported), (0, 0));
         std::env::remove_var("INDEXIO_RETAIN_DAYS");
+    }
+
+    #[test]
+    fn commit_subjects_are_parsed() {
+        assert_eq!(commit_message(r#"git add a && git commit -q -m "fix: x" && git push"#).as_deref(), Some("fix: x"));
+        assert_eq!(commit_message("git commit -m 'one' ").as_deref(), Some("one"));
+        assert_eq!(
+            commit_message("git commit -m \"$(cat <<'EOF'\nfeat: heredoc subject\n\nbody\nEOF\n)\"").as_deref(),
+            Some("feat: heredoc subject")
+        );
+        assert_eq!(commit_message("git commit -m \"subject\n\nbody\""), Some("subject".into()));
+        assert_eq!(commit_message("git status"), None);
+    }
+
+    /// A card: requests (harness turns and /loop repeats dropped), project
+    /// files by edit count, scratch files counted, commits, the last answer.
+    #[test]
+    fn a_session_card_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("C--x");
+        fs::create_dir_all(&proj).unwrap();
+        let lines = [
+            r#"{"type":"ai-title","aiTitle":"Retry policy"}"#,
+            r#"{"type":"user","cwd":"C:\\x","timestamp":"2026-09-15T10:00:00Z","message":{"role":"user","content":"┌──┐\n│ table │\nadd retries to uploads"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-15T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\x\\src\\up.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"C:\\x\\src\\up.rs"}},{"type":"tool_use","name":"Write","input":{"file_path":"C:\\tmp\\scratch.py"}},{"type":"tool_use","name":"Bash","input":{"command":"git commit -m \"feat: upload retries\" && git push"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-09-15T10:01:00Z","message":{"role":"user","content":"<task-notification> done </task-notification>"}}"#,
+            r#"{"type":"user","timestamp":"2026-09-15T10:01:30Z","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>"}}"#,
+            r#"{"type":"user","timestamp":"2026-09-15T10:02:00Z","message":{"role":"user","content":"add retries to uploads"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-09-15T10:03:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Done: 3 tries with backoff."}]}}"#,
+        ];
+        fs::write(proj.join("s1.jsonl"), lines.join("\n")).unwrap();
+        let out = tmp.path().join("sessions");
+        import(tmp.path(), &out, None).unwrap();
+        let c = fs::read_to_string(out.join("C--x").join(format!("s1{CARD_SUFFIX}"))).unwrap();
+        assert!(c.starts_with("# card s1 — Retry policy\nproject: C:\\x (C--x)\nwhen: 2026-09-15 10:00 → 2026-09-15 10:03"), "{c}");
+        assert_eq!(c.matches("add retries to uploads").count(), 1, "{c}");
+        assert!(!c.contains("task-notification") && !c.contains("┌") && !c.contains("/clear"), "{c}");
+        assert!(c.contains("- src/up.rs ×2\n- (1 file outside the project)"), "{c}");
+        assert!(c.contains("## commits\n- feat: upload retries\n"), "{c}");
+        assert!(c.contains("## ended with\nDone: 3 tries with backoff."), "{c}");
+        // unchanged: skipped; a data dir from before cards (no marker, no
+        // card) renders every transcript once more
+        assert_eq!(import(tmp.path(), &out, None).unwrap().sessions_imported, 0);
+        let card = out.join("C--x").join(format!("s1{CARD_SUFFIX}"));
+        fs::remove_file(&card).unwrap();
+        fs::remove_file(out.join("C--x").join(CARDS_MARKER)).unwrap();
+        assert_eq!(import(tmp.path(), &out, None).unwrap().sessions_imported, 1);
+        assert!(card.exists());
+        assert_eq!(import(tmp.path(), &out, None).unwrap().sessions_imported, 0);
     }
 
     #[test]

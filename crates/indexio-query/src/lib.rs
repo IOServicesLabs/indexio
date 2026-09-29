@@ -1416,7 +1416,7 @@ impl Engine {
         let (si, docid) = self.locate_doc(&m.repo, &m.path)?;
         let dm = self.set.doc(si, docid)?;
         let content = self.cached_content(si, docid)?;
-        let (line, snippet) = semantic_snippet(&content, m.start_line, m.end_line);
+        let (line, snippet) = semantic_snippet(&content, m.start_line, m.end_line)?;
         Some(SearchHit {
             repo: m.repo.clone(),
             path: m.path.clone(),
@@ -1816,8 +1816,11 @@ fn snippet_line(content: &[u8], line: u32) -> String {
 }
 
 /// Semantic snippet: up to 2 lines starting at 1-based `start_line`,
-/// each trimmed, joined by a newline, capped at SNIPPET_MAX_CHARS.
-fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> (u32, String) {
+/// each trimmed, joined by a newline, capped at SNIPPET_MAX_CHARS. `None`
+/// for a chunk with no word in reach (a file's closing `}\n}\n` tail): its
+/// vector is near the corpus mean, so it matches every query weakly and
+/// shows as a row reading `}`.
+fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> Option<(u32, String)> {
     // SPEC-P9: a chunk's first line is often a shebang, a comment banner, an
     // attribute, a decorator or a lone `}`; point the hit at the first line
     // that looks like code, scanning a few lines past the chunk end if the
@@ -1826,6 +1829,7 @@ fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> (u32, Str
     let first = content_line(content, start_line);
     let last = start_line.saturating_add(CHUNK_SNIPPET_SCAN);
     let mut chosen: Option<(u32, String)> = None;
+    let mut worded = false;
     for ln in start_line..=last {
         let l = if ln == start_line { first.clone() } else { content_line(content, ln) };
         let t = l.trim();
@@ -1835,11 +1839,15 @@ fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> (u32, Str
             }
             continue;
         }
+        worded |= t.chars().any(char::is_alphanumeric);
         if is_comment_like(t) {
             continue;
         }
         chosen = Some((ln, l));
         break;
+    }
+    if chosen.is_none() && !worded {
+        return None;
     }
     let (line, l1) = chosen.unwrap_or((start_line, first));
     // Two lines: the MCP text layer shows the first, the reranker and the
@@ -1852,10 +1860,10 @@ fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> (u32, Str
 {}", l1.trim(), l2.trim())
     };
     if joined.chars().count() <= SNIPPET_MAX_CHARS {
-        (line, joined)
+        Some((line, joined))
     } else {
         let prefix: String = joined.chars().take(SNIPPET_MAX_CHARS - 3).collect();
-        (line, format!("{prefix}..."))
+        Some((line, format!("{prefix}...")))
     }
 }
 
@@ -1936,6 +1944,16 @@ mod tests {
             col: 0,
             scope: String::new(),
         }
+    }
+
+    #[test]
+    fn wordless_chunks_have_no_snippet() {
+        let src = b"fn a() {\n    x();\n}\n}\n}\n\n";
+        assert_eq!(semantic_snippet(src, 4, 6), None, "a file's closing-brace tail");
+        assert_eq!(semantic_snippet(src, 1, 3).map(|s| s.0), Some(1));
+        // comment-like but worded (markdown bullets, `#` comments): kept
+        let md = b"* first item\n* second item\n";
+        assert_eq!(semantic_snippet(md, 1, 2).map(|s| s.0), Some(1));
     }
 
     /// Two shards: shard 1 = repo "alpha", shard 2 = repo "beta".

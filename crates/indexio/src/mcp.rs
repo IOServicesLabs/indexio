@@ -1733,12 +1733,22 @@ fn call_tool(
                         let scope = repo_scope(engine, q);
                         if let Ok(mut fused) = engine.search_hybrid_in(q, limit.saturating_mul(2), embedder, FusionAlgo::Rrf, scope.as_deref()) {
                             fused.retain(|h| h.hit.repo != crate::sessions::REPO);
+                            // a guess, not a grep: a short list, and other
+                            // repos folded like the literal answer (§35)
+                            let mut folded = Folded::default();
                             if let Some(cur) = current {
                                 let (mut here, rest): (Vec<_>, Vec<_>) = fused.into_iter().partition(|h| h.hit.repo == cur);
-                                here.extend(rest);
+                                if here.is_empty() {
+                                    here.extend(rest);
+                                } else {
+                                    let (kept, left) = split_other_rows(rest, OTHER_REPO_ROWS, |h| (&h.hit.repo, &h.hit.path));
+                                    folded.rows = left.len();
+                                    folded.repos = left.iter().map(|h| h.hit.repo.as_str()).collect::<std::collections::HashSet<_>>().len();
+                                    here.extend(kept);
+                                }
                                 fused = here;
                             }
-                            fused.truncate(limit);
+                            fused.truncate(limit.min(FALLBACK_ROWS));
                             if !fused.is_empty() {
                                 // a hybrid answer has no built-in equivalent
                                 // (the literal grep it replaces was empty)
@@ -1746,6 +1756,7 @@ fn call_tool(
                                 if text {
                                     let mut out = String::from("no line has every word; ranked by any of them (hybrid):\n");
                                     out.push_str(&mcp_text::hybrid_hits(&fused, "hits"));
+                                    out.push_str(&folded.note());
                                     return Ok(plain_result(out));
                                 }
                                 return Ok(text_result(json!({
@@ -1981,14 +1992,17 @@ fn call_tool(
             // whatever survived in a 60-deep fused list; the command-output
             // source (SPEC-P10 §31) is searched the same way and merged
             let n = limit.saturating_mul(3).max(24);
-            let mut fused = engine
-                .search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::sessions::REPO))
-                .map_err(|e| internal(format!("recall failed: {e}")))?;
-            if engine.stats().repos.iter().any(|r| r == crate::runs::REPO) {
-                if let Ok(runs) = engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::runs::REPO)) {
-                    fused.extend(runs);
-                    fused.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
-                }
+            let has_runs = engine.stats().repos.iter().any(|r| r == crate::runs::REPO);
+            // the two legs are independent: run them side by side
+            let (sessions, runs) = std::thread::scope(|s| {
+                let runs = has_runs.then(|| s.spawn(|| engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::runs::REPO))));
+                let sessions = engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::sessions::REPO));
+                (sessions, runs.and_then(|h| h.join().ok()))
+            });
+            let mut fused = sessions.map_err(|e| internal(format!("recall failed: {e}")))?;
+            if let Some(Ok(runs)) = runs {
+                fused.extend(runs);
+                fused.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
             }
             let slug = std::env::current_dir().ok().map(|d| crate::sessions::project_slug(&d));
             let mut hits: Vec<indexio_types::SearchHit> = fused
@@ -2205,17 +2219,7 @@ fn fold_other_repos(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&s
         if here.is_empty() || keep == usize::MAX {
             here.extend(rest);
         } else {
-            // one row per file first, so the allowance shows breadth
-            let mut seen_files: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-            let mut kept: Vec<indexio_types::SearchHit> = Vec::new();
-            let mut left: Vec<indexio_types::SearchHit> = Vec::new();
-            for h in rest {
-                if kept.len() < keep && seen_files.insert((h.repo.clone(), h.path.clone())) {
-                    kept.push(h);
-                } else {
-                    left.push(h);
-                }
-            }
+            let (kept, left) = split_other_rows(rest, keep, |h| (&h.repo, &h.path));
             folded.rows = left.len();
             folded.repos = left.iter().map(|h| h.repo.as_str()).collect::<std::collections::HashSet<_>>().len();
             here.extend(kept);
@@ -2224,6 +2228,27 @@ fn fold_other_repos(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&s
     }
     hits.truncate(limit);
     folded
+}
+
+/// Rows of the lexical no-hit hybrid fallback (SPEC-P10 §25): a ranking
+/// by any of the words is a guess, and 50 guesses cost ~2k tokens.
+const FALLBACK_ROWS: usize = 10;
+
+/// Keep at most `keep` of `rest`, one row per file first so the allowance
+/// shows breadth; the remainder is returned for counting.
+fn split_other_rows<T>(rest: Vec<T>, keep: usize, key: impl Fn(&T) -> (&String, &String)) -> (Vec<T>, Vec<T>) {
+    let mut seen_files: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    let mut left = Vec::new();
+    for h in rest {
+        let (repo, path) = key(&h);
+        if kept.len() < keep && seen_files.insert((repo.clone(), path.clone())) {
+            kept.push(h);
+        } else {
+            left.push(h);
+        }
+    }
+    (kept, left)
 }
 
 /// Days of the usage log `index_stats` summarises.

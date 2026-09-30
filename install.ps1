@@ -12,6 +12,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repo = 'IOServicesLabs/indexio'
+$aside = $null
 $dir = if ($env:INDEXIO_INSTALL_DIR) { $env:INDEXIO_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\indexio' }
 $arch = if ([Environment]::Is64BitOperatingSystem) { 'x86_64' } else { throw 'indexio needs 64-bit Windows' }
 if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'aarch64' }
@@ -39,7 +40,17 @@ try {
 
     Expand-Archive (Join-Path $tmp "$name.zip") -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    Copy-Item (Join-Path $tmp "$name\indexio.exe") (Join-Path $dir 'indexio.exe') -Force
+    $target = Join-Path $dir 'indexio.exe'
+    if (Test-Path $target) {
+        # An upgrade: running agent sessions keep indexio.exe open, and Windows
+        # refuses to overwrite a running binary but allows renaming it. Move it
+        # aside; those sessions keep running it until they restart.
+        Get-ChildItem $dir -Filter 'indexio.old*.exe' | Remove-Item -Force -ErrorAction SilentlyContinue
+        $aside = Join-Path $dir 'indexio.old.exe'
+        if (Test-Path $aside) { $aside = Join-Path $dir ("indexio.old-" + [DateTime]::Now.ToString('yyyyMMddHHmmss') + ".exe") }
+        Move-Item $target $aside
+    }
+    Copy-Item (Join-Path $tmp "$name\indexio.exe") $target -Force
     Write-Host "installed $dir\indexio.exe ($tag)"
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -48,7 +59,11 @@ try {
         $env:Path = "$dir;$env:Path"
         Write-Host "added $dir to your user PATH (open a new terminal to use it)"
     }
-    Write-Host 'next:  indexio add ~/code ; indexio setup claude ; indexio hook install'
+    if ($aside) {
+        Write-Host 'upgraded: run  indexio hook install  and restart your agent sessions'
+    } else {
+        Write-Host 'next:  indexio add ~/code ; indexio setup claude ; indexio hook install'
+    }
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

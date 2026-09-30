@@ -80,6 +80,37 @@ project; the command it installs is `indexio`. The container image works with no
 at all: see [Deploy with Docker](#deploy-with-docker). `git` must be on the PATH. No service, no database and no model download
 is necessary.
 
+## Upgrade
+
+Run the same install command again. The index in `~/.indexio` stays, and you do not
+index again.
+
+| Installed with | Upgrade command |
+|---|---|
+| Script, Linux or macOS | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
+| Script, Windows | `irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 \| iex` |
+| npm | `npm install -g indexio@latest` |
+| pip | `pip install -U indexio-cli` |
+| Docker | `docker pull ghcr.io/ioserviceslabs/indexio:latest`, then recreate the container |
+| Source | `cargo install --git https://github.com/IOServicesLabs/indexio indexio --force` |
+
+Then do two more steps:
+
+1. Run `indexio hook install`. It adds the hooks that the new version brings and repairs the
+   others. It keeps your own hooks.
+2. Restart your agent sessions. A running session keeps its indexio server until it
+   restarts.
+
+Running sessions do not stop you from upgrading:
+
+- The two scripts replace the binary while sessions use it. On Windows, `install.ps1` moves
+  the running `indexio.exe` to `indexio.old.exe` and copies the new one in.
+- On Windows, npm and pip try to overwrite the binary in place, and Windows does not allow
+  that while it runs. Close your agent sessions first, or use the script.
+- Sessions that still run the old version can read an index that the new version wrote.
+- The first new server does its one-time work in the background: it embeds files that have
+  no vectors and it writes session cards. Calls are not blocked.
+
 ## Quick start
 
 Three commands. The third one is only for Claude Code.
@@ -546,13 +577,14 @@ Do one of these:
 indexio hook install
 ```
 
-This writes three Claude Code hooks into `~/.claude/settings.json`:
+This writes four Claude Code hooks into `~/.claude/settings.json`:
 
 | Hook | Effect |
 |---|---|
 | PreToolUse, Bash | A shell read or search of an indexed file (`cat`, `sed -n`, `head`, `grep`, `rg`, `find`, a `python -c` or `node -e` one-liner that only opens the file) is refused. The refusal names the indexio call that gives the same result. A command that also does other work, for example a script or a build, runs as typed. |
 | PreToolUse, Read | A whole-file Read of an indexed file is refused. The refusal names `file_outline` and `read_span`. |
 | PreCompact | Session transcripts are imported for the `recall` tool. |
+| SessionStart | A new session gets one line about the previous session in the same project: its title, dates, files changed, commits and the `recall` call for its card (70–115 tokens). After a compaction, the session gets its own changed files and commits back (75–300 tokens). A resumed session gets nothing. |
 
 The Bash hook also routes scripts and builds (`python`, `node`, `npm`, `pytest`, `go`,
 `make` …) through `indexio run`, which keeps a long output out of the context: the first
@@ -572,12 +604,12 @@ To run a refused command as typed, add `# raw` to it and send it again, or set
 | `who_calls` | Every recorded caller of a symbol. |
 | `semantic_search` | Vector search only. |
 | `list_files` | A glob or substring over indexed paths, folded by directory. No pattern lists every file. |
-| `file_outline` | Every definition of a file with its start and end lines, or the headings of a markdown file. A few hundred tokens instead of the file. |
+| `file_outline` | Every definition of a file with its start and end lines, or the headings of a markdown file. A few hundred tokens instead of the file. The tests of a `mod tests` or a `Test…` class are on one line: name and start line. |
 | `read_span` | An exact line range of an indexed file. Without an end line, the whole definition at the start line. |
 | `impact_of_symbol` | The transitive callers of a symbol across all repositories. |
 | `impact_of_diff` | The callers and importers touched by a patch or by the uncommitted working tree. |
 | `refresh_index` | A delta re-index, embed and reload from inside the session. |
-| `recall` | Search of earlier sessions and of stored command output: requests, answers, tool calls, results, build and test logs. A lone hit comes with its exchange. |
+| `recall` | Search of earlier sessions and of stored command output: requests, answers, tool calls, results, build and test logs. A lone hit comes with its exchange. With `brief: true`, it returns session cards instead: about 1,000 tokens per session with the requests, the files changed, the commits and the outcome. `query: ""` gives the latest sessions of this project. |
 | `index_stats` | What is indexed, how current it is, and the last week of usage against the built-in tools. |
 
 The server tells Claude which built-in tool each indexio tool replaces, and which
@@ -738,6 +770,7 @@ indexio embed --repo payments
 indexio embed --all --rebuild-model         # retrain the built-in model from scratch
 indexio embed --max-chars 800               # smaller chunks
 indexio embcas-stats                        # embedding cache statistics
+indexio embcas-stats --coverage             # per repository: indexed files without vectors
 ```
 
 ### Serve
@@ -1086,7 +1119,7 @@ prescan gave no speed-up. These stay off by default.
 ## Development and releases
 
 ```
-cargo test --workspace                  # every crate, 303 tests
+cargo test --workspace                  # every crate, 325 tests
 cargo clippy --workspace --all-targets
 tools/build-release.sh                  # release build; remaps local paths out of the binary
 ```

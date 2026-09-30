@@ -9,8 +9,13 @@ Three real repositories, 44 in the index, n=30 per task, tiktoken-counted.
 Backup numbers: **2,515,228 tokens saved** in seven days of real agent traffic
 (−50% on the 3,074 calls with a built-in equivalent, verified twice), **310×**
 faster definition lookups (31 ms → 0.1 ms), **10 ms** server start reading **0
-bytes**, **5.3 GB → 911 MB** index, **13** MCP tools, **303** tests, **one**
+bytes**, **5.3 GB → 911 MB** index, **13** MCP tools, **325** tests, **one**
 Rust binary, **zero** bytes uploaded.
+
+0.1.6 numbers (see the "0.1.6 — what's new" section): past sessions kept as **~1k-token
+cards** (86 sessions: **44.9 MB → 265 KB**), **4%** of indexed files were invisible to
+semantic search and now aren't, best-answer rank **0.565 → 0.674** on questions asked from
+inside a repo, outlines **13%** smaller, **8%** fewer tokens on replayed real calls.
 
 One-liner: *indexio is the Rust code index for AI coding agents — it indexes every
 repo you own once, answers in milliseconds, and cuts 97% of the tokens your agent
@@ -21,12 +26,103 @@ Install lines to repeat everywhere:
 - Windows: `irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 | iex`
 - npm: `npm install -g indexio` · pip: `pip install indexio-cli`
 - Docker: `docker pull ghcr.io/ioserviceslabs/indexio`
-- Then: `indexio add ~/code` → `indexio setup claude`
+- Then: `indexio add ~/code` → `indexio setup claude` → `indexio hook install`
+- Upgrade: run the same install line again, then `indexio hook install`; the index carries over
 - Repo: `github.com/IOServicesLabs/indexio`
 
 **The install hook worth leading with:** you don't install indexio. You paste a
 block into your agent and *it* installs itself, indexes your code, registers its
 own MCP server and verifies the result. The README has the block.
+
+---
+
+## 0.1.6 — what's new (post copy)
+
+Source for every figure below: A/B replays of real agent calls against the 0.1.5 binary on a
+copy of the same index (one machine, 48 repos, 10,991 files), plus a 20-question eval asked
+from inside the repo. The release notes carry the same table.
+
+| Change | Result |
+|---|---|
+| Fewer rows when a search matches nothing; recall runs its two searches in parallel | code_search 9–23% fewer tokens; recall about 1.5–2× faster |
+| Session cards + `recall {brief:true}` | 86 past sessions summarized in 265 KB, vs 44.9 MB of rendered transcripts |
+| Search results that just read `}` removed | Less noise, search quality unchanged |
+| `repo:` filter fix + your own repo searched first in hybrid | Best-answer rank score 0.565 → 0.674, right file in the top 5: 80% → 85% |
+| Missing-vector repair + `embcas-stats --coverage` | Fixes 441 files (4%) that semantic search couldn't find |
+| Test modules folded in outlines | file_outline 13% fewer tokens |
+| Session-start hook | 71–112 tokens pointing a new session at the previous one; 76–291 tokens of working set after a compaction |
+
+### X / Twitter — 0.1.6 single post
+
+> Your agent compacts, and forgets which files it was editing.
+> indexio 0.1.6 keeps every past session as a ~1k-token card — what was asked, what changed, what shipped — and hands a new session a one-line pointer to the last one.
+> 86 sessions: 44.9 MB of transcript → 265 KB of cards. Still one Rust binary. Still nothing uploaded.
+
+### X / Twitter — 0.1.6 thread
+
+**1/**
+indexio 0.1.6 is out. The theme: an agent's past is context too, and it was the most expensive context it had. 🧵
+
+**2/**
+Every session now gets a card: the requests, the files changed (most-edited first), the commits, how it ended. About 1k tokens. `recall {brief:true}` returns them. 86 of my sessions went from 44.9 MB of transcript to 265 KB of cards.
+
+**3/**
+A new session gets one line pointing at the previous one — title, when, how much changed, the last commit — for 71–112 tokens. After a compaction, the session gets back its own working set: the files it was editing and what it committed.
+
+**4/**
+We also found 4% of our own code was invisible to semantic search. A lexical-only writer (our shell hook re-indexes before it blocks a `cat`) indexed files that nothing ever embedded. The background sync now repairs it; `indexio embcas-stats --coverage` shows the gap.
+
+**5/**
+And a scoping bug: `repo:indexio` searched every repo, because another repo's name contains "indexio". Exact names win now, and your own repo gets its own ranked pass. On questions asked from inside the repo: best-answer rank 0.565 → 0.674.
+
+**6/**
+One idea we measured and didn't ship: answering a re-read with "only what changed since you last read it". It would save at most 2%, and the server can't tell whether the model's context was compacted in between. A partial answer to a model that lost the file is worse than a full one.
+
+**7/**
+Upgrade: run the same install line again, then `indexio hook install`. The index carries over. github.com/IOServicesLabs/indexio
+
+### X / Twitter — 0.1.6 standalone posts
+
+> 4% of our code was invisible to our own semantic search.
+> Our shell hook re-indexes a repo before it tells the agent "use the index instead of cat". It updated the lexical index. Nothing ever embedded those files.
+> Every search leg looked healthy. It just never returned them.
+
+> `repo:indexio` searched every repository we own.
+> The filter matches by substring, and another repo is called `themlisten_indexio`. Two matches means "ambiguous", ambiguous means "no filter", and no filter means no error.
+
+> We had a feature that would have cut re-reads to just the changed lines.
+> We measured it first: ≤2% of read tokens, and it can hand a partial file to a model that just compacted and lost the original.
+> Not shipped. The measurement was the feature.
+
+> Search results that just said `}`.
+> The last chunk of a file is often nothing but closing braces. Its vector sits at the average of everything, so it matches every query a little. We stopped returning chunks with no words in them.
+
+### LinkedIn — 0.1.6
+
+> **Your coding agent's most expensive context is its own past.**
+>
+> When a long session compacts, the model keeps a summary and loses the working set: which files it was editing, what it already committed. A new session in the same repo starts from nothing and re-explores.
+>
+> indexio 0.1.6 keeps every past session as a card of about 1,000 tokens: what was asked, which files changed, the commits, how it ended. 86 real sessions went from 44.9 MB of transcript to 265 KB of cards. A new session gets a one-line pointer to the last one (71–112 tokens); a compacted one gets its working set back.
+>
+> Two bugs we found while building it are worth more than the feature:
+> • 4% of indexed files had never been embedded, so semantic search could not return them. A lexical-only writer indexed them and nothing noticed. The background sync now repairs it.
+> • A repo filter matched by substring, so `repo:indexio` quietly searched every repo. Fixing it, and giving the session's own repo its own ranked pass, moved best-answer rank from 0.565 to 0.674.
+>
+> Neither produced an error. Both just made the agent a little worse at its job.
+>
+> Apache-2.0, one Rust binary, nothing uploaded: github.com/IOServicesLabs/indexio
+
+### Discord — 0.1.6 announcement
+
+> :crab: **indexio 0.1.6**
+>
+> • **Session cards:** every past session as ~1k tokens (asks, files, commits, outcome). `recall {brief:true, query:""}` for the latest here
+> • **Session-start hook:** new sessions get a pointer to the previous one; compacted sessions get their working set back
+> • **4% of files were invisible to semantic search** — fixed and self-repairing; check with `indexio embcas-stats --coverage`
+> • `repo:` filters scope correctly, your own repo is searched first, outlines fold test modules
+>
+> Upgrade: same install line as before, then `indexio hook install`. Restart your agent sessions to pick it up.
 
 ---
 
@@ -139,7 +235,7 @@ Apache-2.0. `github.com/IOServicesLabs/indexio` — star it, index something hug
 >
 > Data dir went 5.3 GB → 911 MB for the same index. Whole benchmark workload 1,465 ms → 111 ms.
 >
-> Apache-2.0, 303 tests, `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
+> Apache-2.0, 325 tests, `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
 > Repo: https://github.com/IOServicesLabs/indexio — happy to talk about the posting codec, the tombstone/compaction design, or why `.stale` parking exists (Windows won't let you unlink a file another process still has mapped).
 
 ## Reddit — r/programming
@@ -379,3 +475,6 @@ Apache-2.0. `github.com/IOServicesLabs/indexio` — star it, index something hug
 - [ ] **Keep the losing rows in.** `file_outline` (+24k), lexical `code_search` (a tie with grep), `find_symbol` (worse than a targeted grep). They are ~1% of the total and they are the reason the other numbers get believed. Don't let anyone edit them out for a cleaner table.
 - [ ] **n=1 machine, one developer, Windows 11, 42-repo index.** State it up front rather than letting a commenter discover it.
 - [ ] Swap the repo URL for a landing page if one exists at launch time.
+- [ ] **0.1.6 figures carry their denominators.** "8% fewer tokens" is on replayed real calls where output changed or stayed identical (read_span, 85% of all tokens, did not change). "0.565 → 0.674" is a 20-question eval written by us, on one repo, asked from inside it. "44.9 MB → 265 KB" is storage of 86 sessions, not context saved per session.
+- [ ] **Session cards save context only when used.** The hook's pointer costs 71–112 tokens per session start; the saving (sessions not re-exploring) has not been measured yet. Don't claim a context reduction for cards until it is.
+- [ ] **Fresher live-traffic figure exists:** `index_stats` on 2026-09-29 reported 5,347 calls in 7 days, 3.92M tokens vs 12.58M for the built-in equivalents (−69%). Check the logger duplicate-row fix first, then reconcile it with the 2,515,228 / −50% figure above before either circulates.

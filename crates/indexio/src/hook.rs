@@ -40,6 +40,14 @@ fn repos(data_dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Whether the index holds `rel`'s CONTENTS: a name-only entry (a PDF, a
+/// text file over the cap) is indexed by name, and the file itself is what
+/// a Read or a `cat` of it should get.
+fn contents_indexed(engine: &Engine, repo: &str, rel: &str) -> bool {
+    engine.outline(repo, rel).is_some()
+        && !engine.read_span(repo, rel, 1, 1).is_some_and(|(body, _)| body.contains(indexio_ingest::NAME_ONLY_MARKER))
+}
+
 /// (repo, repo-relative path with '/') for an absolute path inside a repo.
 fn locate(repos: &[(String, PathBuf)], abs: &Path) -> Option<(String, String)> {
     let abs = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
@@ -547,7 +555,7 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
         if engine.is_none() {
             engine = Engine::open(data_dir).ok();
         }
-        engine.as_ref().is_some_and(|e| e.outline(repo, rel).is_some())
+        engine.as_ref().is_some_and(|e| contents_indexed(e, repo, rel))
     };
     let mut cwd = cwd.to_path_buf();
     for pipeline in split(command) {
@@ -911,7 +919,9 @@ pub fn read_verdict(data_dir: &Path, file_path: &str, offset: Option<u64>, limit
     let repos = repos(data_dir);
     let (repo, rel) = locate(&repos, &abs)?;
     let engine = Engine::open(data_dir).ok()?;
-    engine.outline(&repo, &rel)?;
+    if !contents_indexed(&engine, &repo, &rel) {
+        return None;
+    }
     freshen(data_dir, &repo);
     let name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
     Some(match (offset, limit) {
@@ -1233,6 +1243,26 @@ mod tests {
         assert!(is_outline_pattern("^pub fn |^impl |^struct "));
         assert!(!is_outline_pattern("^class Foo|bar"));
         assert!(!is_outline_pattern("def test_"));
+    }
+
+    /// A plain folder's PDF is indexed by name only: a Read of it is the
+    /// way to its contents and is allowed; its text neighbour is redirected.
+    /// A nested git worktree (`.git` file) is not part of the folder.
+    #[test]
+    fn read_hook_allows_name_only_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("folder");
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::write(root.join("notes.md"), b"# Notes\nsome text\n").unwrap();
+        std::fs::write(root.join("spec.pdf"), b"%PDF\0binary").unwrap();
+        std::fs::write(root.join("wt/.git"), b"gitdir: elsewhere\n").unwrap();
+        std::fs::write(root.join("wt/lib.rs"), b"fn x() {}\n").unwrap();
+        let cas = indexio_ingest::Cas::open(&data.join("cas")).unwrap();
+        let r = indexio_ingest::index_dir(&root, "folder", &data, &cas).unwrap();
+        assert_eq!(r.docs_added, 2, "notes.md + spec.pdf by name; the worktree is skipped");
+        assert!(read_verdict(&data, &root.join("notes.md").to_string_lossy(), None, None).is_some());
+        assert_eq!(read_verdict(&data, &root.join("spec.pdf").to_string_lossy(), None, None), None);
     }
 
     #[test]

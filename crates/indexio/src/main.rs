@@ -79,6 +79,10 @@ enum Commands {
         /// Skip the embed step after indexing.
         #[arg(long)]
         no_embed: bool,
+        /// Folder sources: a folder under it (relative path) never indexed,
+        /// neither as a repo nor as loose files. Repeatable; remembered.
+        #[arg(long = "exclude", value_name = "PATH")]
+        exclude: Vec<String>,
     },
     /// Sync every remembered source (clone/pull, discover, delta re-index)
     /// plus any repo registered outside a source, then embed. Cron this.
@@ -509,13 +513,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             no_sync,
             no_embed,
+            exclude,
         } => {
             let mut src = sources::parse_source(&source)?;
             src.dest = dest;
             src.include_forks = include_forks;
             src.include_archived = include_archived;
             src.shallow = !full_clone;
+            src.exclude = exclude;
             let added = sources::add_source(&data_dir, src.clone())?;
+            // the stored source: excludes accumulate across adds
+            let src = sources::load_sources(&data_dir)?
+                .into_iter()
+                .find(|s| s.kind == src.kind && s.spec == src.spec)
+                .unwrap_or(src);
             println!(
                 "{} source {}",
                 if added { "added" } else { "updated" },
@@ -569,6 +580,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 if let Some(d) = &s.dest {
                     flags.push(Box::leak(format!("dest={}", d.display()).into_boxed_str()));
+                }
+                if !s.exclude.is_empty() {
+                    flags.push(Box::leak(format!("exclude={}", s.exclude.join(",")).into_boxed_str()));
                 }
                 println!(
                     "  {:<12} {}{}",
@@ -2081,13 +2095,17 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Add { source, include_forks, include_archived, full_clone, limit, no_sync, no_embed, dest } => {
+            Commands::Add { source, include_forks, include_archived, full_clone, limit, no_sync, no_embed, dest, exclude } => {
                 assert_eq!(source, "github:acme");
                 assert!(include_forks && full_clone && no_embed);
                 assert!(!include_archived && !no_sync);
                 assert_eq!(limit, Some(5));
-                assert!(dest.is_none());
+                assert!(dest.is_none() && exclude.is_empty());
             }
+            _ => panic!("expected add"),
+        }
+        match Cli::try_parse_from(["indexio", "add", "~/code", "--exclude", "secrets", "--exclude", "old/copy"]).unwrap().command {
+            Commands::Add { exclude, .. } => assert_eq!(exclude, ["secrets", "old/copy"]),
             _ => panic!("expected add"),
         }
         assert!(Cli::try_parse_from(["indexio", "add"]).is_err());

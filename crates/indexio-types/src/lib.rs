@@ -127,6 +127,27 @@ impl Lang {
         )
     }
 
+    /// Documents a plain folder indexes by NAME only (their contents are not
+    /// text): PDFs, office and e-book formats. A name-only entry makes them
+    /// findable through `list_files` and a search for words of the file
+    /// name; `read_span` on one says the contents are not indexed. Images,
+    /// media and archives stay out: they are rarely what an agent looks up.
+    pub fn is_name_only(path: &str) -> bool {
+        if Lang::is_secret_path(path) {
+            return false;
+        }
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+        let ext = match name.rfind('.') {
+            Some(i) if i > 0 => &name[i + 1..],
+            _ => "",
+        };
+        matches!(
+            ext,
+            "pdf" | "doc" | "docx" | "docm" | "dot" | "dotx" | "xls" | "xlsx" | "xlsm" | "ppt" | "pptx" | "pptm"
+                | "odt" | "ods" | "odp" | "rtf" | "epub" | "pages" | "numbers" | "vsd" | "vsdx"
+        )
+    }
+
     pub fn from_path(path: &str) -> Lang {
         if Lang::is_secret_path(path) {
             return Lang::Unknown;

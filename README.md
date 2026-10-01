@@ -201,7 +201,33 @@ indexio remembers each source in `<data-dir>/sources.json`. `indexio sources` li
 sources and the registered repositories. `indexio remove <source>` forgets a source.
 
 Useful flags for `add`: `--limit 20` (trial run on a large organization), `--include-forks`,
-`--include-archived`, `--full-clone`, `--dest DIR` (where remote clones go), `--no-embed`.
+`--include-archived`, `--full-clone`, `--dest DIR` (where remote clones go), `--no-embed`,
+`--exclude PATH`.
+
+**Folders with repositories and other files.** A folder often holds git repositories and
+files that are not in any repository: notes, specs, exports, PDFs. `indexio add` indexes
+each repository as a repository, and the other files as one more repository with the
+folder's name:
+
+```
+projectA/                     indexio add ~/projectA
+├── backend/   (git)    →     repository "backend"
+├── frontend/  (git)    →     repository "frontend"
+├── docs/notes.md       →     repository "projectA": the contents
+├── docs/spec.pdf       →     repository "projectA": the name only
+└── old-copy/           →     left out with --exclude old-copy
+```
+
+- Text files are indexed by contents, up to the size limit (256 KiB for text, 4 MiB for code).
+- Documents (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB) and text files over the
+  limit are indexed by name only. `list_files` and a search for words of the name find them.
+  `read_span` on one says that its contents are not indexed; read the file itself. The hooks
+  let a Read of such a file through.
+- Images, media, archives and other binary files are not indexed.
+- `--exclude PATH` (repeatable, relative to the folder) keeps a folder out: it is not a
+  repository and its files are not indexed. Excludes are remembered with the source and
+  accumulate when you run `add` again.
+- A folder that is registered on its own is not indexed a second time.
 
 **Credentials.** indexio reads credentials from the environment only: `GITHUB_TOKEN` (or
 `GH_TOKEN`) and `AZDO_TOKEN` (or `AZURE_DEVOPS_EXT_PAT`, `SYSTEM_ACCESSTOKEN`). It sends
@@ -226,7 +252,8 @@ A running `indexio mcp` server does more on its own:
   each call when files changed. Uncommitted and untracked edits are searchable at once;
   their embeddings follow on a background thread within a few hundred milliseconds.
 - Every 10 minutes it probes the other repositories for a moved HEAD and re-indexes the
-  ones that moved.
+  ones that moved, and re-indexes changed plain folders by content (after the first pass,
+  an unchanged file costs one stat).
 - A session that starts before its folder is registered adopts the repository within one
   minute of `indexio add`. No restart is necessary.
 
@@ -277,7 +304,8 @@ export INDEXIO_RERANK_KEY=...
 - Files without a known code, document, configuration, script or data extension, such as
   databases, images, archives and compiled output.
 - Binary content: a NUL byte in the first 8 KiB skips the file. Files over 4 MiB, and
-  text files over 256 KiB.
+  text files over 256 KiB. In a plain folder, these files and documents (PDF, Office) are
+  indexed by name only (see [Add sources](#add-sources)).
 - Build output, dependency and cache folders (`node_modules`, `target`, `dist`, `vendor`,
   any folder with a `CACHEDIR.TAG`), git-ignored files, hidden folders except the
   configuration ones (`.github`, `.cargo`, `.vscode`, `.devcontainer` …), lock, minified

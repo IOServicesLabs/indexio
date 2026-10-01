@@ -40,12 +40,15 @@ fn repos(data_dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Whether the index holds `rel`'s CONTENTS: a name-only entry (a PDF, a
-/// text file over the cap) is indexed by name, and the file itself is what
-/// a Read or a `cat` of it should get.
+/// Whether the index holds `rel`'s CONTENTS as the file itself: a name-only
+/// entry (a document, a text file over the cap) and a PDF's extracted text
+/// layer stand in for the file, and the file itself is what a Read or a
+/// `cat` of it should get.
 fn contents_indexed(engine: &Engine, repo: &str, rel: &str) -> bool {
     engine.outline(repo, rel).is_some()
-        && !engine.read_span(repo, rel, 1, 1).is_some_and(|(body, _)| body.contains(indexio_ingest::NAME_ONLY_MARKER))
+        && !engine.read_span(repo, rel, 1, 1).is_some_and(|(body, _)| {
+            body.contains(indexio_ingest::NAME_ONLY_MARKER) || body.contains(indexio_ingest::PDF_TEXT_MARKER)
+        })
 }
 
 /// (repo, repo-relative path with '/') for an absolute path inside a repo.

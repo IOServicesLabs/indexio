@@ -329,7 +329,7 @@ impl Card {
                 outside += 1;
             }
         }
-        inside.sort_by(|a, b| b.1.cmp(&a.1));
+        inside.sort_by_key(|f| std::cmp::Reverse(f.1));
         if !inside.is_empty() || outside > 0 {
             s.push_str("\n## changed\n");
             for (f, k) in inside.iter().take(CARD_FILES) {
@@ -563,7 +563,7 @@ pub fn session_start_context(claude_dir: &Path, cwd: &Path, session_id: &str, tr
             if files.is_empty() && r.card.commits.is_empty() {
                 return None;
             }
-            files.sort_by(|a, b| b.1.cmp(&a.1));
+            files.sort_by_key(|f| std::cmp::Reverse(f.1));
             let mut s = String::from("indexio — this session before compaction:");
             if !files.is_empty() {
                 let shown: Vec<String> = files.iter().take(START_FILES).map(|(f, k)| if *k > 1 { format!("{f} ×{k}") } else { f.clone() }).collect();
@@ -590,7 +590,7 @@ pub fn session_start_context(claude_dir: &Path, cwd: &Path, session_id: &str, tr
                 .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
                 .filter(|(t, _)| now.duration_since(*t).map(|d| d.as_secs() < START_MAX_AGE_DAYS * 86_400).unwrap_or(true))
                 .collect();
-            cands.sort_by(|a, b| b.0.cmp(&a.0));
+            cands.sort_by_key(|c| std::cmp::Reverse(c.0));
             for (_, path) in cands.into_iter().take(4) {
                 let id = path.file_stem()?.to_string_lossy().into_owned();
                 let Ok(r) = render_full(&path, &slug, &id) else { continue };

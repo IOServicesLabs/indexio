@@ -76,6 +76,10 @@ pub struct Source {
     /// repos nor as loose files (`indexio add <folder> --exclude <path>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Folder sources: index the text layer of the PDFs among the loose
+    /// files instead of their name only (`--pdf-text`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pdf_text: bool,
 }
 
 impl Source {
@@ -88,6 +92,7 @@ impl Source {
             include_archived: false,
             shallow: true,
             exclude: Vec::new(),
+            pdf_text: false,
         }
     }
 
@@ -232,8 +237,10 @@ pub fn add_source(data_dir: &Path, src: Source) -> anyhow::Result<bool> {
     let mut all = load_sources(data_dir)?;
     if let Some(existing) = all.iter_mut().find(|s| s.kind == src.kind && s.spec == src.spec) {
         // excludes accumulate: re-adding a folder never re-includes what was
-        // excluded before (edit sources.json to take one back)
+        // excluded before (edit sources.json to take one back); so does
+        // --pdf-text
         let mut src = src;
+        src.pdf_text |= existing.pdf_text;
         for e in &existing.exclude {
             if !src.exclude.iter().any(|x| x.eq_ignore_ascii_case(e)) {
                 src.exclude.push(e.clone());
@@ -612,17 +619,18 @@ fn index_or_reindex(path: &Path, data_dir: &Path, cas: &Cas) -> anyhow::Result<I
 
 /// [`index_or_reindex`] for a folder indexed as a plain tree that leaves
 /// out `skip`; a changed exclude list is written to its state first.
-fn index_or_reindex_plain(path: &Path, data_dir: &Path, cas: &Cas, skip: &[String]) -> anyhow::Result<IndexReport> {
+fn index_or_reindex_plain(path: &Path, data_dir: &Path, cas: &Cas, skip: &[String], pdf_text: bool) -> anyhow::Result<IndexReport> {
     let name = repo_name_for(data_dir, path);
     match crate::repo_state(data_dir, &name) {
         Ok(mut state) if paths_equal(&state.path, path) => {
-            if state.skip != skip {
+            if state.skip != skip || state.pdf_text != pdf_text {
                 state.skip = skip.to_vec();
+                state.pdf_text = pdf_text;
                 crate::save_repo_state(data_dir, &state)?;
             }
             crate::reindex_repo(&name, data_dir, cas)
         }
-        _ => crate::index_dir_skipping(path, &name, data_dir, cas, skip.to_vec()),
+        _ => crate::index_dir_skipping(path, &name, data_dir, cas, skip.to_vec(), pdf_text),
     }
 }
 
@@ -733,7 +741,7 @@ pub fn sync_source_with(
         // untracked files are the repo's worktree indexing's business)
         if !had_repos || (!crate::is_git_checkout(&root) && crate::plain_tree_has_files(data_dir, &root, &repo_name_for(data_dir, &root), &src.exclude)) {
             report.discovered += 1;
-            match index_or_reindex_plain(&root, data_dir, cas, &src.exclude) {
+            match index_or_reindex_plain(&root, data_dir, cas, &src.exclude, src.pdf_text) {
                 Ok(ir) => report.indexed.push(ir),
                 Err(e) => {
                     warn!(path = %root.display(), error = %e, "index failed");

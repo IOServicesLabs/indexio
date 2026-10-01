@@ -74,6 +74,11 @@ pub struct RepoState {
     /// checkouts are left out without being listed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<String>,
+    /// Plain folders: index the text layer of PDFs instead of their name
+    /// only (`indexio add <folder> --pdf-text`). Kept in the state so every
+    /// process deltas the folder the same way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pdf_text: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -198,7 +203,7 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
                 let mut lang = Lang::from_path(&path);
                 // a plain folder's name-only entry (a document, or text over
                 // the cap) is indexed as the text it is
-                if content.starts_with(NAME_ONLY_MARKER.as_bytes()) {
+                if content.starts_with(NAME_ONLY_MARKER.as_bytes()) || content.starts_with(PDF_TEXT_MARKER.as_bytes()) {
                     lang = Lang::Text;
                 }
                 if lang == Lang::Unknown {
@@ -420,6 +425,7 @@ pub fn index_repo(
             plain: false,
             worktree: false,
             skip: Vec::new(),
+            pdf_text: false,
         },
     )?;
     Ok(report)
@@ -584,6 +590,65 @@ fn name_only_entry(rel: &str, len: u64, why: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// First line of the indexed text of a PDF (a plain folder with
+/// `pdf_text`): the text layer, extracted.
+pub const PDF_TEXT_MARKER: &str = "indexio pdf text";
+
+/// PDFs larger than this keep their name-only entry even with `pdf_text`.
+const PDF_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Longest a single PDF may take to extract before it keeps its name-only
+/// entry (a pathological file must not stall a background pass).
+const PDF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The text layer of a PDF, or `None` (no text, malformed, too slow). The
+/// parser runs on its own thread, behind a panic guard and a timeout.
+fn pdf_text_layer(bytes: Vec<u8>) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("pdf-text".into())
+        .spawn(move || {
+            let r = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes).ok());
+            let _ = tx.send(r.ok().flatten());
+        })
+        .ok()?;
+    let text = rx.recv_timeout(PDF_TIMEOUT).ok().flatten()?;
+    // a scan has no text layer; a few stray glyphs are not one either
+    (text.chars().filter(|c| c.is_alphanumeric()).count() >= 20).then_some(text)
+}
+
+/// The indexed text of a PDF: its text layer under a header, capped like
+/// any text file, or its name-only entry when it has none.
+fn pdf_entry(rel: &str, bytes: Vec<u8>) -> Vec<u8> {
+    let len = bytes.len() as u64;
+    let Some(text) = pdf_text_layer(bytes) else {
+        return name_only_entry(rel, len, "no text layer found (a scan, or unreadable); open the file itself to read it");
+    };
+    // collapse the layout's runs of blank lines; NULs would read as binary
+    let mut body = String::with_capacity(text.len());
+    let mut blank = 0;
+    for line in text.replace('\0', "").lines() {
+        let l = line.trim_end();
+        blank = if l.is_empty() { blank + 1 } else { 0 };
+        if blank <= 1 {
+            body.push_str(l);
+            body.push('\n');
+        }
+    }
+    let mut out = format!("{PDF_TEXT_MARKER}: extracted from {rel} ({len} bytes); open the file itself for layout and images\n\n");
+    let room = MAX_TEXT_BYTES.saturating_sub(out.len() + 64);
+    if body.len() > room {
+        let mut cut = room;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.push_str(&body[..cut]);
+        out.push_str("\n[… text truncated at the size cap]\n");
+    } else {
+        out.push_str(&body);
+    }
+    out.into_bytes()
+}
+
 /// What a plain folder indexes for one file.
 enum PlainFile {
     /// Not indexed at all (an image, an archive, an unknown type).
@@ -592,13 +657,19 @@ enum PlainFile {
     NameOnly(Vec<u8>),
     /// Indexed by contents: read the file.
     Read,
+    /// A PDF whose text layer is indexed: read it and extract.
+    Pdf,
 }
 
 /// Text files up to their cap are indexed by contents; documents
-/// ([`Lang::is_name_only`]) and text over the cap by name.
-fn plain_file(rel: &str, len: u64) -> PlainFile {
+/// ([`Lang::is_name_only`]) and text over the cap by name — PDFs by their
+/// text layer when the folder has `pdf_text`.
+fn plain_file(rel: &str, len: u64, pdf_text: bool) -> PlainFile {
     let lang = Lang::from_path(rel);
     if lang == Lang::Unknown {
+        if pdf_text && len <= PDF_MAX_BYTES && rel.to_ascii_lowercase().ends_with(".pdf") && !Lang::is_secret_path(rel) {
+            return PlainFile::Pdf;
+        }
         return if Lang::is_name_only(rel) {
             PlainFile::NameOnly(name_only_entry(rel, len, "the contents are not indexed (not a text file); open the file itself to read it"))
         } else {
@@ -614,32 +685,34 @@ fn plain_file(rel: &str, len: u64) -> PlainFile {
 
 /// The indexed bytes of one plain-folder file: its contents or its name-only
 /// entry; `None` when it is not indexed or unreadable.
-fn plain_bytes(root: &Path, rel: &str) -> Option<Vec<u8>> {
+fn plain_bytes(root: &Path, rel: &str, pdf_text: bool) -> Option<Vec<u8>> {
     let path = root.join(rel);
     let meta = fs::metadata(&path).ok()?;
     if !meta.is_file() {
         return None;
     }
-    match plain_file(rel, meta.len()) {
+    let read = || match fs::read(&path) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "skip: unreadable");
+            None
+        }
+    };
+    match plain_file(rel, meta.len(), pdf_text) {
         PlainFile::Skip => None,
         PlainFile::NameOnly(e) => Some(e),
-        PlainFile::Read => match fs::read(&path) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "skip: unreadable");
-                None
-            }
-        },
+        PlainFile::Read => read(),
+        PlainFile::Pdf => read().map(|b| pdf_entry(rel, b)),
     }
 }
 
 /// Read the indexable files of a plain tree: (relative path, content), the
-/// content being the file or its name-only entry (binary detection happens
-/// in `extract_docs`).
-fn read_plain_tree(root: &Path, skip: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+/// content being the file, its PDF text or its name-only entry (binary
+/// detection happens in `extract_docs`).
+fn read_plain_tree(root: &Path, skip: &[String], pdf_text: bool) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     Ok(walk_plain_tree_skipping(root, skip)?
         .into_iter()
-        .filter_map(|rel| plain_bytes(root, &rel).map(|c| (rel, c)))
+        .filter_map(|rel| plain_bytes(root, &rel, pdf_text).map(|c| (rel, c)))
         .collect())
 }
 
@@ -647,7 +720,7 @@ fn read_plain_tree(root: &Path, skip: &[String]) -> anyhow::Result<Vec<(String, 
 /// [`WorktreeCache`] so a file whose mtime and length are unchanged since
 /// the last pass is only stat'ed (SPEC-P10: the `sessions` folder and
 /// plain-folder repos were re-read and re-hashed whole on every refresh).
-fn read_plain_tree_cached(root: &Path, skip: &[String], mut cache: Option<&mut WorktreeCache>) -> anyhow::Result<Vec<WtFile>> {
+fn read_plain_tree_cached(root: &Path, skip: &[String], pdf_text: bool, mut cache: Option<&mut WorktreeCache>) -> anyhow::Result<Vec<WtFile>> {
     let mut files = Vec::new();
     for rel in walk_plain_tree_skipping(root, skip)? {
         let path = root.join(&rel);
@@ -655,7 +728,7 @@ fn read_plain_tree_cached(root: &Path, skip: &[String], mut cache: Option<&mut W
         if !meta.is_file() {
             continue;
         }
-        let kind = plain_file(&rel, meta.len());
+        let kind = plain_file(&rel, meta.len(), pdf_text);
         if matches!(kind, PlainFile::Skip) {
             continue;
         }
@@ -670,6 +743,7 @@ fn read_plain_tree_cached(root: &Path, skip: &[String], mut cache: Option<&mut W
         }
         let read = match kind {
             PlainFile::NameOnly(entry) => Ok(entry),
+            PlainFile::Pdf => fs::read(&path).map(|b| pdf_entry(&rel, b)),
             _ => fs::read(&path),
         };
         match read {
@@ -700,7 +774,7 @@ pub fn index_dir(
     data_dir: &Path,
     cas: &Cas,
 ) -> anyhow::Result<IndexReport> {
-    index_dir_skipping(dir, name, data_dir, cas, Vec::new())
+    index_dir_skipping(dir, name, data_dir, cas, Vec::new(), false)
 }
 
 /// The folders a plain folder at `root` leaves out: its own `skip` list
@@ -738,7 +812,7 @@ pub fn plain_tree_has_files(data_dir: &Path, root: &Path, name: &str, skip: &[St
     let skip = plain_skips(data_dir, root, name, skip);
     walk_plain_tree_skipping(root, &skip).is_ok_and(|files| {
         files.iter().any(|rel| {
-            fs::metadata(root.join(rel)).is_ok_and(|m| m.is_file() && !matches!(plain_file(rel, m.len()), PlainFile::Skip))
+            fs::metadata(root.join(rel)).is_ok_and(|m| m.is_file() && !matches!(plain_file(rel, m.len(), false), PlainFile::Skip))
         })
     })
 }
@@ -756,6 +830,7 @@ pub fn index_dir_skipping(
     data_dir: &Path,
     cas: &Cas,
     skip: Vec<String>,
+    pdf_text: bool,
 ) -> anyhow::Result<IndexReport> {
     let t0 = Instant::now();
     if state_path(data_dir, name).exists() {
@@ -765,7 +840,7 @@ pub fn index_dir_skipping(
     let shards_dir = data_dir.join("shards");
     fs::create_dir_all(&shards_dir)?;
     fs::create_dir_all(repos_dir(data_dir))?;
-    let contents = read_plain_tree(dir, &plain_skips(data_dir, dir, name, &skip))?;
+    let contents = read_plain_tree(dir, &plain_skips(data_dir, dir, name, &skip), pdf_text)?;
     let docs = extract_docs(contents, cas);
     let cas_hits = docs.iter().filter(|d| d.cas_hit).count() as u64;
     let docs_added = docs.len() as u64;
@@ -781,6 +856,7 @@ pub fn index_dir_skipping(
             plain: true,
             worktree: false,
             skip,
+            pdf_text,
         },
     )?;
     Ok(IndexReport {
@@ -807,7 +883,7 @@ fn reindex_dir(
     cache: Option<&mut WorktreeCache>,
 ) -> anyhow::Result<IndexReport> {
     let skip = plain_skips(data_dir, &state.path, &state.name, &state.skip);
-    let current = read_plain_tree_cached(&state.path, &skip, cache)?;
+    let current = read_plain_tree_cached(&state.path, &skip, state.pdf_text, cache)?;
     let next = RepoState {
         indexed_at: iso_now(),
         ..state.clone()
@@ -904,7 +980,7 @@ fn delta_by_content(
                 // unchanged on disk but its doc is gone (a HEAD sync from
                 // another process tombstoned it): read it after all — a
                 // plain folder's way, so a document gets its name-only entry
-                let reread = if state.plain { plain_bytes(&state.path, &rel) } else { fs::read(state.path.join(&rel)).ok() };
+                let reread = if state.plain { plain_bytes(&state.path, &rel, state.pdf_text) } else { fs::read(state.path.join(&rel)).ok() };
                 match reread {
                     Some(c) => c,
                     None => continue,
@@ -1376,6 +1452,7 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
             plain: false,
             worktree: false,
             skip: Vec::new(),
+            pdf_text: false,
         },
     )?;
     Ok(report)
@@ -1433,6 +1510,66 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A valid one-page PDF whose page shows `text` (Helvetica), or an empty
+    /// page — the shape of a scan, which has no text layer — for `None`.
+    fn tiny_pdf(text: Option<&str>) -> Vec<u8> {
+        let stream = match text {
+            Some(t) => format!("BT /F1 12 Tf 72 720 Td ({t}) Tj ET"),
+            None => String::new(),
+        };
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+        out
+    }
+
+    /// `pdf_text`: a PDF with a text layer is indexed by its text; one
+    /// without (a scan) or a corrupt one keeps its name-only entry, and the
+    /// pass neither hangs nor fails. Without `pdf_text`, names only.
+    #[test]
+    fn pdf_text_layer_is_indexed_when_the_folder_asks() {
+        let data = tempfile::tempdir().unwrap();
+        let cas = Cas::open(&data.path().join("cas")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("plan.pdf"), tiny_pdf(Some("Quarterly revenue grew because of the new pricing plan"))).unwrap();
+        fs::write(root.path().join("scan.pdf"), tiny_pdf(None)).unwrap();
+        fs::write(root.path().join("broken.pdf"), b"%PDF-1.4\n\x00\x01 not really a pdf").unwrap();
+        let doc = |name: &str| -> String {
+            let set = ShardSet::open_dir(&data.path().join("shards")).unwrap();
+            let (si, id, _) = set.visible_docs().into_iter().find(|(_, _, dm)| dm.path == name).unwrap();
+            String::from_utf8_lossy(&set.content(si, id).unwrap()).into_owned()
+        };
+        let r = index_dir_skipping(root.path(), "docs", data.path(), &cas, Vec::new(), true).unwrap();
+        assert_eq!(r.docs_added, 3);
+        let plan = doc("plan.pdf");
+        assert!(plan.starts_with(PDF_TEXT_MARKER) && plan.contains("Quarterly revenue grew"), "{plan}");
+        assert!(doc("scan.pdf").contains("no text layer found"), "{}", doc("scan.pdf"));
+        assert!(doc("broken.pdf").starts_with(NAME_ONLY_MARKER));
+        // the same folder without pdf_text: names only
+        let data2 = tempfile::tempdir().unwrap();
+        let cas2 = Cas::open(&data2.path().join("cas")).unwrap();
+        index_dir(root.path(), "docs", data2.path(), &cas2).unwrap();
+        let set2 = ShardSet::open_dir(&data2.path().join("shards")).unwrap();
+        let (si, id, _) = set2.visible_docs().into_iter().find(|(_, _, dm)| dm.path == "plan.pdf").unwrap();
+        assert!(String::from_utf8_lossy(&set2.content(si, id).unwrap()).starts_with(NAME_ONLY_MARKER));
     }
 
     /// Init a git repo in a fresh tempdir with the given files committed.

@@ -122,6 +122,9 @@ pub struct McpServer {
     pending_embed: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// (repo, path) the coverage repair already tried in this process.
     repair_tried: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Per plain folder (not the session's own): file stamps of the last
+    /// background pass, so the next one only stats unchanged files.
+    plain_caches: Arc<Mutex<HashMap<String, indexio_ingest::WorktreeCache>>>,
     /// The background embed of the current repo's changed files is running.
     embed_busy: Arc<AtomicBool>,
     /// Serialises this process's embeds (the auto-refresh thread and the
@@ -230,6 +233,7 @@ impl McpServer {
             warm: Arc::new(Mutex::new(None)),
             pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             repair_tried: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            plain_caches: Arc::new(Mutex::new(HashMap::new())),
             embed_busy: Arc::new(AtomicBool::new(false)),
             embed_lock: Arc::new(Mutex::new(())),
             embedder_thread: Mutex::new(None),
@@ -281,6 +285,7 @@ impl McpServer {
         let reload = Arc::clone(&self.reload_needed);
         let embed_lock = Arc::clone(&self.embed_lock);
         let tried = Arc::clone(&self.repair_tried);
+        let plain_caches = Arc::clone(&self.plain_caches);
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
             let Some(_lock) = indexio_ingest::SyncLock::try_acquire(&data_dir) else {
@@ -288,20 +293,37 @@ impl McpServer {
                 return;
             };
             let names = indexio_ingest::sources::registered_repo_names(&data_dir).unwrap_or_default();
-            let moved: Vec<String> = names
+            let others: Vec<String> = names
                 .into_iter()
-                .filter(|n| current.as_deref() != Some(n.as_str()) && n != crate::sessions::REPO)
-                .filter(|n| indexio_ingest::head_moved(&data_dir, n))
+                .filter(|n| current.as_deref() != Some(n.as_str()) && n != crate::sessions::REPO && n != crate::runs::REPO)
+                .collect();
+            let moved: Vec<String> = others.iter().filter(|n| indexio_ingest::head_moved(&data_dir, n)).cloned().collect();
+            // plain folders have no HEAD to watch: delta each one by content,
+            // with a per-folder stamp cache so unchanged files are only
+            // stat'ed after this server's first pass
+            let plain: Vec<String> = others
+                .iter()
+                .filter(|n| indexio_ingest::repo_state(&data_dir, n).is_ok_and(|s| s.plain))
+                .cloned()
                 .collect();
             let mut changed: Vec<String> = Vec::new();
-            if moved.is_empty() {
-                // nothing to sync; the coverage repair below still runs
-            } else if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
-                for n in &moved {
-                    match indexio_ingest::reindex_repo(n, &data_dir, &cas) {
-                        Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => changed.push(n.clone()),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(repo = %n, error = %e, "background sync failed"),
+            if !moved.is_empty() || !plain.is_empty() {
+                if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
+                    for n in &moved {
+                        match indexio_ingest::reindex_repo(n, &data_dir, &cas) {
+                            Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => changed.push(n.clone()),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(repo = %n, error = %e, "background sync failed"),
+                        }
+                    }
+                    for n in &plain {
+                        let mut caches = plain_caches.lock().unwrap_or_else(|e| e.into_inner());
+                        let cache = caches.entry(n.clone()).or_default();
+                        match indexio_ingest::reindex_worktree_cached(n, &data_dir, &cas, Some(cache)) {
+                            Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => changed.push(n.clone()),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(repo = %n, error = %e, "background sync of a plain folder failed"),
+                        }
                     }
                 }
             }
@@ -3467,6 +3489,7 @@ mod tests {
                 indexed_at: String::new(),
                 plain: true,
                 worktree: false,
+                skip: Vec::new(),
             })
             .unwrap(),
         )

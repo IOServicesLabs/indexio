@@ -72,6 +72,10 @@ pub struct Source {
     pub include_archived: bool,
     #[serde(default = "default_true")]
     pub shallow: bool,
+    /// Folder sources: root-relative folders never indexed — neither as
+    /// repos nor as loose files (`indexio add <folder> --exclude <path>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 impl Source {
@@ -83,6 +87,7 @@ impl Source {
             include_forks: false,
             include_archived: false,
             shallow: true,
+            exclude: Vec::new(),
         }
     }
 
@@ -226,6 +231,14 @@ pub fn save_sources(data_dir: &Path, sources: &[Source]) -> anyhow::Result<()> {
 pub fn add_source(data_dir: &Path, src: Source) -> anyhow::Result<bool> {
     let mut all = load_sources(data_dir)?;
     if let Some(existing) = all.iter_mut().find(|s| s.kind == src.kind && s.spec == src.spec) {
+        // excludes accumulate: re-adding a folder never re-includes what was
+        // excluded before (edit sources.json to take one back)
+        let mut src = src;
+        for e in &existing.exclude {
+            if !src.exclude.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                src.exclude.push(e.clone());
+            }
+        }
         *existing = src;
         save_sources(data_dir, &all)?;
         return Ok(false);
@@ -260,8 +273,19 @@ pub fn remove_source(data_dir: &Path, spec: &str) -> anyhow::Result<bool> {
 /// `.git`); the walk does not descend into repos, hidden dirs or
 /// [`crate::SKIP_DIRS`]. `root` itself being a repo yields just `[root]`.
 pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        if dir.join(".git").exists() {
+    discover_repos_excluding(root, &[])
+}
+
+/// [`discover_repos`] that never enters the root-relative folders in
+/// `exclude` (case-insensitive).
+pub fn discover_repos_excluding(root: &Path, exclude: &[String]) -> Vec<PathBuf> {
+    let exclude: Vec<String> = exclude.iter().map(|s| s.trim_matches('/').replace('\\', "/").to_lowercase()).collect();
+    fn walk(root: &Path, dir: &Path, exclude: &[String], out: &mut Vec<PathBuf>) {
+        let rel = dir.strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase()).unwrap_or_default();
+        if !rel.is_empty() && exclude.contains(&rel) {
+            return;
+        }
+        if crate::is_git_checkout(dir) {
             out.push(dir.to_path_buf());
             return;
         }
@@ -274,11 +298,11 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
             .collect();
         subdirs.sort();
         for d in subdirs {
-            walk(&d, out);
+            walk(root, &d, exclude, out);
         }
     }
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(root, root, &exclude, &mut out);
     out
 }
 
@@ -586,6 +610,22 @@ fn index_or_reindex(path: &Path, data_dir: &Path, cas: &Cas) -> anyhow::Result<I
     }
 }
 
+/// [`index_or_reindex`] for a folder indexed as a plain tree that leaves
+/// out `skip`; a changed exclude list is written to its state first.
+fn index_or_reindex_plain(path: &Path, data_dir: &Path, cas: &Cas, skip: &[String]) -> anyhow::Result<IndexReport> {
+    let name = repo_name_for(data_dir, path);
+    match crate::repo_state(data_dir, &name) {
+        Ok(mut state) if paths_equal(&state.path, path) => {
+            if state.skip != skip {
+                state.skip = skip.to_vec();
+                crate::save_repo_state(data_dir, &state)?;
+            }
+            crate::reindex_repo(&name, data_dir, cas)
+        }
+        _ => crate::index_dir_skipping(path, &name, data_dir, cas, skip.to_vec()),
+    }
+}
+
 fn default_dest(data_dir: &Path, src: &Source, repo: &str) -> PathBuf {
     let base = src
         .dest
@@ -673,17 +713,31 @@ pub fn sync_source_with(
         if !root.is_dir() {
             bail!("{}: folder no longer exists", root.display());
         }
-        let mut repos = discover_repos(&root);
-        if repos.is_empty() {
-            repos.push(root.clone()); // plain tree
-        }
+        let repos = discover_repos_excluding(&root, &src.exclude);
         report.discovered = repos.len() as u64;
+        let had_repos = !repos.is_empty();
         for r in repos {
             match index_or_reindex(&r, data_dir, cas) {
                 Ok(ir) => report.indexed.push(ir),
                 Err(e) => {
                     warn!(path = %r.display(), error = %e, "index failed");
                     report.failed.push((r.display().to_string(), format!("{e:#}")));
+                }
+            }
+        }
+        // the folder itself as a plain tree: the whole of it when it holds no
+        // repo, else its loose files — the docs, notes and data next to the
+        // repos (each repo, and each folder registered on its own, is left
+        // out), when there are any
+        // (a source that IS a repo has no loose files of its own: its
+        // untracked files are the repo's worktree indexing's business)
+        if !had_repos || (!crate::is_git_checkout(&root) && crate::plain_tree_has_files(data_dir, &root, &repo_name_for(data_dir, &root), &src.exclude)) {
+            report.discovered += 1;
+            match index_or_reindex_plain(&root, data_dir, cas, &src.exclude) {
+                Ok(ir) => report.indexed.push(ir),
+                Err(e) => {
+                    warn!(path = %root.display(), error = %e, "index failed");
+                    report.failed.push((root.display().to_string(), format!("{e:#}")));
                 }
             }
         }
@@ -888,6 +942,98 @@ mod tests {
         assert_eq!(repo_name_for(&d, &t2), "teamB-api");
         assert_eq!(url_repo_name("https://github.com/acme/widgets.git"), "widgets");
         assert_eq!(url_repo_name("git@github.com:acme/widgets.git"), "widgets");
+    }
+
+    /// A folder holding a repo AND loose files: the repo is indexed as a
+    /// repo, the loose files as the folder's own plain tree — text by
+    /// contents, a PDF and an over-cap CSV by name, an image not at all,
+    /// an excluded folder never — and a second sync changes nothing.
+    #[test]
+    fn local_source_indexes_loose_files_next_to_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("data");
+        let cas = Cas::open(&d.join("cas")).unwrap();
+        let root = tmp.path().join("projectA");
+        let app = root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("main.rs"), b"fn main() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&app)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/notes.md"), b"# Launch notes\nthe budget is approved\n").unwrap();
+        fs::write(root.join("docs/Q3_ReportDraft.pdf"), b"%PDF-1.7\0\x01binary").unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/huge.csv"), vec![b'a'; crate::MAX_TEXT_BYTES + 10]).unwrap();
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        fs::write(root.join("secrets/token.txt"), b"do not index\n").unwrap();
+        fs::write(root.join("photo.jpg"), b"\xff\xd8\xff").unwrap();
+
+        let mut src = parse_source(root.to_str().unwrap()).unwrap();
+        src.exclude = vec!["secrets".into()];
+        let opts = SyncOptions { github_token: None, azdo_token: None, ..Default::default() };
+        let r = sync_source_with(&src, &d, &cas, &opts, &|_, _, _, _| Ok(())).unwrap();
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        let names: Vec<&str> = r.indexed.iter().map(|i| i.repo.as_str()).collect();
+        assert_eq!(names, ["app", "projectA"], "the repo, then the folder's loose files");
+        let loose = &r.indexed[1];
+        assert_eq!(loose.docs_added, 3, "notes.md + the pdf + huge.csv by name");
+
+        let set = indexio_index::ShardSet::open_dir(&d.join("shards")).unwrap();
+        let mut docs: Vec<(String, String)> = set
+            .visible_docs()
+            .into_iter()
+            .map(|(si, id, dm)| (dm.path.clone(), String::from_utf8_lossy(&set.content(si, id).unwrap()).into_owned()))
+            .collect();
+        docs.sort();
+        let paths: Vec<&str> = docs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["data/huge.csv", "docs/Q3_ReportDraft.pdf", "docs/notes.md", "main.rs"]);
+        let pdf = &docs[1].1;
+        assert!(pdf.starts_with(crate::NAME_ONLY_MARKER) && pdf.contains("words: q3 report draft") && pdf.contains("folder: docs"), "{pdf}");
+        assert!(docs[0].1.contains("over the size cap"), "{}", docs[0].1);
+        assert!(docs[2].1.contains("the budget is approved"));
+
+        // nothing changed: nothing re-indexed
+        let r2 = sync_source_with(&src, &d, &cas, &opts, &|_, _, _, _| Ok(())).unwrap();
+        assert!(r2.indexed.iter().all(|i| i.docs_added == 0 && i.docs_deleted == 0), "{:?}", r2.indexed);
+        // a source that IS a repo (how most folders are registered) gets no
+        // plain copy of itself
+        let repo_src = parse_source(app.to_str().unwrap()).unwrap();
+        let r3 = sync_source_with(&repo_src, &d, &cas, &opts, &|_, _, _, _| Ok(())).unwrap();
+        let names3: Vec<&str> = r3.indexed.iter().map(|i| i.repo.as_str()).collect();
+        assert_eq!(names3, ["app"]);
+        // a folder whose every file sits in its repos gets no plain entry
+        fs::remove_dir_all(root.join("docs")).unwrap();
+        fs::remove_dir_all(root.join("data")).unwrap();
+        fs::remove_file(root.join("photo.jpg")).unwrap();
+        let other = tmp.path().join("only-repos");
+        fs::create_dir_all(&other).unwrap();
+        assert!(!crate::plain_tree_has_files(&d, &other, "only-repos", &[]));
+    }
+
+    #[test]
+    fn excludes_accumulate_across_adds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut a = parse_source(tmp.path().to_str().unwrap()).unwrap();
+        a.exclude = vec!["secrets".into()];
+        assert!(add_source(tmp.path(), a.clone()).unwrap());
+        a.exclude = vec!["old".into()];
+        assert!(!add_source(tmp.path(), a.clone()).unwrap());
+        a.exclude = Vec::new();
+        add_source(tmp.path(), a).unwrap();
+        assert_eq!(load_sources(tmp.path()).unwrap()[0].exclude, ["old", "secrets"]);
+        assert_eq!(discover_repos_excluding(tmp.path(), &["x".into()]), Vec::<PathBuf>::new());
     }
 
     #[test]

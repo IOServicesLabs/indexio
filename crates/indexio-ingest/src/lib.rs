@@ -69,6 +69,11 @@ pub struct RepoState {
     /// hash instead of by tree diff.
     #[serde(default)]
     pub worktree: bool,
+    /// Plain folders: root-relative folders left out (a folder source's
+    /// `--exclude`). Folders registered as repos of their own and nested git
+    /// checkouts are left out without being listed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -190,7 +195,12 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
         files
             .into_par_iter()
             .filter_map(|(path, content)| {
-                let lang = Lang::from_path(&path);
+                let mut lang = Lang::from_path(&path);
+                // a plain folder's name-only entry (a document, or text over
+                // the cap) is indexed as the text it is
+                if content.starts_with(NAME_ONLY_MARKER.as_bytes()) {
+                    lang = Lang::Text;
+                }
                 if lang == Lang::Unknown {
                     debug!(%path, "skip: unknown language");
                     return None;
@@ -409,6 +419,7 @@ pub fn index_repo(
             indexed_at: iso_now(),
             plain: false,
             worktree: false,
+            skip: Vec::new(),
         },
     )?;
     Ok(report)
@@ -497,14 +508,30 @@ pub fn under_cache_dir(root: &Path, rel: &str, memo: &mut HashMap<String, bool>)
 /// Every regular file under `root` (relative '/'-separated paths, sorted),
 /// skipping [`SKIP_DIRS`] and hidden directories; symlinks are not followed.
 pub fn walk_plain_tree(root: &Path) -> anyhow::Result<Vec<String>> {
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+    walk_plain_tree_skipping(root, &[])
+}
+
+/// Whether `dir` is a git checkout of its own: a `.git` directory, or the
+/// `.git` file of a linked worktree. It is indexed as its own repo, never as
+/// part of an enclosing folder.
+pub fn is_git_checkout(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// [`walk_plain_tree`] that also leaves out nested git checkouts and the
+/// root-relative folders in `skip` (excluded paths, folders registered as
+/// repos of their own), compared case-insensitively.
+pub fn walk_plain_tree_skipping(root: &Path, skip: &[String]) -> anyhow::Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, skip: &[String], out: &mut Vec<String>) -> anyhow::Result<()> {
         for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let entry = entry?;
             let ft = entry.file_type()?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if ft.is_dir() {
-                if !skip_dir_name(&name) && !is_cache_dir(&entry.path()) {
-                    walk(root, &entry.path(), out)?;
+                let path = entry.path();
+                let rel = path.strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase()).unwrap_or_default();
+                if !skip_dir_name(&name) && !is_cache_dir(&path) && !is_git_checkout(&path) && !skip.contains(&rel) {
+                    walk(root, &path, skip, out)?;
                 }
             } else if ft.is_file() {
                 let rel = entry
@@ -517,47 +544,119 @@ pub fn walk_plain_tree(root: &Path) -> anyhow::Result<Vec<String>> {
         }
         Ok(())
     }
+    let skip: Vec<String> = skip.iter().map(|s| s.trim_matches('/').replace('\\', "/").to_lowercase()).collect();
     let mut out = Vec::new();
-    walk(root, root, &mut out)?;
+    walk(root, root, &skip, &mut out)?;
     out.sort();
     Ok(out)
 }
 
-/// Read the indexable files of a plain tree: (relative path, content) for
-/// files with a known language and <= MAX_DOC_BYTES (binary detection
-/// happens in `extract_docs`).
-fn read_plain_tree(root: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let mut out = Vec::new();
-    for rel in walk_plain_tree(root)? {
-        if Lang::from_path(&rel) == Lang::Unknown {
-            continue;
+/// First line of a name-only entry: a plain-folder file whose contents are
+/// not indexed (a document format, or text over the size cap) but whose
+/// name is, so `list_files` and a search for words of its name find it.
+pub const NAME_ONLY_MARKER: &str = "indexio name-only entry";
+
+/// The indexed text standing in for a file whose contents are not indexed.
+fn name_only_entry(rel: &str, len: u64, why: &str) -> Vec<u8> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    // the words of the name, so `Q3_ReportDraft.pdf` matches "report draft"
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in stem.chars() {
+        if (!c.is_alphanumeric() || (c.is_uppercase() && prev_lower)) && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur).to_lowercase());
         }
-        let path = root.join(&rel);
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        if meta.len() as usize > MAX_DOC_BYTES {
-            continue;
+        if c.is_alphanumeric() {
+            cur.push(c);
         }
-        match fs::read(&path) {
-            Ok(content) => out.push((rel, content)),
-            Err(e) => warn!(path = %path.display(), error = %e, "skip: unreadable"),
-        }
+        prev_lower = c.is_lowercase();
     }
-    Ok(out)
+    if !cur.is_empty() {
+        words.push(cur.to_lowercase());
+    }
+    let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+    format!(
+        "{NAME_ONLY_MARKER}: {why}\nfile: {rel}\nfolder: {dir}\nname: {name}\nwords: {}\nsize: {len} bytes\n",
+        words.join(" ")
+    )
+    .into_bytes()
+}
+
+/// What a plain folder indexes for one file.
+enum PlainFile {
+    /// Not indexed at all (an image, an archive, an unknown type).
+    Skip,
+    /// Indexed by name only, with this entry as its text.
+    NameOnly(Vec<u8>),
+    /// Indexed by contents: read the file.
+    Read,
+}
+
+/// Text files up to their cap are indexed by contents; documents
+/// ([`Lang::is_name_only`]) and text over the cap by name.
+fn plain_file(rel: &str, len: u64) -> PlainFile {
+    let lang = Lang::from_path(rel);
+    if lang == Lang::Unknown {
+        return if Lang::is_name_only(rel) {
+            PlainFile::NameOnly(name_only_entry(rel, len, "the contents are not indexed (not a text file); open the file itself to read it"))
+        } else {
+            PlainFile::Skip
+        };
+    }
+    let cap = if lang == Lang::Text { MAX_TEXT_BYTES } else { MAX_DOC_BYTES };
+    if len as usize > cap {
+        return PlainFile::NameOnly(name_only_entry(rel, len, "the contents are not indexed (over the size cap); open the file itself to read it"));
+    }
+    PlainFile::Read
+}
+
+/// The indexed bytes of one plain-folder file: its contents or its name-only
+/// entry; `None` when it is not indexed or unreadable.
+fn plain_bytes(root: &Path, rel: &str) -> Option<Vec<u8>> {
+    let path = root.join(rel);
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    match plain_file(rel, meta.len()) {
+        PlainFile::Skip => None,
+        PlainFile::NameOnly(e) => Some(e),
+        PlainFile::Read => match fs::read(&path) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "skip: unreadable");
+                None
+            }
+        },
+    }
+}
+
+/// Read the indexable files of a plain tree: (relative path, content), the
+/// content being the file or its name-only entry (binary detection happens
+/// in `extract_docs`).
+fn read_plain_tree(root: &Path, skip: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    Ok(walk_plain_tree_skipping(root, skip)?
+        .into_iter()
+        .filter_map(|rel| plain_bytes(root, &rel).map(|c| (rel, c)))
+        .collect())
 }
 
 /// The indexable files of a plain tree as [`WtFile`]s, with a
 /// [`WorktreeCache`] so a file whose mtime and length are unchanged since
 /// the last pass is only stat'ed (SPEC-P10: the `sessions` folder and
 /// plain-folder repos were re-read and re-hashed whole on every refresh).
-fn read_plain_tree_cached(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::Result<Vec<WtFile>> {
+fn read_plain_tree_cached(root: &Path, skip: &[String], mut cache: Option<&mut WorktreeCache>) -> anyhow::Result<Vec<WtFile>> {
     let mut files = Vec::new();
-    for rel in walk_plain_tree(root)? {
-        if Lang::from_path(&rel) == Lang::Unknown {
-            continue;
-        }
+    for rel in walk_plain_tree_skipping(root, skip)? {
         let path = root.join(&rel);
         let Ok(meta) = fs::metadata(&path) else { continue };
-        if !meta.is_file() || meta.len() as usize > MAX_DOC_BYTES {
+        if !meta.is_file() {
+            continue;
+        }
+        let kind = plain_file(&rel, meta.len());
+        if matches!(kind, PlainFile::Skip) {
             continue;
         }
         let stamp = (meta.modified().ok(), meta.len());
@@ -569,7 +668,11 @@ fn read_plain_tree_cached(root: &Path, mut cache: Option<&mut WorktreeCache>) ->
                 }
             }
         }
-        match fs::read(&path) {
+        let read = match kind {
+            PlainFile::NameOnly(entry) => Ok(entry),
+            _ => fs::read(&path),
+        };
+        match read {
             Ok(content) => {
                 let blob = match normalize_crlf(&content) {
                     Some(lf) => BlobId::from_content(&lf),
@@ -597,6 +700,63 @@ pub fn index_dir(
     data_dir: &Path,
     cas: &Cas,
 ) -> anyhow::Result<IndexReport> {
+    index_dir_skipping(dir, name, data_dir, cas, Vec::new())
+}
+
+/// The folders a plain folder at `root` leaves out: its own `skip` list
+/// plus every other registered repo whose folder lies under `root` (a
+/// folder source's loose files never re-index a repo of its own).
+fn plain_skips(data_dir: &Path, root: &Path, name: &str, skip: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = skip.to_vec();
+    let norm = |p: &Path| {
+        fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/").to_lowercase())
+            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/").to_lowercase())
+    };
+    let base = norm(root);
+    if let Ok(rd) = fs::read_dir(repos_dir(data_dir)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") || p.file_stem().and_then(|s| s.to_str()) == Some(name) {
+                continue;
+            }
+            let Ok(st) = fs::read(&p).map_err(anyhow::Error::from).and_then(|b| Ok(serde_json::from_slice::<RepoState>(&b)?)) else { continue };
+            let other = norm(&st.path);
+            if let Some(rel) = other.strip_prefix(&format!("{base}/")) {
+                out.push(rel.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether a plain tree at `root` (registered, or to be registered, as
+/// `name`, leaving out `skip`, nested checkouts and other registered repos)
+/// holds at least one file it would index: the guard that keeps a folder
+/// whose every file sits in its repos from becoming an empty repo.
+pub fn plain_tree_has_files(data_dir: &Path, root: &Path, name: &str, skip: &[String]) -> bool {
+    let skip = plain_skips(data_dir, root, name, skip);
+    walk_plain_tree_skipping(root, &skip).is_ok_and(|files| {
+        files.iter().any(|rel| {
+            fs::metadata(root.join(rel)).is_ok_and(|m| m.is_file() && !matches!(plain_file(rel, m.len()), PlainFile::Skip))
+        })
+    })
+}
+
+/// Write a repo's bookkeeping (a folder source updating its excludes).
+pub fn save_repo_state(data_dir: &Path, state: &RepoState) -> anyhow::Result<()> {
+    Ok(save_state(data_dir, state)?)
+}
+
+/// [`index_dir`] that leaves out the root-relative folders in `skip`
+/// (remembered in the repo state for every later delta).
+pub fn index_dir_skipping(
+    dir: &Path,
+    name: &str,
+    data_dir: &Path,
+    cas: &Cas,
+    skip: Vec<String>,
+) -> anyhow::Result<IndexReport> {
     let t0 = Instant::now();
     if state_path(data_dir, name).exists() {
         bail!("repo '{name}' is already registered; use reindex_repo");
@@ -605,7 +765,7 @@ pub fn index_dir(
     let shards_dir = data_dir.join("shards");
     fs::create_dir_all(&shards_dir)?;
     fs::create_dir_all(repos_dir(data_dir))?;
-    let contents = read_plain_tree(dir)?;
+    let contents = read_plain_tree(dir, &plain_skips(data_dir, dir, name, &skip))?;
     let docs = extract_docs(contents, cas);
     let cas_hits = docs.iter().filter(|d| d.cas_hit).count() as u64;
     let docs_added = docs.len() as u64;
@@ -620,6 +780,7 @@ pub fn index_dir(
             indexed_at: iso_now(),
             plain: true,
             worktree: false,
+            skip,
         },
     )?;
     Ok(IndexReport {
@@ -645,7 +806,8 @@ fn reindex_dir(
     cas: &Cas,
     cache: Option<&mut WorktreeCache>,
 ) -> anyhow::Result<IndexReport> {
-    let current = read_plain_tree_cached(&state.path, cache)?;
+    let skip = plain_skips(data_dir, &state.path, &state.name, &state.skip);
+    let current = read_plain_tree_cached(&state.path, &skip, cache)?;
     let next = RepoState {
         indexed_at: iso_now(),
         ..state.clone()
@@ -740,10 +902,12 @@ fn delta_by_content(
                     continue; // unchanged on disk and still the visible doc
                 }
                 // unchanged on disk but its doc is gone (a HEAD sync from
-                // another process tombstoned it): read it after all
-                match fs::read(state.path.join(&rel)) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                // another process tombstoned it): read it after all — a
+                // plain folder's way, so a document gets its name-only entry
+                let reread = if state.plain { plain_bytes(&state.path, &rel) } else { fs::read(state.path.join(&rel)).ok() };
+                match reread {
+                    Some(c) => c,
+                    None => continue,
                 }
             }
         };
@@ -1211,6 +1375,7 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
             indexed_at: iso_now(),
             plain: false,
             worktree: false,
+            skip: Vec::new(),
         },
     )?;
     Ok(report)

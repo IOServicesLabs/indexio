@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "indexio"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aho-corasick",
  "indexio-types",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-embed"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-index"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-ingest"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-query"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "indexio-core",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-symbols"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "indexio-types",
  "serde",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "indexio-types"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bincode",
  "blake3",

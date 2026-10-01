@@ -26,6 +26,7 @@ blake3 = { workspace = true }
 zstd = { workspace = true }
 ureq = { version = "2", features = ["json"] }
 base64 = { workspace = true }
+pdf-extract = "0.12.1"
 
 [dev-dependencies]
 tempfile = "3"

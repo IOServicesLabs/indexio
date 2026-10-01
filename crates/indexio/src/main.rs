@@ -83,6 +83,10 @@ enum Commands {
         /// neither as a repo nor as loose files. Repeatable; remembered.
         #[arg(long = "exclude", value_name = "PATH")]
         exclude: Vec<String>,
+        /// Folder sources: index the text layer of PDFs among the files that
+        /// are not in a repository, instead of their name only. Remembered.
+        #[arg(long)]
+        pdf_text: bool,
     },
     /// Sync every remembered source (clone/pull, discover, delta re-index)
     /// plus any repo registered outside a source, then embed. Cron this.
@@ -514,6 +518,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             no_sync,
             no_embed,
             exclude,
+            pdf_text,
         } => {
             let mut src = sources::parse_source(&source)?;
             src.dest = dest;
@@ -521,6 +526,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             src.include_archived = include_archived;
             src.shallow = !full_clone;
             src.exclude = exclude;
+            src.pdf_text = pdf_text;
             let added = sources::add_source(&data_dir, src.clone())?;
             // the stored source: excludes accumulate across adds
             let src = sources::load_sources(&data_dir)?
@@ -580,6 +586,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 if let Some(d) = &s.dest {
                     flags.push(Box::leak(format!("dest={}", d.display()).into_boxed_str()));
+                }
+                if s.pdf_text {
+                    flags.push("pdf-text");
                 }
                 if !s.exclude.is_empty() {
                     flags.push(Box::leak(format!("exclude={}", s.exclude.join(",")).into_boxed_str()));
@@ -2095,12 +2104,12 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Add { source, include_forks, include_archived, full_clone, limit, no_sync, no_embed, dest, exclude } => {
+            Commands::Add { source, include_forks, include_archived, full_clone, limit, no_sync, no_embed, dest, exclude, pdf_text } => {
                 assert_eq!(source, "github:acme");
                 assert!(include_forks && full_clone && no_embed);
                 assert!(!include_archived && !no_sync);
                 assert_eq!(limit, Some(5));
-                assert!(dest.is_none() && exclude.is_empty());
+                assert!(dest.is_none() && exclude.is_empty() && !pdf_text);
             }
             _ => panic!("expected add"),
         }

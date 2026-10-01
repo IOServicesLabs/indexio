@@ -2334,7 +2334,7 @@ fn recall_cards(engine: &Engine, embedder: &dyn Embedder, q: &str, limit: usize)
                 n.ends_with(crate::sessions::CARD_SUFFIX).then(|| (t, format!("{}/{n}", slug.as_deref().unwrap_or(""))))
             })
             .collect();
-        cards.sort_by(|a, b| b.0.cmp(&a.0));
+        cards.sort_by_key(|c| std::cmp::Reverse(c.0));
         paths.extend(cards.into_iter().map(|(_, p)| p));
     } else {
         let fused = engine
@@ -2353,7 +2353,7 @@ fn recall_cards(engine: &Engine, embedder: &dyn Embedder, q: &str, limit: usize)
                     format!("{stem}{}", crate::sessions::CARD_SUFFIX)
                 }
             };
-            *score.entry(card).or_default() += h.rrf as f64;
+            *score.entry(card).or_default() += h.rrf;
         }
         let mut ranked: Vec<(String, f64)> = score.into_iter().filter(|(c, _)| root.join(c).is_file()).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
@@ -3490,6 +3490,7 @@ mod tests {
                 plain: true,
                 worktree: false,
                 skip: Vec::new(),
+                pdf_text: false,
             })
             .unwrap(),
         )

@@ -202,7 +202,7 @@ sources and the registered repositories. `indexio remove <source>` forgets a sou
 
 Useful flags for `add`: `--limit 20` (trial run on a large organization), `--include-forks`,
 `--include-archived`, `--full-clone`, `--dest DIR` (where remote clones go), `--no-embed`,
-`--exclude PATH`.
+`--exclude PATH`, `--pdf-text`.
 
 **Folders with repositories and other files.** A folder often holds git repositories and
 files that are not in any repository: notes, specs, exports, PDFs. `indexio add` indexes
@@ -223,6 +223,12 @@ projectA/                     indexio add ~/projectA
   limit are indexed by name only. `list_files` and a search for words of the name find them.
   `read_span` on one says that its contents are not indexed; read the file itself. The hooks
   let a Read of such a file through.
+- `--pdf-text` indexes the text layer of these PDFs instead of their name. A PDF that was
+  exported from a document (Word, Google Docs, a browser) has one, so a search finds words
+  inside it. A scanned PDF has no text layer and keeps its name-only entry: indexio does
+  no OCR. The extracted text has the text size limit. A PDF over 64 MiB, or one that
+  takes longer than 20 seconds to read, keeps its name-only entry. The option is
+  remembered with the source.
 - Images, media, archives and other binary files are not indexed.
 - `--exclude PATH` (repeatable, relative to the folder) keeps a folder out: it is not a
   repository and its files are not indexed. Excludes are remembered with the source and

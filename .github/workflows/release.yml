@@ -279,3 +279,34 @@ jobs:
         run: |
           npm version --no-git-tag-version --allow-same-version "${{ needs.release.outputs.version }}"
           npm publish --access public
+
+  # Lists the release on the official MCP Registry (registry.modelcontextprotocol.io),
+  # which feeds VS Code, GitHub's MCP directory, PulseMCP and other catalogs.
+  # Auth is GitHub OIDC, so no secret: a workflow in the IOServicesLabs org may
+  # publish io.github.IOServicesLabs/*. The registry checks ownership through
+  # `mcpName` in npm/package.json and the `mcp-name:` line in pypi/README.md,
+  # and rejects versions npm/PyPI do not have yet, hence the needs.
+  mcp-registry:
+    needs: [release, npm, pypi]
+    if: needs.release.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - name: Stamp the release version into server.json
+        run: |
+          jq --arg v "${{ needs.release.outputs.version }}" \
+            '.version = $v | .packages |= map(.version = $v)' server.json > server.tmp
+          mv server.tmp server.json
+
+      - name: Publish
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.IOServicesLabs/indexio",
+  "title": "indexio",
+  "description": "Code search, symbols and call graph for AI coding agents. Answers in milliseconds.",
+  "websiteUrl": "https://www.ioservices.io/indexio",
+  "repository": {
+    "url": "https://github.com/IOServicesLabs/indexio",
+    "source": "github"
+  },
+  "version": "0.1.7",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "indexio",
+      "version": "0.1.7",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "indexio-cli",
+      "version": "0.1.7",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

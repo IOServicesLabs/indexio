@@ -1,13 +1,14 @@
 {
   "name": "indexio",
   "version": "0.1.7",
+  "mcpName": "io.github.IOServicesLabs/indexio",
   "description": "Code search, impact analysis and MCP server for AI coding agents",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/IOServicesLabs/indexio.git"
   },
-  "homepage": "https://github.com/IOServicesLabs/indexio#readme",
+  "homepage": "https://www.ioservices.io/indexio",
   "bin": {
     "indexio": "bin/indexio.js"
   },

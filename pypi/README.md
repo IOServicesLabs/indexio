@@ -28,3 +28,5 @@ installs is `indexio`.
 
 Documentation and source: https://github.com/IOServicesLabs/indexio
 Licence: Apache-2.0
+
+<!-- mcp-name: io.github.IOServicesLabs/indexio -->

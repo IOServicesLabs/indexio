@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/IOServicesLabs/indexio"
+Homepage = "https://www.ioservices.io/indexio"
 Repository = "https://github.com/IOServicesLabs/indexio"
 Changelog = "https://github.com/IOServicesLabs/indexio/releases"
 

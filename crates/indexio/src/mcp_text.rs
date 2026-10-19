@@ -257,15 +257,17 @@ pub fn outline(repo: &str, path: &str, items: &[OutlineItem]) -> String {
     while i < items.len() {
         let it = &items[i];
         let depth = depth_of(it);
-        let _ = write!(
-            out,
-            "{}{}-{} {} {}",
-            "  ".repeat(depth),
-            it.start_line,
-            it.end_line,
-            it.kind.name(),
-            it.name
-        );
+        // 6.5% of real outline bytes: a one-line item's `N-N` and the kind
+        // of a method under its type (a nested row without a kind is a method)
+        let _ = write!(out, "{}{}", "  ".repeat(depth), it.start_line);
+        if it.end_line != it.start_line {
+            let _ = write!(out, "-{}", it.end_line);
+        }
+        if depth > 0 && it.kind.name() == "method" {
+            let _ = write!(out, " {}", it.name);
+        } else {
+            let _ = write!(out, " {} {}", it.kind.name(), it.name);
+        }
         i += 1;
         // a test module's items on its own line, `name start` each: ~29% of
         // real outline tokens were test rows, rarely what the outline is
@@ -417,6 +419,25 @@ pub fn refresh(
     out
 }
 
+/// Changed line numbers as runs: `293-312,325` instead of every number
+/// (a 20-line hunk cost 80 characters per definition).
+fn line_ranges(lines: &[u32]) -> String {
+    let mut v: Vec<u32> = lines.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i;
+        while j + 1 < v.len() && v[j + 1] == v[j] + 1 {
+            j += 1;
+        }
+        out.push(if j == i { v[i].to_string() } else { format!("{}-{}", v[i], v[j]) });
+        i = j + 1;
+    }
+    out.join(",")
+}
+
 /// Impact report (SPEC-P9): the changed definitions, the roots'
 /// definitions, then the DIRECT call sites grouped per file (at most
 /// [`MAX_SITES_PER_FILE`] each, with the enclosing caller), then the
@@ -435,7 +456,6 @@ pub fn impact(changed: Option<&[ChangedSymbol]>, r: &ImpactReport, current: Opti
             } else {
                 format!(" [{}]", c.scope)
             };
-            let lines: Vec<String> = c.lines.iter().map(|l| l.to_string()).collect();
             let _ = writeln!(
                 out,
                 "  {} {} {}{} lines {}",
@@ -443,7 +463,7 @@ pub fn impact(changed: Option<&[ChangedSymbol]>, r: &ImpactReport, current: Opti
                 c.kind.name(),
                 c.name,
                 scope,
-                lines.join(",")
+                line_ranges(&c.lines)
             );
         }
     }
@@ -746,11 +766,19 @@ mod tests {
             it("after", SymbolKind::Fn, "", 42, 44),
             it("TestTwo", SymbolKind::Class, "", 50, 60),
             it("test_x", SymbolKind::Method, "TestTwo", 51, 55),
+            it("LIMIT", SymbolKind::Const, "", 62, 62),
         ];
+        // a nested method's kind and a one-line item's end are implied
         assert_eq!(
             outline("r", "a.rs", &items),
-            "r:a.rs  8 definitions\n1-5 fn run\n10-40 mod tests: helper 12, a_works 16, b_works 22\n42-44 fn after\n50-60 class TestTwo\n  51-55 method test_x"
+            "r:a.rs  9 definitions\n1-5 fn run\n10-40 mod tests: helper 12, a_works 16, b_works 22\n42-44 fn after\n50-60 class TestTwo\n  51-55 test_x\n62 const LIMIT"
         );
+    }
+
+    #[test]
+    fn changed_lines_print_as_runs() {
+        assert_eq!(line_ranges(&[5, 3, 4, 9, 11, 12, 12]), "3-5,9,11-12");
+        assert_eq!(line_ranges(&[]), "");
     }
 
     fn hit(repo: &str, path: &str, line: u32, snip: &str) -> SearchHit {

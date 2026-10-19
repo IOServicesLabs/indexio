@@ -394,11 +394,14 @@ fn is_outline_pattern(ere: &str) -> bool {
 
 /// Bring `repo`'s working tree into the index before a redirected lookup
 /// runs (the session that issued the shell read may not be the one that
-/// auto-refreshes this repo). Lexical only, a stat pass when nothing
-/// changed; errors are ignored.
+/// auto-refreshes this repo). Lexical only; with the repo's saved worktree
+/// cache it is a stat pass when nothing changed (without one, every hook
+/// call re-read and re-hashed the whole tree). Errors are ignored.
 fn freshen(data_dir: &Path, repo: &str) {
     if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
-        let _ = indexio_ingest::reindex_worktree(repo, data_dir, &cas);
+        // the saved cache is loaded, and saved again when the pass changed it
+        let mut cache = indexio_ingest::WorktreeCache::default();
+        let _ = indexio_ingest::reindex_worktree_cached(repo, data_dir, &cas, Some(&mut cache));
     }
 }
 

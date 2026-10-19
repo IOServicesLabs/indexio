@@ -101,6 +101,22 @@ pub struct IndexReport {
 /// document larger than this is noise, not something a session looks up.
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 
+/// Cap for prose documents (Markdown, reStructuredText, AsciiDoc, Org):
+/// unlike data dumps they are written to be read, and the big ones are the
+/// ones agents keep coming back to (a 634 KB `WORK_STATE.md` drew 177
+/// built-in reads in a week while it sat over the text cap). The heading
+/// outline makes them cheap to navigate by section.
+pub const MAX_PROSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// The size cap for a [`Lang::Text`] file at `path`.
+pub fn text_cap(path: &str) -> usize {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "md" | "markdown" | "mdx" | "rst" | "adoc" | "org" => MAX_PROSE_BYTES,
+        _ => MAX_TEXT_BYTES,
+    }
+}
+
 /// Max commits walked when checking that last_commit is an ancestor of HEAD.
 const ANCESTRY_WALK_LIMIT: usize = 100_000;
 
@@ -214,7 +230,7 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
                     debug!(%path, "skip: >4MiB");
                     return None;
                 }
-                if lang == Lang::Text && content.len() > MAX_TEXT_BYTES {
+                if lang == Lang::Text && content.len() > text_cap(&path) {
                     debug!(%path, "skip: text file over the cap");
                     return None;
                 }
@@ -676,7 +692,7 @@ fn plain_file(rel: &str, len: u64, pdf_text: bool) -> PlainFile {
             PlainFile::Skip
         };
     }
-    let cap = if lang == Lang::Text { MAX_TEXT_BYTES } else { MAX_DOC_BYTES };
+    let cap = if lang == Lang::Text { text_cap(rel) } else { MAX_DOC_BYTES };
     if len as usize > cap {
         return PlainFile::NameOnly(name_only_entry(rel, len, "the contents are not indexed (over the size cap); open the file itself to read it"));
     }
@@ -753,7 +769,7 @@ fn read_plain_tree_cached(root: &Path, skip: &[String], pdf_text: bool, mut cach
                     None => BlobId::from_content(&content),
                 };
                 if let Some(c) = cache.as_deref_mut() {
-                    c.files.insert(rel.clone(), (stamp.0, stamp.1, blob));
+                    c.insert(rel.clone(), stamp, blob);
                 }
                 files.push(WtFile { rel, blob, content: Some(content) });
             }
@@ -761,7 +777,7 @@ fn read_plain_tree_cached(root: &Path, skip: &[String], pdf_text: bool, mut cach
         }
     }
     if let Some(c) = cache {
-        c.files.retain(|rel, _| files.iter().any(|f| f.rel == *rel));
+        c.retain_listed(&files);
     }
     Ok(files)
 }
@@ -916,6 +932,105 @@ impl WtFile {
 #[derive(Default)]
 pub struct WorktreeCache {
     files: HashMap<String, (Option<SystemTime>, u64, BlobId)>,
+    /// The saved cache was read in (or there was none): never again.
+    loaded: bool,
+    /// Entries changed since the last save.
+    dirty: bool,
+}
+
+/// On-disk form of a [`WorktreeCache`]: (path, mtime ns since the epoch or
+/// 0, length, blob).
+type CacheRows = Vec<(String, u64, u64, [u8; 16])>;
+
+impl WorktreeCache {
+    /// Keep only the entries of files the pass just listed (a hash set:
+    /// the pairwise scan this replaces was quadratic in the repo's files).
+    fn retain_listed(&mut self, files: &[WtFile]) {
+        let listed: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        let before = self.files.len();
+        self.files.retain(|rel, _| listed.contains(rel.as_str()));
+        self.dirty |= self.files.len() != before;
+    }
+
+    fn insert(&mut self, rel: String, stamp: (Option<SystemTime>, u64), blob: BlobId) {
+        self.files.insert(rel, (stamp.0, stamp.1, blob));
+        self.dirty = true;
+    }
+
+    fn remove(&mut self, rel: &str) -> bool {
+        let gone = self.files.remove(rel).is_some();
+        self.dirty |= gone;
+        gone
+    }
+
+    /// Read the saved cache in once, when this one is still empty (a new
+    /// process), and save it after a pass that changed it.
+    fn load_once(&mut self, data_dir: &Path, repo: &str) {
+        if !self.loaded && self.files.is_empty() {
+            *self = WorktreeCache::load(data_dir, repo);
+        }
+        self.loaded = true;
+    }
+
+    fn save_if_dirty(&mut self, data_dir: &Path, repo: &str) {
+        if self.dirty && self.save(data_dir, repo).is_ok() {
+            self.dirty = false;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// `<data_dir>/wtcache/<repo>.bin`: the cache a later process starts
+    /// from, so its first pass stats the tree instead of re-hashing it
+    /// (5.4 s on a 900-file repo, paid by every new session and every
+    /// Bash-hook freshen).
+    pub fn path_for(data_dir: &Path, repo: &str) -> PathBuf {
+        data_dir.join("wtcache").join(format!("{repo}.bin"))
+    }
+
+    /// The saved cache of `repo`, empty when there is none or it is unreadable.
+    pub fn load(data_dir: &Path, repo: &str) -> WorktreeCache {
+        let Ok(bytes) = fs::read(Self::path_for(data_dir, repo)) else {
+            return WorktreeCache::default();
+        };
+        let Ok(rows) = bincode::deserialize::<CacheRows>(&bytes) else {
+            return WorktreeCache::default();
+        };
+        let files = rows
+            .into_iter()
+            .map(|(rel, ns, len, blob)| {
+                let m = (ns > 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_nanos(ns));
+                (rel, (m, len, BlobId(blob)))
+            })
+            .collect();
+        WorktreeCache { files, loaded: true, dirty: false }
+    }
+
+    /// Write the cache (tmp + rename; several processes may save the same
+    /// repo's, and any of their versions is a valid cache).
+    pub fn save(&self, data_dir: &Path, repo: &str) -> anyhow::Result<()> {
+        let rows: CacheRows = self
+            .files
+            .iter()
+            .map(|(rel, (m, len, blob))| {
+                let ns = m
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos() as u64);
+                (rel.clone(), ns, *len, blob.0)
+            })
+            .collect();
+        let path = Self::path_for(data_dir, repo);
+        fs::create_dir_all(path.parent().expect("wtcache dir"))?;
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        fs::write(&tmp, bincode::serialize(&rows)?)?;
+        if let Err(e) = fs::rename(&tmp, &path) {
+            fs::remove_file(&tmp).ok();
+            return Err(e.into());
+        }
+        Ok(())
+    }
 }
 
 /// Delta re-index against whatever `current` files say (SPEC-P7 plain
@@ -930,6 +1045,21 @@ fn delta_by_content(
     cas: &Cas,
     current: Vec<WtFile>,
     commit: String,
+) -> anyhow::Result<IndexReport> {
+    delta_by_content_in(state, next, data_dir, cas, current, commit, None)
+}
+
+/// [`delta_by_content`] limited to `scope`: only docs at those paths are
+/// compared, re-indexed or tombstoned; `current` lists the scoped paths
+/// that exist (a scoped path missing from it is deleted).
+fn delta_by_content_in(
+    state: &RepoState,
+    next: RepoState,
+    data_dir: &Path,
+    cas: &Cas,
+    current: Vec<WtFile>,
+    commit: String,
+    scope: Option<&HashSet<String>>,
 ) -> anyhow::Result<IndexReport> {
     let t0 = Instant::now();
     let name = state.name.as_str();
@@ -956,11 +1086,16 @@ fn delta_by_content(
     let shards_dir = data_dir.join("shards");
     fs::create_dir_all(&shards_dir)?;
     let mut set = ShardSet::open_dir(&shards_dir)?;
-    let prev_docs: Vec<(usize, u32, DocMeta)> = set
-        .visible_docs()
-        .into_iter()
-        .filter(|(si, _, dm)| repo_name(&set, *si, dm.repo_id) == name)
-        .collect();
+    let prev_docs: Vec<(usize, u32, DocMeta)> = match scope {
+        // a few named files: look up just those (the full view cost ~15 ms
+        // per edit on a 12k-doc index)
+        Some(s) => set.visible_at(name, s),
+        None => set
+            .visible_docs()
+            .into_iter()
+            .filter(|(si, _, dm)| repo_name(&set, *si, dm.repo_id) == name)
+            .collect(),
+    };
     let prev_blob: HashMap<&str, BlobId> =
         prev_docs.iter().map(|(_, _, dm)| (dm.path.as_str(), dm.blob)).collect();
 
@@ -1030,7 +1165,9 @@ fn delta_by_content(
     changed_paths.extend(doomed.iter().cloned());
     changed_paths.sort();
     changed_paths.dedup();
+    let t_plan = t0.elapsed();
     let docs = extract_docs(to_index, cas);
+    let t_extract = t0.elapsed();
     let cas_hits = docs.iter().filter(|d| d.cas_hit).count() as u64;
     let docs_added = docs.len() as u64;
     let bytes_indexed = docs.iter().map(|d| d.content.len() as u64).sum();
@@ -1038,9 +1175,20 @@ fn delta_by_content(
         // a no-op pass must not leave an empty delta shard behind
         write_shard(&shards_dir, name, &docs)?;
     }
+    let t_write = t0.elapsed();
     let docs_deleted = tombstone_matching(&mut set, &prev_docs, &|p| doomed.contains(p))?;
+    let t_tomb = t0.elapsed();
     let docs_unchanged = (prev_docs.len() as u64).saturating_sub(docs_deleted);
     save_state(data_dir, &next)?;
+    debug!(
+        repo = %name,
+        plan_ms = t_plan.as_millis() as u64,
+        extract_ms = (t_extract - t_plan).as_millis() as u64,
+        write_ms = (t_write - t_extract).as_millis() as u64,
+        tomb_ms = (t_tomb - t_write).as_millis() as u64,
+        save_ms = (t0.elapsed() - t_tomb).as_millis() as u64,
+        "delta by content"
+    );
     Ok(IndexReport {
         repo: name.to_string(),
         commit,
@@ -1251,7 +1399,7 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
                     None => BlobId::from_content(&content),
                 };
                 if let Some(c) = cache.as_deref_mut() {
-                    c.files.insert(rel.clone(), (stamp.0, stamp.1, blob));
+                    c.insert(rel.clone(), stamp, blob);
                 }
                 files.push(WtFile { rel, blob, content: Some(content) });
             }
@@ -1259,7 +1407,7 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
         }
     }
     if let Some(c) = cache {
-        c.files.retain(|rel, _| files.iter().any(|f| f.rel == *rel));
+        c.retain_listed(&files);
     }
     Ok(files)
 }
@@ -1271,12 +1419,34 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
 /// `reindex_repo` reconciles by content instead of trusting the tree diff.
 /// Plain folders take their usual path.
 pub fn reindex_worktree(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<IndexReport> {
-    reindex_worktree_cached(name, data_dir, cas, None)
+    // through the repo's saved stat cache (a stat pass when nothing changed)
+    reindex_worktree_cached(name, data_dir, cas, Some(&mut WorktreeCache::default()))
 }
 
 /// [`reindex_worktree`] with a [`WorktreeCache`] carried between calls so
 /// unchanged files are only stat'ed, not read.
 pub fn reindex_worktree_cached(
+    name: &str,
+    data_dir: &Path,
+    cas: &Cas,
+    cache: Option<&mut WorktreeCache>,
+) -> anyhow::Result<IndexReport> {
+    // a fresh cache starts from the one the last process saved, and a pass
+    // that changed it saves it for the next (SPEC-P10 stat caches were
+    // per process: every new server re-hashed whole trees, 65 MB of
+    // transcripts included)
+    let mut cache = cache;
+    if let Some(c) = cache.as_deref_mut() {
+        c.load_once(data_dir, name);
+    }
+    let r = reindex_worktree_inner(name, data_dir, cas, cache.as_deref_mut());
+    if let (Ok(_), Some(c)) = (&r, cache) {
+        c.save_if_dirty(data_dir, name);
+    }
+    r
+}
+
+fn reindex_worktree_inner(
     name: &str,
     data_dir: &Path,
     cas: &Cas,
@@ -1294,6 +1464,95 @@ pub fn reindex_worktree_cached(
         ..state.clone()
     };
     delta_by_content(&state, next, data_dir, cas, current, "worktree".to_string())
+}
+
+/// [`reindex_worktree_cached`] for a known set of changed paths (the MCP
+/// server's file watch names them): only those files are stat'ed, read and
+/// compared, with no `git ls-files` and no tree walk. A path the cache does
+/// not list may be new, and only the full listing knows whether git ignores
+/// it, so such a set (or an empty cache, a plain folder, a directory path)
+/// returns `None` and the caller runs the full pass. A set that changed
+/// nothing on disk (an mtime-only touch, an identical rewrite) returns a
+/// no-op report without opening the shards at all.
+pub fn reindex_worktree_paths(
+    name: &str,
+    data_dir: &Path,
+    cas: &Cas,
+    cache: &mut WorktreeCache,
+    paths: &HashSet<String>,
+) -> anyhow::Result<Option<IndexReport>> {
+    let t0 = Instant::now();
+    if cache.files.is_empty() {
+        return Ok(None);
+    }
+    let state = load_state(data_dir, name)
+        .map_err(|e| anyhow!("repo '{name}' is not registered (run index_repo first): {e}"))?;
+    if state.plain {
+        return Ok(None);
+    }
+    let mut current: Vec<WtFile> = Vec::new();
+    let mut scope: HashSet<String> = HashSet::new();
+    for rel in paths {
+        let path = state.path.join(rel);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let Some(&(m, l, blob)) = cache.files.get(rel) else {
+                    return Ok(None); // new file: ignore rules unknown here
+                };
+                if meta.len() as usize > MAX_DOC_BYTES {
+                    // grew past the cap: the listing would drop it
+                    cache.remove(rel);
+                    scope.insert(rel.clone());
+                    continue;
+                }
+                let stamp = (meta.modified().ok(), meta.len());
+                if (m, l) == stamp {
+                    continue;
+                }
+                let content = match fs::read(&path) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None),
+                };
+                let now = match normalize_crlf(&content) {
+                    Some(lf) => BlobId::from_content(&lf),
+                    None => BlobId::from_content(&content),
+                };
+                cache.insert(rel.clone(), stamp, now);
+                if now == blob {
+                    continue; // touched, not changed
+                }
+                scope.insert(rel.clone());
+                current.push(WtFile { rel: rel.clone(), blob: now, content: Some(content) });
+            }
+            Ok(_) => return Ok(None), // a directory: leave it to the listing
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if cache.remove(rel) {
+                    scope.insert(rel.clone()); // deleted
+                }
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    if scope.is_empty() {
+        return Ok(Some(IndexReport {
+            repo: name.to_string(),
+            commit: "worktree".to_string(),
+            docs_added: 0,
+            docs_deleted: 0,
+            docs_unchanged: 0,
+            cas_hits: 0,
+            cas_misses: 0,
+            bytes_indexed: 0,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            changed_paths: Vec::new(),
+        }));
+    }
+    let next = RepoState {
+        indexed_at: iso_now(),
+        worktree: true,
+        ..state.clone()
+    };
+    delta_by_content_in(&state, next, data_dir, cas, current, "worktree".to_string(), Some(&scope)).map(Some)
 }
 
 /// Delta re-index of a registered repo: tree-diff `last_commit..HEAD`.
@@ -1826,6 +2085,49 @@ mod tests {
             err.to_string().contains("already registered"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn targeted_worktree_pass_touches_only_the_named_paths() {
+        let repo = make_repo(&[("src/main.rs", MAIN_RS), ("util.py", UTIL_PY), ("b.py", b"B_TOKEN = 1\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        index_repo(repo.path(), "r1", data.path(), &cas).unwrap();
+        let mut cache = WorktreeCache::default();
+        let set = |ps: &[&str]| ps.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        // an empty cache cannot vouch for anything
+        assert!(reindex_worktree_paths("r1", data.path(), &cas, &mut cache, &set(&["util.py"])).unwrap().is_none());
+        reindex_worktree_cached("r1", data.path(), &cas, Some(&mut cache)).unwrap();
+        // saved and loaded caches are the same cache
+        cache.save(data.path(), "r1").unwrap();
+        let mut cache = WorktreeCache::load(data.path(), "r1");
+        assert_eq!(cache.files.len(), 3);
+        let shards_before = shard_files(data.path()).len();
+
+        // an mtime-only touch is a no-op that writes nothing
+        let p = repo.path().join("util.py");
+        let f = fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(5)).unwrap();
+        drop(f);
+        let r = reindex_worktree_paths("r1", data.path(), &cas, &mut cache, &set(&["util.py"])).unwrap().unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (0, 0), "{r:?}");
+        assert_eq!(shard_files(data.path()).len(), shards_before);
+
+        // an edit re-indexes that file only; a deletion tombstones it
+        write_files(repo.path(), &[("util.py", b"TARGETED_EDIT_TOKEN = 2\n")]);
+        fs::remove_file(repo.path().join("b.py")).unwrap();
+        let r = reindex_worktree_paths("r1", data.path(), &cas, &mut cache, &set(&["util.py", "b.py"])).unwrap().unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (1, 2), "{r:?}");
+        assert!(content_contains(data.path(), "r1", b"TARGETED_EDIT_TOKEN"));
+        assert!(!content_contains(data.path(), "r1", b"B_TOKEN"));
+        assert!(content_contains(data.path(), "r1", b"fn main"), "unnamed files are untouched");
+        assert!(load_repo_state(data.path(), "r1").worktree);
+        // a new file needs the listing (it may be ignored)
+        write_files(repo.path(), &[("new.py", b"N = 1\n")]);
+        assert!(reindex_worktree_paths("r1", data.path(), &cas, &mut cache, &set(&["new.py"])).unwrap().is_none());
+        // and the full pass agrees with the targeted ones
+        let full = reindex_worktree_cached("r1", data.path(), &cas, Some(&mut cache)).unwrap();
+        assert_eq!((full.docs_added, full.docs_deleted), (1, 0), "{full:?}");
     }
 
     #[test]

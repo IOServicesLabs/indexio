@@ -274,13 +274,92 @@ pub const MAX_SEGMENTS: usize = 8;
 /// Tombstoned row fraction above which every segment is merged.
 pub const MAX_DEAD_FRACTION: f64 = 0.3;
 
-/// The open vector + BM25 segment sets, or `None` before the first embed.
-/// The two are written one after the other by every embed, so another
-/// server can be observed between its two writes: a mismatch is an error
-/// the caller retries later, never a reason to touch the plane.
+/// Age past which half of a segment pair is an orphan (its writer died
+/// between the two files) rather than a write in flight.
+pub const ORPHAN_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// The committed segments of the semantic plane: the vector and BM25 files
+/// that exist as a pair (same stem), in segment order, plus the unpaired
+/// files. A writer creates the BM25 file first and the vector file last,
+/// so the vector rename is the commit point; a half-written pair is simply
+/// not part of the plane yet, and a pair whose writer died never becomes
+/// one (it is an orphan, see [`reap_orphans`]).
+pub struct PlanePaths {
+    pub vec: Vec<PathBuf>,
+    pub bm25: Vec<PathBuf>,
+    pub orphans: Vec<PathBuf>,
+}
+
+pub fn plane_paths(data_dir: &Path, model_id: &str) -> PlanePaths {
+    let (vd, bd) = (vec_dir(data_dir), bm25_dir(data_dir));
+    let vs = crate::index::segment_paths(&vd, model_id);
+    let mut bs: HashSet<PathBuf> = crate::bm25::segment_paths(&bd, model_id).into_iter().collect();
+    let mut out = PlanePaths {
+        vec: Vec::with_capacity(vs.len()),
+        bm25: Vec::with_capacity(vs.len()),
+        orphans: Vec::new(),
+    };
+    for v in vs {
+        // the legacy base pairs with the legacy BM25 base; deltas by stem
+        let b = if v == VecIndex::file_path(&vd, model_id) {
+            crate::bm25::file_path(&bd, model_id)
+        } else {
+            crate::bm25::aligned_path(&bd, &v)
+        };
+        if bs.remove(&b) {
+            out.vec.push(v);
+            out.bm25.push(b);
+        } else {
+            out.orphans.push(v);
+        }
+    }
+    out.orphans.extend(bs);
+    out
+}
+
+/// Remove (or park, when still mapped) unpaired segment files older than
+/// `min_age`: what a writer that died between its BM25 and vector writes
+/// left behind. Their rows were never part of the plane; the docs whose
+/// old rows that writer had already tombstoned show up in
+/// [`unembedded_docs`] and the coverage repair embeds them again.
+pub fn reap_orphans(data_dir: &Path, model_id: &str, min_age: Duration) -> usize {
+    let mut n = 0;
+    for p in plane_paths(data_dir, model_id).orphans {
+        let old = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old && crate::index::remove_or_park(&p).is_ok() {
+            tracing::warn!(path = %p.display(), "removed an orphaned semantic segment (its writer died mid-write)");
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Create one segment pair: BM25 first, the vector file last (the commit).
+fn create_pair(
+    seg: &Path,
+    bseg: &Path,
+    write_vec: impl FnOnce(&Path) -> anyhow::Result<()>,
+    write_bm25: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    write_bm25(bseg)?;
+    if let Err(e) = write_vec(seg) {
+        std::fs::remove_file(bseg).ok();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The open vector + BM25 segment sets (committed pairs only), or `None`
+/// before the first embed. Rows line up by construction; a row-count
+/// mismatch inside a pair means a damaged file and is an error.
 fn open_sets(data_dir: &Path, model_id: &str) -> anyhow::Result<Option<(VecSet, Bm25Set)>> {
-    let vs = VecSet::open(&vec_dir(data_dir), model_id)?;
-    let bs = Bm25Set::open(&bm25_dir(data_dir), model_id)?;
+    let pp = plane_paths(data_dir, model_id);
+    let vs = VecSet::reopen_paths(None, &vec_dir(data_dir), model_id, &pp.vec)?;
+    let bs = Bm25Set::reopen_paths(None, &pp.bm25)?;
     match (vs, bs) {
         (Some(v), Some(b)) if v.raw_len() == b.raw_len() && v.segments().len() == b.segments().len() => {
             Ok(Some((v, b)))
@@ -417,7 +496,46 @@ pub fn embed_paths_with_sets(
     Ok(reports.remove(0))
 }
 
+/// `<vec>/<model>.embed-error`: the last failed embed's message, removed by
+/// the next one that succeeds. Embeds run on background threads whose
+/// warnings nobody reads, so `index_stats` shows this instead.
+fn embed_error_path(data_dir: &Path, model_id: &str) -> PathBuf {
+    vec_dir(data_dir).join(format!("{model_id}.embed-error"))
+}
+
+/// The last embed failure (message, age) if the plane is failing to update.
+pub fn last_embed_error(data_dir: &Path, model_id: &str) -> Option<(String, Duration)> {
+    let p = embed_error_path(data_dir, model_id);
+    let msg = std::fs::read_to_string(&p).ok()?;
+    let age = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?.elapsed().unwrap_or_default();
+    Some((msg.trim().to_string(), age))
+}
+
 fn embed_incremental_with(
+    shards: &ShardSet,
+    data_dir: &Path,
+    repos: &[String],
+    only_paths: Option<&HashSet<String>>,
+    given: Option<(&VecSet, &Bm25Set)>,
+    embedder: &dyn Embedder,
+    max_chars: usize,
+) -> anyhow::Result<Vec<EmbedReport>> {
+    let r = embed_incremental_inner(shards, data_dir, repos, only_paths, given, embedder, max_chars);
+    let marker = embed_error_path(data_dir, embedder.model_id());
+    match &r {
+        Ok(_) => {
+            if marker.exists() {
+                std::fs::remove_file(&marker).ok();
+            }
+        }
+        Err(e) => {
+            std::fs::write(&marker, format!("{e:#}")).ok();
+        }
+    }
+    r
+}
+
+fn embed_incremental_inner(
     shards: &ShardSet,
     data_dir: &Path,
     repos: &[String],
@@ -436,7 +554,10 @@ fn embed_incremental_with(
     // all means a first embed: other repos join on their own embed call.
     let owned: Option<(VecSet, Bm25Set)> = match given {
         Some(_) => None,
-        None => open_sets(data_dir, &model_id)?,
+        None => {
+            reap_orphans(data_dir, &model_id, ORPHAN_AGE);
+            open_sets(data_dir, &model_id)?
+        }
     };
     let sets: Option<(&VecSet, &Bm25Set)> = match (&owned, given) {
         (Some((v, b)), _) => Some((v, b)),
@@ -531,8 +652,12 @@ fn embed_incremental_with(
     if !new_rows.is_empty() {
         let seg = crate::index::next_delta_path(&vec_dir(data_dir), &model_id);
         let bseg = crate::bm25::aligned_path(&bm25_dir(data_dir), &seg);
-        VecIndex::create_segment(&seg, embedder.dim(), new_rows)?;
-        ChunkBm25::create_path(&bseg, &new_bm25)?;
+        create_pair(
+            &seg,
+            &bseg,
+            |p| VecIndex::create_segment(p, embedder.dim(), new_rows),
+            |p| ChunkBm25::create_path(p, &new_bm25),
+        )?;
     }
     embedder.flush()?;
     let build_ms = t_idx.elapsed().as_millis();
@@ -587,8 +712,12 @@ pub fn rebuild_all(
     let old_b = crate::bm25::segment_paths(&bm25_dir(data_dir), &model_id);
     let seg = crate::index::next_delta_path(&vec_dir(data_dir), &model_id);
     let bseg = crate::bm25::aligned_path(&bm25_dir(data_dir), &seg);
-    VecIndex::create_segment(&seg, embedder.dim(), rows)?;
-    ChunkBm25::create_path(&bseg, &bm25_rows)?;
+    create_pair(
+        &seg,
+        &bseg,
+        |p| VecIndex::create_segment(p, embedder.dim(), rows),
+        |p| ChunkBm25::create_path(p, &bm25_rows),
+    )?;
     for p in old_v.iter().chain(old_b.iter()) {
         crate::index::remove_or_park(p)?;
     }
@@ -626,6 +755,7 @@ pub fn compact_vectors(data_dir: &Path, model_id: &str) -> anyhow::Result<bool> 
 pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> anyhow::Result<bool> {
     crate::index::reap_stale(&vec_dir(data_dir));
     crate::index::reap_stale(&bm25_dir(data_dir));
+    reap_orphans(data_dir, model_id, ORPHAN_AGE);
     let Some((vset, bset)) = open_sets(data_dir, model_id)? else {
         return Ok(false);
     };
@@ -695,8 +825,12 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
     drop(bset);
     let seg = crate::index::next_delta_path(&vec_dir(data_dir), model_id);
     let bseg = crate::bm25::aligned_path(&bm25_dir(data_dir), &seg);
-    VecIndex::create_segment(&seg, dim, rows)?;
-    ChunkBm25::create_from_tf(&bseg, tf_rows)?;
+    create_pair(
+        &seg,
+        &bseg,
+        |p| VecIndex::create_segment(p, dim, rows),
+        |p| ChunkBm25::create_from_tf(p, tf_rows),
+    )?;
     // rows tombstoned in an input since we read it
     let late: std::collections::BTreeSet<u32> = {
         let mut now: Vec<std::collections::HashSet<u32>> = Vec::with_capacity(merge.len());
@@ -1025,6 +1159,54 @@ mod tests {
         let segs = idx.segments().len();
         embed_docs(&v2, tmp.path(), &after, &e, MAX_CHARS).unwrap();
         assert_eq!(VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap().segments().len(), segs);
+    }
+
+    /// A writer that died between its two segment files (seen live: a
+    /// vector delta without its BM25 twin wedged every later embed with
+    /// "out of sync; retry" for ten days) leaves an orphan that is not part
+    /// of the plane: embeds keep working, the orphan is reaped once old,
+    /// and its docs are re-embedded by the coverage repair.
+    #[test]
+    fn orphaned_half_pair_neither_blocks_embeds_nor_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shards = build_shardset(tmp.path(), &["r1", "r2"], &[(0, "src/a.rs", b"fn alpha_function() {}\n"), (1, "src/b.rs", b"fn beta_function() {}\n")]);
+        let e = HashEmbedder::new(512);
+        embed_repo(&shards, tmp.path(), "r1", &e).unwrap();
+        embed_repo(&shards, tmp.path(), "r2", &e).unwrap();
+        // kill the newest pair's BM25 half (r2's rows)
+        let pp = plane_paths(tmp.path(), "hash-v1");
+        assert_eq!((pp.vec.len(), pp.bm25.len(), pp.orphans.len()), (2, 2, 0));
+        std::fs::remove_file(&pp.bm25[1]).unwrap();
+        let pp = plane_paths(tmp.path(), "hash-v1");
+        assert_eq!((pp.vec.len(), pp.orphans.len()), (1, 1));
+        // the plane opens (committed pairs only) and an embed succeeds
+        let (v, b) = open_sets(tmp.path(), "hash-v1").unwrap().unwrap();
+        assert_eq!(v.raw_len(), b.raw_len());
+        drop((v, b));
+        embed_repo(&shards, tmp.path(), "r1", &e).unwrap();
+        assert!(last_embed_error(tmp.path(), "hash-v1").is_none());
+        // young orphans are left alone (a write may be in flight) ...
+        assert_eq!(reap_orphans(tmp.path(), "hash-v1", ORPHAN_AGE), 0);
+        // ... old ones are removed, and the repair restores r2's rows
+        assert_eq!(reap_orphans(tmp.path(), "hash-v1", Duration::ZERO), 1);
+        assert!(plane_paths(tmp.path(), "hash-v1").orphans.is_empty());
+        let missing = unembedded_docs(&shards, tmp.path(), "hash-v1").unwrap();
+        assert_eq!(missing, vec![("r2".to_string(), "src/b.rs".to_string())]);
+        embed_docs(&shards, tmp.path(), &missing, &e, MAX_CHARS).unwrap();
+        assert!(unembedded_docs(&shards, tmp.path(), "hash-v1").unwrap().is_empty());
+        let (v, b) = open_sets(tmp.path(), "hash-v1").unwrap().unwrap();
+        assert_eq!(v.raw_len(), b.raw_len());
+    }
+
+    /// A vector file is only written once its BM25 twin exists, so a reader
+    /// never sees a vector segment without BM25 rows.
+    #[test]
+    fn a_failed_vector_write_leaves_no_half_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (seg, bseg) = (tmp.path().join("vec").join("m.d1.civec"), tmp.path().join("bm25").join("m.d1.cibm25"));
+        let r = create_pair(&seg, &bseg, |_| anyhow::bail!("disk full"), |p| ChunkBm25::create_path(p, &[("h".into(), "body".into())]));
+        assert!(r.is_err());
+        assert!(!seg.exists() && !bseg.exists());
     }
 
     #[test]

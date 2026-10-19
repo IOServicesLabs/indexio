@@ -949,7 +949,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if !no_index && report.sessions_imported > 0 {
                 let cas = Cas::open(&data_dir.join("cas"))?;
-                let r = sessions::index_sessions(&data_dir, &cas, None)?;
+                // the saved stat cache: only rewritten parts are read (the
+                // PreCompact hook used to re-hash every transcript)
+                let mut cache = indexio_ingest::WorktreeCache::default();
+                let r = sessions::index_sessions(&data_dir, &cas, Some(&mut cache))?;
                 if !quiet {
                     println!("indexed: +{} -{} ={} docs", r.docs_added, r.docs_deleted, r.docs_unchanged);
                 }

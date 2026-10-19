@@ -135,7 +135,16 @@ pub struct McpServer {
     embedder_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// (count, total bytes, newest mtime) of the shard files at the last
     /// check; a change means another process wrote or merged shards.
-    shards_seen: Mutex<(usize, u64, Option<std::time::SystemTime>)>,
+    shards_seen: Mutex<ShardsStamp>,
+    /// An engine opened (and its doc views built) off the call path after
+    /// the shards dir changed, with the stamp it was opened at: a call that
+    /// sees that stamp adopts it instead of reopening (another session's
+    /// import or a hook's freshen used to cost the next call ~25 ms).
+    prepared: Arc<Mutex<Option<(ShardsStamp, Engine)>>>,
+    prepare_busy: Arc<AtomicBool>,
+    prepare_again: Arc<AtomicBool>,
+    /// Watch on `<data_dir>/shards` that triggers the preparation.
+    shards_watch: Mutex<Option<notify::RecommendedWatcher>>,
     /// Last transcript import (SPEC-P9 recall); throttled to
     /// [`SESSIONS_IMPORT_EVERY`] and run on a background thread.
     sessions_last: Mutex<Option<std::time::Instant>>,
@@ -242,6 +251,10 @@ impl McpServer {
             sessions_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             runs_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             shards_seen: Mutex::new((0, 0, None)),
+            prepared: Arc::new(Mutex::new(None)),
+            prepare_busy: Arc::new(AtomicBool::new(false)),
+            prepare_again: Arc::new(AtomicBool::new(false)),
+            shards_watch: Mutex::new(None),
             exe: std::env::current_exe().ok().and_then(|p| {
                 let m = std::fs::metadata(&p).ok()?;
                 Some((p, (m.len(), m.modified().ok())))
@@ -292,6 +305,18 @@ impl McpServer {
                 busy.store(false, Ordering::Release);
                 return;
             };
+            // one pass per SYNC_EVERY across every server on this data dir
+            // (each of 17 servers used to run its own: ~100 passes an hour)
+            let stamp = data_dir.join("sync.last");
+            let fresh = std::fs::metadata(&stamp)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < SYNC_EVERY);
+            if fresh {
+                busy.store(false, Ordering::Release);
+                return;
+            }
             let names = indexio_ingest::sources::registered_repo_names(&data_dir).unwrap_or_default();
             let others: Vec<String> = names
                 .into_iter()
@@ -374,6 +399,11 @@ impl McpServer {
                 ms = t0.elapsed().as_millis() as u64,
                 "background sync of other repos"
             );
+            // content changes every time, so the mtime always moves
+            std::fs::write(&stamp, format!("{}", std::process::id())).ok();
+            if let Ok(f) = std::fs::File::options().write(true).open(&stamp) {
+                f.set_modified(std::time::SystemTime::now()).ok();
+            }
             busy.store(false, Ordering::Release);
         });
     }
@@ -540,7 +570,6 @@ impl McpServer {
         let busy = Arc::clone(&self.embed_busy);
         let lock = Arc::clone(&self.embed_lock);
         let embedder = Arc::clone(&self.embedder);
-        let reload = Arc::clone(&self.reload_needed);
         let handle = std::thread::spawn(move || {
             loop {
                 let batch: Vec<String> = pending.lock().map(|q| q.iter().cloned().collect()).unwrap_or_default();
@@ -567,7 +596,10 @@ impl McpServer {
                                 q.remove(p);
                             }
                         }
-                        reload.store(true, Ordering::Release);
+                        // no engine reopen: the vector/BM25 sidecars are
+                        // re-validated against their segment stamps on every
+                        // use, and the shards did not change (a reopen here
+                        // cost the call after every edit another ~12 ms)
                         tracing::debug!(paths = batch.len(), ms = t0.elapsed().as_millis() as u64, "auto-refresh: semantic plane updated");
                     }
                     Err(e) => {
@@ -590,6 +622,14 @@ impl McpServer {
     pub fn finish_background_work(&self) {
         if let Some(h) = self.embedder_thread.lock().expect("embed thread lock poisoned").take() {
             let _ = h.join();
+        }
+        // the targeted refreshes since the last full pass updated stamps too
+        let data_dir = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.to_path_buf());
+        if let (Some(d), Some(repo)) = (data_dir, self.current()) {
+            let cache = self.wt_cache.lock().expect("worktree cache poisoned");
+            if !cache.is_empty() {
+                cache.save(&d, &repo).ok();
+            }
         }
         if let Some(h) = self.compactor.lock().expect("compactor lock poisoned").take() {
             let _ = h.join();
@@ -726,7 +766,10 @@ impl McpServer {
         let fresh = Engine::open(data_dir)?;
         let mut guard = self.engine.write().expect("engine lock poisoned");
         fresh.inherit_sidecars(&guard);
-        *guard = fresh;
+        let old = std::mem::replace(&mut *guard, fresh);
+        // unmap the old shards after readers are let back in (~2 ms)
+        drop(guard);
+        drop(old);
         Ok(())
     }
 
@@ -750,6 +793,18 @@ impl McpServer {
         if !self.reload_needed.swap(false, Ordering::AcqRel) && !changed {
             return;
         }
+        // an engine the shards watch already opened at exactly this state
+        if changed {
+            let ready = self.prepared.lock().expect("prepared slot poisoned").take();
+            if let Some((st, fresh)) = ready {
+                if st == stamp {
+                    let mut guard = self.engine.write().expect("engine lock poisoned");
+                    fresh.inherit_sidecars(&guard);
+                    *guard = fresh;
+                    return;
+                }
+            }
+        }
         // The read guard must be gone before the write lock is taken: an
         // `if let` scrutinee would keep it alive through the body.
         let dir: Option<std::path::PathBuf> =
@@ -758,6 +813,40 @@ impl McpServer {
             if let Err(e) = self.swap_engine(&d) {
                 tracing::warn!(error = %e, "reopen after compaction failed");
             }
+        }
+    }
+
+    /// Watch `<data_dir>/shards` (once per process): every change there
+    /// (another session's refresh or import, a hook's freshen, a sync, a
+    /// compaction) prepares a reopened, warmed engine on a background
+    /// thread for [`reload_if_needed`](Self::reload_if_needed) to adopt.
+    fn ensure_shards_watch(&self) {
+        let mut slot = self.shards_watch.lock().expect("shards watch poisoned");
+        if slot.is_some() {
+            return;
+        }
+        let Some(data_dir) = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.to_path_buf()) else {
+            return;
+        };
+        let shards = data_dir.join("shards");
+        let (prepared, busy, again) = (Arc::clone(&self.prepared), Arc::clone(&self.prepare_busy), Arc::clone(&self.prepare_again));
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let relevant = match &res {
+                Ok(ev) => ev.paths.iter().any(|p| p.extension().and_then(|e| e.to_str()) == Some("cidx")),
+                Err(_) => true,
+            };
+            if relevant {
+                prepare_engine(&data_dir, &prepared, &busy, &again);
+            }
+        });
+        match watcher {
+            Ok(mut w) => {
+                use notify::Watcher as _;
+                if w.watch(&shards, notify::RecursiveMode::NonRecursive).is_ok() {
+                    *slot = Some(w);
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "cannot watch the shards dir; reloads stay on the call path"),
         }
     }
 
@@ -846,6 +935,11 @@ impl McpServer {
                     Err(e) => tracing::warn!(error = %e, root = %root.display(), "cannot watch repo; auto-refresh off"),
                 }
             }
+            // start from the last process's stamps (no whole-tree re-hash)
+            let data_dir = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.to_path_buf());
+            if let Some(d) = data_dir {
+                *self.wt_cache.lock().expect("worktree cache poisoned") = indexio_ingest::WorktreeCache::load(&d, name);
+            }
         }
         *self.watch.lock().expect("watch poisoned") = watch;
         *self.current_repo.write().expect("current_repo poisoned") = repo;
@@ -898,14 +992,14 @@ impl McpServer {
             guard.data_dir().map(|d| d.to_path_buf())
         };
         let Some(data_dir) = data_dir else { return };
-        if !w.take_dirty() {
+        let Some(changes) = w.take_changes() else {
             // nothing new on disk, but a deferred embed may be waiting
             let pending = !self.pending_embed.lock().expect("pending embed poisoned").is_empty();
             if pending {
                 self.embed_current_paths(repo, &data_dir, &[]);
             }
             return;
-        }
+        };
         let t0 = std::time::Instant::now();
         let cas = match indexio_ingest::Cas::open(&data_dir.join("cas")) {
             Ok(c) => c,
@@ -915,11 +1009,31 @@ impl McpServer {
             }
         };
         let mut cache = self.wt_cache.lock().expect("worktree cache poisoned");
-        match indexio_ingest::reindex_worktree_cached(repo, &data_dir, &cas, Some(&mut cache)) {
+        // the watch named the changed files: stat and hash only those; a
+        // set it could not name (or a new file) takes the full listing
+        let targeted = if changes.full {
+            Ok(None)
+        } else {
+            indexio_ingest::reindex_worktree_paths(repo, &data_dir, &cas, &mut cache, &changes.paths)
+        };
+        let was_targeted = matches!(targeted, Ok(Some(_)));
+        let result = match targeted {
+            Ok(Some(r)) => Ok(r),
+            // (the full pass saves the stamps for the next process itself)
+            Ok(None) => indexio_ingest::reindex_worktree_cached(repo, &data_dir, &cas, Some(&mut cache)),
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(r) if r.docs_added > 0 || r.docs_deleted > 0 => {
-                // the lexical plane is what this call needs: reopen now
-                if let Err(e) = self.swap_engine(&data_dir) {
-                    tracing::warn!(error = %e, "auto-refresh: reopen failed");
+                // the lexical plane is what this call needs: reopen now,
+                // and count our own write as seen (stamped before the open:
+                // anything written after it still shows as a change), or
+                // the next call reopens the same state a second time
+                let reindex_ms = t0.elapsed().as_millis() as u64;
+                let stamp = shards_stamp(&data_dir.join("shards"));
+                match self.swap_engine(&data_dir) {
+                    Ok(()) => *self.shards_seen.lock().expect("shards stamp poisoned") = stamp,
+                    Err(e) => tracing::warn!(error = %e, "auto-refresh: reopen failed"),
                 }
                 // Semantic plane too (SPEC-P9 incremental embed): only the
                 // changed paths are chunked, diffed and appended — on a
@@ -930,8 +1044,10 @@ impl McpServer {
                 self.maybe_compact();
                 tracing::debug!(
                     repo,
+                    targeted = was_targeted,
                     added = r.docs_added,
                     deleted = r.docs_deleted,
+                    reindex_ms,
                     ms = t0.elapsed().as_millis() as u64,
                     "auto-refresh"
                 );
@@ -1044,6 +1160,7 @@ impl McpServer {
             return self.refresh_index(&args, format).map(|v| (v, None));
         }
         self.adopt_warm();
+        self.ensure_shards_watch();
         self.reload_if_needed();
         self.maybe_adopt_repo();
         self.auto_refresh();
@@ -1113,12 +1230,14 @@ impl McpServer {
             let res = if worktree {
                 if self.current().as_deref() == Some(n.as_str()) {
                     if let Some(w) = self.watch.lock().expect("watch poisoned").as_ref() {
-                        w.take_dirty();
+                        w.take_changes();
                     }
                     let mut cache = self.wt_cache.lock().expect("worktree cache poisoned");
                     indexio_ingest::reindex_worktree_cached(n, &data_dir, &cas, Some(&mut cache))
                 } else {
-                    indexio_ingest::reindex_worktree(n, &data_dir, &cas)
+                    // starts from (and updates) that repo's saved stamps
+                    let mut cache = indexio_ingest::WorktreeCache::default();
+                    indexio_ingest::reindex_worktree_cached(n, &data_dir, &cas, Some(&mut cache))
                 }
             } else {
                 indexio_ingest::reindex_repo(n, &data_dir, &cas)
@@ -1510,12 +1629,13 @@ fn tools_list() -> Value {
             tool(
                 "file_outline",
                 "USE THIS BEFORE READING A FILE: every definition with kind, scope and start-end \
-                 lines in a few hundred tokens; then read_span only the lines you need.",
+                 lines in a few hundred tokens (an indented row without a kind is a method); then \
+                 read_span only the lines you need.",
                 json!({
-                    "repo": string_prop("registered repo name"),
+                    "repo": string_prop("registered repo name (default: this session's repo)"),
                     "path": string_prop("repo-relative file path"),
                 }),
-                &["repo", "path"],
+                &["path"],
             ),
             tool(
                 "read_span",
@@ -1524,12 +1644,12 @@ fn tools_list() -> Value {
                  are `N<TAB>text`; N appears on the first, the last and every 5th line (other rows \
                  start with the tab), count from the nearest one.",
                 json!({
-                    "repo": string_prop("registered repo name"),
+                    "repo": string_prop("registered repo name (default: this session's repo)"),
                     "path": string_prop("repo-relative file path"),
                     "start": json!({ "type": "integer", "minimum": 1, "description": "first line (1-based; default 1)" }),
                     "end": json!({ "type": "integer", "minimum": 1, "description": "last line inclusive (default: end of the definition at start, else start+59)" }),
                 }),
-                &["repo", "path"],
+                &["path"],
             ),
         ]
     })
@@ -1605,6 +1725,76 @@ fn strip_repo_prefix<'a>(repo: &str, path: &'a str) -> &'a str {
     path.strip_prefix(repo).and_then(|rest| rest.strip_prefix(':')).unwrap_or(path)
 }
 
+/// `code_grep`'s separate `repo` / `path` arguments as filters. A path that
+/// starts with a registered repo's name (`Swarmio_cloud/src`, seen in
+/// empty greps: no path inside the repo contains its name) or is absolute
+/// under a registered repo becomes that repo plus the path inside it.
+fn path_filter(engine: &Engine, repo: Option<&str>, path: Option<&str>) -> (Option<String>, Option<String>) {
+    let (Some(p), Some(d)) = (path, engine.data_dir()) else {
+        return (repo.map(str::to_string), path.map(str::to_string));
+    };
+    // a bare repo name as the path: the whole repo
+    if repo.is_none() && p.len() > 1 && indexio_ingest::repo_state(d, p.trim_end_matches('/')).is_ok() {
+        return (Some(p.trim_end_matches('/').to_string()), None);
+    }
+    if let Some((head, rest)) = p.split_once(['/', ':']) {
+        if repo.is_none_or(|r| r == head) && head.len() > 1 && indexio_ingest::repo_state(d, head).is_ok() {
+            let rest = rest.trim_start_matches('/');
+            return (Some(head.to_string()), (!rest.is_empty()).then(|| rest.to_string()));
+        }
+    }
+    let abs = std::path::Path::new(p);
+    if abs.is_absolute() {
+        if let Some(name) = repo_containing(d, abs) {
+            if let Ok(st) = indexio_ingest::repo_state(d, &name) {
+                let root = st.path.canonicalize().unwrap_or(st.path);
+                let full = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
+                if let Ok(rel) = full.strip_prefix(&root) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    return (Some(name), (!rel.is_empty()).then_some(rel));
+                }
+            }
+        }
+    }
+    (repo.map(str::to_string), Some(p.to_string()))
+}
+
+/// The (repo, repo-relative path) a file tool targets. `repo` may be left
+/// out (16 failed calls a week did): then a `repo:path` path names it, an
+/// absolute path under a registered repo resolves to it, and otherwise the
+/// session's repo is meant.
+fn file_target(engine: &Engine, args: &Value, current: Option<&str>) -> Result<(String, String), (i64, String)> {
+    let path = req_str(args, "path")?;
+    if let Some(repo) = args.get("repo").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        return Ok((repo.to_string(), strip_repo_prefix(repo, path).to_string()));
+    }
+    let data_dir = engine.data_dir();
+    if let (Some((head, rest)), Some(d)) = (path.split_once(':'), data_dir) {
+        if head.len() > 1 && indexio_ingest::repo_state(d, head).is_ok() {
+            return Ok((head.to_string(), rest.to_string()));
+        }
+    }
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        if let Some(d) = data_dir {
+            if let Some(name) = repo_containing(d, p) {
+                if let Ok(st) = indexio_ingest::repo_state(d, &name) {
+                    let root = st.path.canonicalize().unwrap_or(st.path);
+                    let full = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                    if let Ok(rel) = full.strip_prefix(&root) {
+                        let rel = rel.to_string_lossy().replace('\\', "/");
+                        return Ok((name, rel));
+                    }
+                }
+            }
+        }
+    }
+    match current {
+        Some(cur) => Ok((cur.to_string(), path.to_string())),
+        None => Err(invalid("missing or invalid 'repo' parameter (this session is not in a registered repo)")),
+    }
+}
+
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
     // the names agents reach for from the built-in tools (SPEC-P10 §38):
     // `query` for a grep pattern, `symbol` for a symbol name, `file` for a path
@@ -1662,6 +1852,32 @@ fn stats_payload(engine: &Engine) -> Value {
         v["repos_detail"] = Value::Array(detail);
     }
     v
+}
+
+/// Files the semantic plane may lack before index_stats says so: docs that
+/// chunk to nothing (empty `__init__.py`) never get a row.
+const UNEMBEDDED_NOTE_ABOVE: usize = 100;
+
+/// index_stats lines for a semantic plane that is failing to update or is
+/// missing many files (empty when healthy). Embeds run on background
+/// threads, so this is the one place such a failure becomes visible.
+fn semantic_health(engine: &Engine, data_dir: &std::path::Path, model_id: &str) -> String {
+    let mut s = String::new();
+    if let Some((msg, age)) = indexio_embed::pipeline::last_embed_error(data_dir, model_id) {
+        s.push_str(&format!(
+            "\nsemantic plane: the last embed failed {} min ago: {msg}",
+            age.as_secs() / 60
+        ));
+    }
+    if let Ok(missing) = indexio_embed::pipeline::unembedded_docs(engine.shard_set(), data_dir, model_id) {
+        if missing.len() > UNEMBEDDED_NOTE_ABOVE {
+            s.push_str(&format!(
+                "\nsemantic plane: {} files have no vectors yet (hybrid/semantic search misses them until the background repair embeds them)",
+                missing.len()
+            ));
+        }
+    }
+    s
 }
 
 /// index_stats as text (SPEC-P9).
@@ -1910,11 +2126,14 @@ fn call_tool(
             let pattern = req_str(args, "pattern")?;
             // `repo` / `path` as separate arguments, the way Grep takes them
             // (agents send them; they used to be ignored): trailing filters
+            let arg = |k: &str| args.get(k).and_then(Value::as_str).filter(|v| !v.is_empty() && !v.contains(char::is_whitespace));
+            let (repo_arg, path_arg) = path_filter(engine, arg("repo"), arg("path"));
             let mut pattern = pattern.to_string();
-            for key in ["repo", "path"] {
-                if let Some(v) = args.get(key).and_then(Value::as_str).filter(|v| !v.is_empty() && !v.contains(char::is_whitespace)) {
-                    pattern.push_str(&format!(" {key}:{v}"));
-                }
+            if let Some(r) = &repo_arg {
+                pattern.push_str(&format!(" repo:{r}"));
+            }
+            if let Some(p) = &path_arg {
+                pattern.push_str(&format!(" path:{p}"));
             }
             let pattern = pattern.as_str();
             let limit = opt_limit(args)?;
@@ -1937,10 +2156,33 @@ fn call_tool(
                 },
             };
             let mut res = engine.search_lines(&query, fetch(limit), lines);
+            let mut note: Option<String> = note.map(str::to_string);
+            // `\\.` where `\.` was meant (an escape doubled on the way into
+            // JSON, 1 in 9 empty greps): it asks for a literal backslash, so
+            // an empty answer is retried with the escapes undoubled
+            if res.hits.is_empty() && pattern.contains("\\\\") {
+                let undoubled = pattern.replace("\\\\", "\\");
+                if let Ok(q) = grep_query(&undoubled) {
+                    let retry = engine.search_lines(&q, fetch(limit), lines);
+                    if !retry.hits.is_empty() {
+                        res = retry;
+                        note = Some("doubled backslashes read as single escapes (`\\\\.` -> `\\.`):\n".to_string());
+                    }
+                }
+            }
             *baseline = Some(grep_baseline(&res.hits, current));
             let folded = fold_other_repos(&mut res.hits, current, limit, OTHER_REPO_ROWS);
             if text {
-                let body = mcp_text::hits(&res.hits, true, res.truncated, "matches") + &folded.note();
+                let mut body = mcp_text::hits(&res.hits, true, res.truncated, "matches") + &folded.note();
+                // an empty answer under a path filter that names no indexed
+                // file is a wrong path, not proof the code is absent
+                if res.hits.is_empty() {
+                    if let Some(p) = &path_arg {
+                        if indexio_query::path_alternatives(p).split('|').all(|alt| engine.list_paths(alt, repo_arg.as_deref(), 1).0.is_empty()) {
+                            body.push_str(&format!(" (no indexed file path contains '{p}'{}; try list_files)", repo_arg.as_deref().map(|r| format!(" in {r}")).unwrap_or_default()));
+                        }
+                    }
+                }
                 return Ok(plain_result(match note {
                     Some(n) => format!("{n}{body}"),
                     None => body,
@@ -2128,6 +2370,9 @@ fn call_tool(
                 if let Some(cur) = current {
                     s.push_str(&format!("\ncurrent repo (this session's working directory): {cur}"));
                 }
+                if let Some(d) = engine.data_dir() {
+                    s.push_str(&semantic_health(engine, d, embedder.model_id()));
+                }
                 // the two summary lines only: the per-tool table is
                 // `indexio usage`, and index_stats is called at most
                 // session starts
@@ -2199,8 +2444,8 @@ fn call_tool(
             Ok(text_result(crate::impact_cli::impact_to_json(Some(&changed), &report)))
         }
         "file_outline" => {
-            let repo = req_str(args, "repo")?;
-            let path = strip_repo_prefix(repo, req_str(args, "path")?);
+            let (repo, path) = file_target(engine, args, current)?;
+            let (repo, path) = (repo.as_str(), path.as_str());
             let items = engine
                 .outline(repo, path)
                 .ok_or_else(|| not_indexed(engine, repo, path))?;
@@ -2213,8 +2458,8 @@ fn call_tool(
             Ok(text_result(crate::impact_cli::outline_to_json(repo, path, &items)))
         }
         "read_span" => {
-            let repo = req_str(args, "repo")?;
-            let path = strip_repo_prefix(repo, req_str(args, "path")?);
+            let (repo, path) = file_target(engine, args, current)?;
+            let (repo, path) = (repo.as_str(), path.as_str());
             // no start (a worker omitted it) reads from the top, not an error
             let start = opt_usize(args, "start", 1)?.max(1);
             // SPEC-P9: no `end` → the enclosing definition's end (a whole
@@ -2572,8 +2817,39 @@ fn focus_repo(
     format!("\n… {} more {what} elsewhere (pass repo: to list them): {}", rest.len(), list.join(", "))
 }
 
+/// (files, bytes, newest mtime) of a shard directory.
+type ShardsStamp = (usize, u64, Option<std::time::SystemTime>);
+
+/// Open + warm an engine at the shards dir's current state on a
+/// background thread and park it in `slot`; bursts of writes collapse into
+/// one more pass after the running one.
+fn prepare_engine(
+    data_dir: &std::path::Path,
+    slot: &Arc<Mutex<Option<(ShardsStamp, Engine)>>>,
+    busy: &Arc<AtomicBool>,
+    again: &Arc<AtomicBool>,
+) {
+    again.store(true, Ordering::Release);
+    if busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (data_dir, slot, busy, again) = (data_dir.to_path_buf(), Arc::clone(slot), Arc::clone(busy), Arc::clone(again));
+    std::thread::spawn(move || {
+        while again.swap(false, Ordering::AcqRel) {
+            // let the rest of a writer's burst (shard + tombstones) land
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let stamp = shards_stamp(&data_dir.join("shards"));
+            if let Ok(e) = Engine::open(&data_dir) {
+                e.warm();
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, e));
+            }
+        }
+        busy.store(false, Ordering::Release);
+    });
+}
+
 /// Cheap fingerprint of a shard directory: (files, bytes, newest mtime).
-fn shards_stamp(dir: &std::path::Path) -> (usize, u64, Option<std::time::SystemTime>) {
+fn shards_stamp(dir: &std::path::Path) -> ShardsStamp {
     let mut n = 0usize;
     let mut bytes = 0u64;
     let mut newest: Option<std::time::SystemTime> = None;

@@ -307,8 +307,37 @@ pub(crate) struct RootShape {
     /// Some definition takes a receiver (`&self`, `self`, `cls`, or is a
     /// method in a language where every method does): callable as `x.name()`.
     has_receiver: bool,
+    /// Language families the definitions are written in (see [`family`]).
+    families: HashSet<u8>,
+    /// Some definition sits in a file without a language family.
+    untyped: bool,
     /// No definition known — judge nothing.
     unknown: bool,
+}
+
+/// Call-graph language family: a Rust function is not called from Python
+/// (`open(path)` in a script is the builtin, not `VecSet::open`), but C and
+/// C++, or TS and JS, call each other. 0 = no grammar (judged by nothing).
+fn family(lang: Lang) -> u8 {
+    match lang {
+        Lang::Rust => 1,
+        Lang::Python => 2,
+        Lang::TsJs => 3,
+        Lang::Go => 4,
+        Lang::Java => 5,
+        Lang::Cpp => 6,
+        _ => 0,
+    }
+}
+
+impl RootShape {
+    /// Whether a call site in a `lang` file can reach one of the
+    /// definitions: same language family, or a site/definition the
+    /// families cannot judge.
+    pub(crate) fn lang_plausible(&self, lang: Lang) -> bool {
+        let f = family(lang);
+        self.unknown || self.untyped || f == 0 || self.families.is_empty() || self.families.contains(&f)
+    }
 }
 
 /// Whether a definition line declares a receiver parameter.
@@ -339,6 +368,13 @@ impl RootShape {
         }
         if takes_receiver(lang, def_line, scoped) {
             self.has_receiver = true;
+        }
+        // a definition in a file with no grammar: no family can be ruled out
+        match family(lang) {
+            0 => self.untyped = true,
+            f => {
+                self.families.insert(f);
+            }
         }
         // module-style qualifiers for free functions and for Python/JS
         // modules (`net.spawn(`, `executor::spawn(`)
@@ -603,9 +639,9 @@ impl Engine {
                         postings.truncate(budget);
                     }
                     postings.retain(|(si, docid, _, line)| {
-                        cache
-                            .get(*si, *docid)
-                            .is_some_and(|(_, _, content)| site_plausible(&content_line(content, *line), name, shape))
+                        cache.get(*si, *docid).is_some_and(|(dm, _, content)| {
+                            shape.lang_plausible(dm.lang) && site_plausible(&content_line(content, *line), name, shape)
+                        })
                     });
                 }
                 // Hub protection: over the per-symbol cap, sample the

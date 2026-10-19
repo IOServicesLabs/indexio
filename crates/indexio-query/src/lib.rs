@@ -190,6 +190,84 @@ fn regex_valid(pattern: &str) -> bool {
     verify::find_regex(b"", pattern, 1).is_some()
 }
 
+/// Most substrings a `path:` filter's groups expand to.
+const MAX_PATH_ALTERNATIVES: usize = 32;
+
+/// A `path:` filter as `|`-separated substrings. Agents write regex groups
+/// into it (`app/src/(lib/speech|components/Voice)`, `(a.rs|b.rs)`,
+/// `routes/(x|y)\.routes\.ts`: 1% of real path filters, every one an empty
+/// answer): each `(a|b)` group is expanded and `\.` unescaped.
+pub fn path_alternatives(v: &str) -> String {
+    if !v.contains('(') && !v.contains('\\') {
+        return v.to_string();
+    }
+    let unescaped = v.replace("\\.", ".").replace("\\/", "/");
+    let mut out: Vec<String> = Vec::new();
+    for top in split_top_level(&unescaped) {
+        out.extend(expand_groups(&top));
+    }
+    out.retain(|s| !s.is_empty());
+    out.dedup();
+    out.truncate(MAX_PATH_ALTERNATIVES);
+    out.join("|")
+}
+
+/// `a|(b|c)d` -> [`a`, `(b|c)d`]: split on `|` outside parentheses.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '|' if depth == 0 => {
+                parts.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        parts.last_mut().expect("non-empty").push(c);
+    }
+    parts
+}
+
+/// Every string the first `(…|…)` group (recursively, all groups) of `s`
+/// stands for; an unbalanced group is dropped as-is.
+fn expand_groups(s: &str) -> Vec<String> {
+    let Some(open) = s.find('(') else {
+        return vec![s.replace(')', "")];
+    };
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return vec![s.replace(['(', ')'], "")];
+    };
+    let (head, inner, tail) = (&s[..open], &s[open + 1..close], &s[close + 1..]);
+    let mut out = Vec::new();
+    for alt in split_top_level(inner) {
+        for rest in expand_groups(&format!("{alt}{tail}")) {
+            out.push(format!("{head}{rest}"));
+            if out.len() >= MAX_PATH_ALTERNATIVES {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 pub fn parse(input: &str) -> Result<Query, QueryError> {
     let mut q = Query::default();
     // case:yes = case-sensitive, case:no = case-insensitive (overrides smart-case).
@@ -217,7 +295,7 @@ pub fn parse(input: &str) -> Result<Query, QueryError> {
                 } else if let Some(v) = w.strip_prefix("lang:") {
                     q.filters.lang = Some(Lang::from_name(v));
                 } else if let Some(v) = w.strip_prefix("path:") {
-                    q.filters.path = Some(v.to_string());
+                    q.filters.path = Some(path_alternatives(v));
                 } else if let Some(v) = w.strip_prefix("case:") {
                     match v {
                         "yes" => case_override = Some(true),
@@ -626,7 +704,7 @@ pub struct Engine {
     /// (repo, path) -> live doc, built on first use (the shard set is
     /// immutable for the engine's lifetime; `indexio serve` reloads by building
     /// a new Engine).
-    doc_map: std::sync::OnceLock<HashMap<(String, String), DocRef>>,
+    doc_map: std::sync::OnceLock<HashMap<String, HashMap<String, DocRef>>>,
     /// Parsed outlines per content blob (SPEC-P9): `read_span` sizes its
     /// default range by the enclosing definition and `find_symbol` reports
     /// definition ends; a tree-sitter parse per lookup would cost ms. Keyed
@@ -639,11 +717,21 @@ pub struct Engine {
     /// to 50 docs per call, and agents keep returning to the same files.
     /// Keyed by blob (content-addressed, never stale); bounded, cleared
     /// wholesale when full.
-    content_cache: Mutex<HashMap<BlobId, Arc<Vec<u8>>>>,
+    content_cache: Mutex<ContentCache>,
 }
 
 /// Max decompressed docs kept by `Engine::content_cache`.
 const CONTENT_CACHE_CAP: usize = 512;
+/// Max decompressed bytes it holds: 512 docs of up to 4 MiB each could pin
+/// 2 GiB per server (a session grepping minified bundles).
+const CONTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Blob-keyed decompressed contents with a doc and a byte bound.
+#[derive(Clone, Default)]
+struct ContentCache {
+    map: HashMap<BlobId, Arc<Vec<u8>>>,
+    bytes: usize,
+}
 
 /// (file length, mtime) of a sidecar at open time.
 type FileStamp = (u64, Option<SystemTime>);
@@ -674,7 +762,7 @@ impl Engine {
             sidecars: RwLock::new(SidecarCache::default()),
             doc_map: std::sync::OnceLock::new(),
             outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(HashMap::new()),
+            content_cache: Mutex::new(ContentCache::default()),
         })
     }
 
@@ -692,7 +780,7 @@ impl Engine {
             sidecars: RwLock::new(SidecarCache::default()),
             doc_map: std::sync::OnceLock::new(),
             outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(HashMap::new()),
+            content_cache: Mutex::new(ContentCache::default()),
         })
     }
 
@@ -718,7 +806,7 @@ impl Engine {
     /// can be stale; a file that did not change keeps its parse.
     pub fn inherit_caches(&self, from: &Engine) {
         if let (Ok(theirs), Ok(mut mine)) = (from.content_cache.lock(), self.content_cache.lock()) {
-            if mine.is_empty() {
+            if mine.map.is_empty() {
                 *mine = theirs.clone();
             }
         }
@@ -737,7 +825,7 @@ impl Engine {
             sidecars: RwLock::new(SidecarCache::default()),
             doc_map: std::sync::OnceLock::new(),
             outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(HashMap::new()),
+            content_cache: Mutex::new(ContentCache::default()),
         }
     }
 
@@ -757,8 +845,9 @@ impl Engine {
         let Some(dir) = &self.data_dir else {
             return Ok(None);
         };
-        // stamp over every segment + tombstone side file (SPEC-P9)
-        let Some(stamp) = indexio_embed::index::set_stamp(&dir.join("vec"), model_id) else {
+        // stamp over every committed segment + tombstone side file (SPEC-P9)
+        let paths = indexio_embed::pipeline::plane_paths(dir, model_id).vec;
+        let Some(stamp) = indexio_embed::index::set_stamp_paths(&paths) else {
             return Ok(None);
         };
         let prev: Option<Arc<VecSet>> = {
@@ -770,7 +859,7 @@ impl Engine {
             }
         };
         // reuse the parsed segments whose files did not change
-        let Some(idx) = VecSet::reopen(prev.as_deref(), &dir.join("vec"), model_id)? else {
+        let Some(idx) = VecSet::reopen_paths(prev.as_deref(), &dir.join("vec"), model_id, &paths)? else {
             return Ok(None);
         };
         let idx = Arc::new(idx);
@@ -787,7 +876,8 @@ impl Engine {
         let Some(dir) = &self.data_dir else {
             return Ok(None);
         };
-        let Some(stamp) = indexio_embed::bm25::set_stamp(&dir.join("bm25"), model_id) else {
+        let paths = indexio_embed::pipeline::plane_paths(dir, model_id).bm25;
+        let Some(stamp) = indexio_embed::bm25::set_stamp_paths(&paths) else {
             return Ok(None);
         };
         let prev: Option<Arc<Bm25Set>> = {
@@ -798,7 +888,7 @@ impl Engine {
                 None => None,
             }
         };
-        let Some(bm) = Bm25Set::reopen(prev.as_deref(), &dir.join("bm25"), model_id)? else {
+        let Some(bm) = Bm25Set::reopen_paths(prev.as_deref(), &paths)? else {
             return Ok(None);
         };
         let bm = Arc::new(bm);
@@ -1268,17 +1358,34 @@ impl Engine {
         out
     }
 
+    /// Build the lazily computed doc views (visible set, (repo, path) map)
+    /// now, so the first lookup on a freshly opened engine does not pay for
+    /// them (an engine prepared off the call path is warmed before use).
+    pub fn warm(&self) {
+        let _ = self.set.visible_slice();
+        let _ = self.locate_doc("", "");
+    }
+
     /// Locate a live doc by (repo, path) through a lazily built map (one
     /// visible-docs scan per engine instead of one per lookup).
     fn locate_doc(&self, repo: &str, path: &str) -> Option<DocRef> {
+        // repo -> path -> doc, built from the borrowed view (no copy of the
+        // visible list, one repo String per shard repo instead of per doc)
         let map = self.doc_map.get_or_init(|| {
-            self.set
-                .visible_docs()
-                .into_iter()
-                .map(|(si, docid, dm)| ((self.repo_name(si, &dm), dm.path), (si, docid)))
-                .collect()
+            let mut m: HashMap<String, HashMap<String, DocRef>> = HashMap::new();
+            for (si, docid, dm) in self.set.visible_slice() {
+                let Some(r) = self.set.shard(*si).and_then(|s| s.meta().repos.get(dm.repo_id as usize)) else {
+                    continue;
+                };
+                let paths = match m.get_mut(r.as_str()) {
+                    Some(p) => p,
+                    None => m.entry(r.clone()).or_default(),
+                };
+                paths.insert(dm.path.clone(), (*si, *docid));
+            }
+            m
         });
-        map.get(&(repo.to_string(), path.to_string())).copied()
+        map.get(repo)?.get(path).copied()
     }
 
     /// Repos with at least one live doc in this view, sorted (a layered
@@ -1364,6 +1471,9 @@ impl Engine {
         let mut hits: Vec<SearchHit> = postings
             .par_iter()
             .filter_map(|(si, docid, _caller, line)| {
+                if !shape.lang_plausible(self.set.doc(*si, *docid)?.lang) {
+                    return None;
+                }
                 let content = self.cached_content(*si, *docid)?;
                 if !impact::site_plausible(&content_line(&content, *line), name, &shape) {
                     return None;
@@ -1379,15 +1489,18 @@ impl Engine {
     /// Decompressed content of a doc through the bounded engine cache.
     fn cached_content(&self, si: usize, docid: u32) -> Option<Arc<Vec<u8>>> {
         let blob = self.set.doc(si, docid)?.blob;
-        if let Some(c) = self.content_cache.lock().ok()?.get(&blob) {
+        if let Some(c) = self.content_cache.lock().ok()?.map.get(&blob) {
             return Some(Arc::clone(c));
         }
         let content = Arc::new(self.set.content(si, docid).ok()?);
         if let Ok(mut cache) = self.content_cache.lock() {
-            if cache.len() >= CONTENT_CACHE_CAP {
-                cache.clear();
+            if cache.map.len() >= CONTENT_CACHE_CAP || cache.bytes + content.len() > CONTENT_CACHE_BYTES {
+                cache.map.clear();
+                cache.bytes = 0;
             }
-            cache.insert(blob, Arc::clone(&content));
+            if content.len() <= CONTENT_CACHE_BYTES / 4 && cache.map.insert(blob, Arc::clone(&content)).is_none() {
+                cache.bytes += content.len();
+            }
         }
         Some(content)
     }
@@ -1932,6 +2045,22 @@ mod tests {
     use indexio_core::grams;
     use indexio_index::ShardWriter;
     use indexio_types::{BlobId, CallRec, DocMeta, ExtractedArtifact, SymbolKind, SymbolRec};
+
+    #[test]
+    fn path_filter_groups_expand_to_substrings() {
+        // the shapes seen in real empty greps
+        assert_eq!(path_alternatives("app/src/(lib/speech|components/Voice)"), "app/src/lib/speech|app/src/components/Voice");
+        assert_eq!(path_alternatives("(firmware/a.h|hub/hub.html)"), "firmware/a.h|hub/hub.html");
+        assert_eq!(
+            path_alternatives("routes/(staff-import|import)\\.routes\\.ts"),
+            "routes/staff-import.routes.ts|routes/import.routes.ts"
+        );
+        assert_eq!(path_alternatives("a/(b|c)/(d|e).rs"), "a/b/d.rs|a/b/e.rs|a/c/d.rs|a/c/e.rs");
+        // plain filters and `a|b` lists are left as they are
+        assert_eq!(path_alternatives("src/lib.rs"), "src/lib.rs");
+        assert_eq!(path_alternatives("a.py|b.py"), "a.py|b.py");
+        assert_eq!(parse("x path:app/(a|b).ts").unwrap().filters.path.as_deref(), Some("app/a.ts|app/b.ts"));
+    }
 
     struct Doc {
         path: &'static str,

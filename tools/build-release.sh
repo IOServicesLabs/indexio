@@ -19,7 +19,7 @@ export RUSTFLAGS="${RUSTFLAGS:-}$remap"
 for i in 1 2 3 4 5 6 7 8; do
   out=$(cargo build --release "$@" 2>&1)
   if echo "$out" | grep -q "Finished"; then echo "$out" | grep -E "^warning|Finished" | head -5; exit 0; fi
-  if echo "$out" | grep -qE "ACCESS_VIOLATION|STACK_BUFFER_OVERRUN|0xc0000409|0xc0000005"; then echo "attempt $i: rustc access violation, retrying"; continue; fi
+  if echo "$out" | grep -qE "ACCESS_VIOLATION|STACK_BUFFER_OVERRUN|ILLEGAL_INSTRUCTION|0xc0000409|0xc0000005|0xc000001d"; then echo "attempt $i: rustc access violation, retrying"; continue; fi
   echo "$out" | grep -E "^(error|warning)" -A8 | head -60; exit 1
 done
 echo "build failed after 8 attempts"; exit 1

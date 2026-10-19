@@ -18,6 +18,15 @@ use crate::{invalid, Shard, ShardWriter};
 /// Extension merged-but-still-mapped shards are parked under (see `merge`).
 const STALE_EXT: &str = "stale";
 
+/// A temp file untouched for an hour: its writer is gone.
+pub fn is_abandoned(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() > 3600)
+}
+
 pub struct ShardSet {
     /// Newest-first (by created_unix in the shard header); in a layered set
     /// ([`open_layers`](Self::open_layers)) newest-first within each layer,
@@ -86,6 +95,12 @@ impl ShardSet {
                     // compaction ran (Windows refuses to unlink mapped
                     // files): parked by `merge`, reaped whenever possible.
                     Some(STALE_EXT) => {
+                        let _ = fs::remove_file(&path);
+                    }
+                    // a writer that died between create and rename (seen:
+                    // seven empty `.cidx.tmp` files weeks old); a live write
+                    // finishes in seconds
+                    Some("tmp") if is_abandoned(&path) => {
                         let _ = fs::remove_file(&path);
                     }
                     _ => {}
@@ -174,6 +189,39 @@ impl ShardSet {
         self.cache().docs.clone()
     }
 
+    /// The live docs of `repo` at `paths` only (what a delta over a few
+    /// changed files compares against): the same newest-wins/tombstone
+    /// rules as [`visible_docs`](Self::visible_docs) without building the
+    /// whole view, and only the matches are decoded.
+    pub fn visible_at(&self, repo: &str, paths: &HashSet<String>) -> Vec<(usize, u32, DocMeta)> {
+        let wanted: HashSet<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        let mut out = Vec::new();
+        for (si, shard) in self.shards.iter().enumerate() {
+            let Some(rid) = shard.meta().repos.iter().position(|r| r == repo) else { continue };
+            if self.view.allow.as_ref().is_some_and(|f| !f(repo)) {
+                continue;
+            }
+            let tomb = shard.tombstones();
+            for docid in 0..shard.doc_count() as u32 {
+                if tomb.contains(docid) {
+                    continue;
+                }
+                let Some((r, path)) = shard.doc_key(docid) else { continue };
+                if r as usize != rid || !wanted.contains(path) || !seen.insert(path) {
+                    continue;
+                }
+                if self.view.hidden.contains(&(repo.to_string(), String::from_utf8_lossy(path).into_owned())) {
+                    continue;
+                }
+                if let Some(dm) = shard.doc(docid) {
+                    out.push((si, docid, dm));
+                }
+            }
+        }
+        out
+    }
+
     /// Borrowed live-doc view: newest shard first, newest-wins on
     /// (repo, path), tombstoned docs excluded.
     pub fn visible_slice(&self) -> &[(usize, u32, DocMeta)] {
@@ -188,25 +236,42 @@ impl ShardSet {
     /// Duplicate suppression: same (repo, path) — the newest shard wins;
     /// tombstoned docs are skipped.
     fn scan_visible(&self) -> Vec<(usize, u32, DocMeta)> {
-        let mut seen: HashSet<(String, String)> = self.view.hidden.clone();
+        // Dedupe on (set-wide repo id, path bytes borrowed from the maps):
+        // superseded versions are skipped without decoding or allocating,
+        // and only the docs that are returned are decoded (the old scan
+        // built two Strings per doc of every shard).
+        let mut repo_ids: HashMap<&str, u32> = HashMap::new();
+        let mut hidden: HashSet<(u32, &[u8])> = HashSet::with_capacity(self.view.hidden.len());
+        for (r, p) in &self.view.hidden {
+            let n = repo_ids.len() as u32;
+            let id = *repo_ids.entry(r.as_str()).or_insert(n);
+            hidden.insert((id, p.as_bytes()));
+        }
+        let mut seen: HashSet<(u32, &[u8])> = HashSet::new();
         let mut out = Vec::new();
         for (si, shard) in self.shards.iter().enumerate() {
-            let allowed: Vec<bool> = shard
+            // shard-local repo id -> (set-wide id, allowed)
+            let local: Vec<(u32, bool)> = shard
                 .meta()
                 .repos
                 .iter()
-                .map(|r| self.view.allow.as_ref().is_none_or(|f| f(r)))
+                .map(|r| {
+                    let n = repo_ids.len() as u32;
+                    let id = *repo_ids.entry(r.as_str()).or_insert(n);
+                    (id, self.view.allow.as_ref().is_none_or(|f| f(r)))
+                })
                 .collect();
+            let tomb = shard.tombstones();
             for docid in 0..shard.doc_count() as u32 {
-                if shard.tombstones().contains(docid) {
+                if tomb.contains(docid) {
                     continue;
                 }
-                let Some(dm) = shard.doc(docid) else { continue };
-                if !allowed.get(dm.repo_id as usize).copied().unwrap_or(false) {
+                let Some((rid, path)) = shard.doc_key(docid) else { continue };
+                let Some(&(id, allowed)) = local.get(rid as usize) else { continue };
+                if !allowed || hidden.contains(&(id, path)) || !seen.insert((id, path)) {
                     continue;
                 }
-                let repo = Self::repo_name(shard, dm.repo_id);
-                if seen.insert((repo, dm.path.clone())) {
+                if let Some(dm) = shard.doc(docid) {
                     out.push((si, docid, dm));
                 }
             }

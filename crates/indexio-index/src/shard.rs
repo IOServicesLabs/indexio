@@ -180,6 +180,18 @@ impl Shard {
         Some(String::from_utf8_lossy(&rest[..end]).into_owned())
     }
 
+    /// A doc's (shard-local repo id, path bytes) borrowed from the map: what
+    /// the visible-docs scan dedupes on, without decoding the doc.
+    pub(crate) fn doc_key(&self, docid: u32) -> Option<(u32, &[u8])> {
+        if docid as u64 >= self.doc_count {
+            return None;
+        }
+        let r = self.rec(docid)?;
+        let start = self.strings_blob.checked_add(r.path_off as usize)?;
+        let end = start.checked_add(r.path_len as usize)?;
+        Some((r.repo_id, self.mmap.get(start..end)?))
+    }
+
     pub fn doc(&self, docid: u32) -> Option<DocMeta> {
         if docid as u64 >= self.doc_count {
             return None;

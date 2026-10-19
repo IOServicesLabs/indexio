@@ -97,7 +97,7 @@ pub struct ChunkBm25 {
     tombstones: BTreeSet<u32>,
 }
 
-fn file_path(dir: &Path, ns: &str) -> PathBuf {
+pub(crate) fn file_path(dir: &Path, ns: &str) -> PathBuf {
     dir.join(format!("{ns}.cibm25"))
 }
 
@@ -635,7 +635,11 @@ pub fn aligned_path(dir: &Path, vec_seg: &Path) -> PathBuf {
 
 /// Cache stamp over every segment and side file.
 pub fn set_stamp(dir: &Path, ns: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
-    let paths = segment_paths(dir, ns);
+    set_stamp_paths(&segment_paths(dir, ns))
+}
+
+/// [`set_stamp`] over an explicit segment list.
+pub fn set_stamp_paths(paths: &[PathBuf]) -> Option<(u64, Option<std::time::SystemTime>)> {
     if paths.is_empty() {
         return None;
     }
@@ -675,14 +679,18 @@ impl Bm25Set {
     /// Open the current segment list, reusing `prev`'s parsed segments
     /// whose files are unchanged (see `VecSet::reopen`).
     pub fn reopen(prev: Option<&Bm25Set>, dir: &Path, ns: &str) -> anyhow::Result<Option<Self>> {
-        let paths = segment_paths(dir, ns);
+        Self::reopen_paths(prev, &segment_paths(dir, ns))
+    }
+
+    /// [`reopen`](Self::reopen) over an explicit segment list.
+    pub fn reopen_paths(prev: Option<&Bm25Set>, paths: &[PathBuf]) -> anyhow::Result<Option<Self>> {
         if paths.is_empty() {
             return Ok(None);
         }
         let mut segs = Vec::with_capacity(paths.len());
         let mut stamps = Vec::with_capacity(paths.len());
         let mut tombs = Vec::with_capacity(paths.len());
-        for p in &paths {
+        for p in paths {
             let stamp = file_stamp(p);
             let reused = prev.and_then(|pv| {
                 pv.segs

@@ -307,7 +307,7 @@ pub struct VecIndex {
 }
 
 impl VecIndex {
-    fn file_path(dir: &Path, model_id: &str) -> PathBuf {
+    pub(crate) fn file_path(dir: &Path, model_id: &str) -> PathBuf {
         dir.join(format!("{model_id}.civec"))
     }
 
@@ -1066,7 +1066,12 @@ pub fn next_delta_path(dir: &Path, model_id: &str) -> PathBuf {
 /// Cache stamp over every segment and tombstone side file: (total bytes,
 /// newest mtime). Changes whenever a refresh touched the plane.
 pub fn set_stamp(dir: &Path, model_id: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
-    let paths = segment_paths(dir, model_id);
+    set_stamp_paths(&segment_paths(dir, model_id))
+}
+
+/// [`set_stamp`] over an explicit segment list (the committed pairs of
+/// `pipeline::plane_paths`).
+pub fn set_stamp_paths(paths: &[PathBuf]) -> Option<(u64, Option<std::time::SystemTime>)> {
     if paths.is_empty() {
         return None;
     }
@@ -1115,7 +1120,16 @@ impl VecSet {
     /// Open the current segment list, reusing `prev`'s parsed segments
     /// whose files are byte-identical (same length and mtime).
     pub fn reopen(prev: Option<&VecSet>, dir: &Path, model_id: &str) -> anyhow::Result<Option<Self>> {
-        let paths = segment_paths(dir, model_id);
+        Self::reopen_paths(prev, dir, model_id, &segment_paths(dir, model_id))
+    }
+
+    /// [`reopen`](Self::reopen) over an explicit segment list.
+    pub fn reopen_paths(
+        prev: Option<&VecSet>,
+        dir: &Path,
+        model_id: &str,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<Option<Self>> {
         if paths.is_empty() {
             return Ok(None);
         }
@@ -1358,8 +1372,15 @@ pub fn remove_or_park(seg: &Path) -> anyhow::Result<()> {
 pub fn reap_stale(dir: &Path) {
     if let Ok(rd) = fs::read_dir(dir) {
         for p in rd.flatten().map(|e| e.path()) {
-            if p.extension().and_then(|e| e.to_str()) == Some(STALE_EXT) {
-                fs::remove_file(&p).ok();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some(STALE_EXT) => {
+                    fs::remove_file(&p).ok();
+                }
+                // `.civec.tmp` / `.cibm25.tmp` of a writer that died mid-write
+                Some("tmp") if indexio_index::is_abandoned(&p) => {
+                    fs::remove_file(&p).ok();
+                }
+                _ => {}
             }
         }
     }

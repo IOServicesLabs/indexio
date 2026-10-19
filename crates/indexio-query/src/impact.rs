@@ -549,14 +549,13 @@ impl Engine {
     fn root_shapes(
         &self,
         roots: &[String],
-        visible: &HashSet<DocRef>,
         cache: &mut DocCache<'_>,
     ) -> HashMap<String, RootShape> {
         let mut out = HashMap::new();
         for n in roots {
             let mut shape = RootShape::default();
             let mut any = false;
-            for (si, docid, _kind, line, scope) in self.set.symbol_postings_visible(n, visible) {
+            for (si, docid, _kind, line, scope) in self.set.symbol_postings(n) {
                 let Some((dm, _, content)) = cache.get(si, docid) else { continue };
                 any = true;
                 let def_line = content_line(content, line);
@@ -587,17 +586,16 @@ impl Engine {
     pub fn impact_symbols(&self, names: &[String], opts: &ImpactOptions) -> ImpactReport {
         let t0 = Instant::now();
         let roots = dedup_names(names);
-        let visible = self.set.visible_ids();
         let mut definitions = Vec::new();
         for n in &roots {
-            for (si, docid, _kind, line, _scope) in self.set.symbol_postings_visible(n, &visible) {
+            for (si, docid, _kind, line, _scope) in self.set.symbol_postings(n) {
                 if let Some(h) = self.posting_hit(si, docid, line, 10.0) {
                     definitions.push(h);
                 }
             }
         }
         sort_hits(&mut definitions);
-        let (sites, truncated) = self.walk(&roots, opts, &visible, &HashSet::new(), HashMap::new());
+        let (sites, truncated) = self.walk(&roots, opts, &HashSet::new(), HashMap::new());
         let mut report = finish_report(roots, definitions, sites, truncated);
         report.took_ms = t0.elapsed().as_millis() as u64;
         report
@@ -609,7 +607,6 @@ impl Engine {
         &self,
         roots: &[String],
         opts: &ImpactOptions,
-        visible: &HashSet<DocRef>,
         exclude: &HashSet<(String, String)>,
         given: HashMap<String, RootShape>,
     ) -> (Vec<ImpactSite>, bool) {
@@ -617,7 +614,7 @@ impl Engine {
         // shapes handed in (a diff knows exactly which definitions changed)
         // win over the every-definition-of-that-name view
         let missing: Vec<String> = roots.iter().filter(|r| !given.contains_key(*r)).cloned().collect();
-        let mut shapes = self.root_shapes(&missing, visible, &mut cache);
+        let mut shapes = self.root_shapes(&missing, &mut cache);
         shapes.extend(given);
         let mut visited: HashSet<String> = roots.iter().cloned().collect();
         let mut frontier: Vec<String> = roots.to_vec();
@@ -628,7 +625,7 @@ impl Engine {
             depth += 1;
             let mut next: Vec<String> = Vec::new();
             for name in &frontier {
-                let mut postings = self.set.call_postings_visible(name, visible);
+                let mut postings = self.set.call_postings(name);
                 // Direct sites of a root: drop the ones whose qualifier
                 // says they are someone else's `name` (`tokio::spawn`,
                 // `cmd.spawn()` for a free fn), before the hub sampling.
@@ -892,7 +889,6 @@ impl Engine {
                 .iter()
                 .map(|c| (c.name.clone(), c.kind, c.scope.clone())),
         );
-        let visible = self.set.visible_ids();
         // Only the changed definitions are roots: `search` here means the
         // three provider classes that changed, not every `search` in the
         // index, so `re.search(` and `OtherProvider().search(` are out.
@@ -904,7 +900,7 @@ impl Engine {
                 .or_default()
                 .add_definition(&c.name, &c.path, lang, &c.scope, &c.signature);
         }
-        let (sites, truncated) = self.walk(&roots, opts, &visible, &exclude, given);
+        let (sites, truncated) = self.walk(&roots, opts, &exclude, given);
         let mut importers: Vec<SearchHit> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in &changes {
@@ -934,10 +930,9 @@ impl Engine {
                 .into_iter()
                 .map(|it| (it.name, it.kind, it.scope)),
         );
-        let visible = self.set.visible_ids();
         let exclude: HashSet<(String, String)> =
             [(repo.to_string(), path.to_string())].into_iter().collect();
-        let (sites, truncated) = self.walk(&roots, opts, &visible, &exclude, HashMap::new());
+        let (sites, truncated) = self.walk(&roots, opts, &exclude, HashMap::new());
         let mut report = finish_report(roots, Vec::new(), sites, truncated);
         report.importers = self.who_imports(repo, path, 50);
         report.took_ms = t0.elapsed().as_millis() as u64;

@@ -24,7 +24,11 @@
 //! Team overlays: a request made as a user who has overlays is answered by
 //! an engine that layers them over the shared index (their changed files
 //! shadow the base, their deleted files are hidden). The user is the ACL
-//! entry's `"user"` in ACL mode, else the `X-Indexio-User` header.
+//! entry's `"user"` in ACL mode, else the `X-Indexio-User` header. A
+//! session's own repo (results first, default of read_span/file_outline) is
+//! the `X-Indexio-Repo` header on /mcp, else the repo of the caller's latest
+//! overlay. The shared engine follows `<data_dir>/shards` by itself (a
+//! watch, a 2 s poll): reloads are prepared off the request path.
 //!
 //! Bound to 127.0.0.1 unless `--bind` names another address, which the
 //! CLI only allows together with a bearer token or an ACL file.
@@ -41,7 +45,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -54,6 +58,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tower_http::compression::{CompressionLayer, CompressionLevel};
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use indexio_embed::embed::Embedder;
@@ -469,9 +475,11 @@ fn hit_allowed(acl: &Option<Extension<AclAllow>>, repo: &str) -> bool {
 
 #[derive(Clone)]
 struct AppState {
-    /// Engine holds mmap'd shards; /admin/reload replaces the contents of
-    /// this lock with a freshly opened Engine.
-    engine: Arc<RwLock<Engine>>,
+    /// Engine holds mmap'd shards; a reload (the shards watch, or
+    /// /admin/reload) swaps in a freshly opened, warmed Engine. Requests
+    /// clone the Arc and let go of the lock at once, so a swap never waits
+    /// for in-flight calls and they never wait for it.
+    engine: Arc<RwLock<Arc<Engine>>>,
     /// Embedder for semantic/hybrid search and /admin/embed, held behind
     /// the same RwLock pattern as the engine so it can be swapped later.
     embedder: Arc<RwLock<Arc<dyn Embedder>>>,
@@ -487,18 +495,51 @@ struct AppState {
     team: Arc<TeamEngines>,
 }
 
+impl AppState {
+    /// The shared engine as of now.
+    fn base(&self) -> Arc<Engine> {
+        Arc::clone(&self.engine.read().expect("engine lock poisoned"))
+    }
+
+    /// Install `fresh` as the shared engine (it takes over the old one's
+    /// parsed sidecars and caches); every cached per-user view is rebuilt
+    /// over it on next use.
+    fn swap_base(&self, fresh: Engine) {
+        fresh.inherit_sidecars(&self.base());
+        let old = std::mem::replace(&mut *self.engine.write().expect("engine lock poisoned"), Arc::new(fresh));
+        self.team.base_gen.fetch_add(1, Ordering::AcqRel);
+        self.team.map.lock().expect("team map poisoned").clear();
+        // unmapped when the last in-flight request holding it finishes
+        drop(old);
+    }
+}
+
+/// Run blocking engine work on the blocking pool: queries are CPU-bound
+/// (and fan out over rayon), and running them on the async workers stalled
+/// every other request, `/health` included, behind the slowest one.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, (StatusCode, Json<Value>)> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| internal_error(format!("request task failed: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // Team overlays: per-user engines
 // ---------------------------------------------------------------------------
 
-/// Most per-user engines kept open (each maps the base shards once more).
-const TEAM_ENGINE_CAP: usize = 64;
+/// Most per-user views kept open. A view holds only its overlay shards and
+/// what they change (the base is shared), so this is about open files.
+const TEAM_ENGINE_CAP: usize = 256;
 
 #[derive(Default)]
 struct TeamEngines {
     /// Bumped by /admin/reload: every cached view is rebuilt on next use.
     base_gen: AtomicU64,
     map: Mutex<HashMap<String, TeamEntry>>,
+    /// One build at a time per view: a request arriving while the view is
+    /// being opened (the upload's prebuild, a parallel tool call) waits for
+    /// it instead of opening it again.
+    building: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Origin URL -> repo name, with the time it was read.
     remotes: Mutex<Option<(Instant, HashMap<String, String>)>>,
 }
@@ -508,59 +549,57 @@ struct TeamEntry {
     base_gen: u64,
     used: Instant,
     engine: Arc<Engine>,
-}
-
-/// The engine a request reads: the shared one, or the caller's layered view.
-enum View<'a> {
-    Base(RwLockReadGuard<'a, Engine>),
-    Layered(Arc<Engine>),
-}
-
-impl std::ops::Deref for View<'_> {
-    type Target = Engine;
-    fn deref(&self) -> &Engine {
-        match self {
-            View::Base(g) => g,
-            View::Layered(e) => e,
-        }
-    }
+    /// Repo of the user's most recently updated overlay.
+    latest: Option<String>,
 }
 
 /// The engine for `user` with `allow` enforced at the doc level (`None` =
 /// every repo; the REST routes filter hits instead, MCP output is rendered
 /// text and cannot be filtered after the fact). The shared engine when
 /// neither applies.
-fn view<'a>(state: &'a AppState, user: Option<&str>, allow: Option<&[String]>) -> Result<View<'a>, (StatusCode, Json<Value>)> {
+fn view(state: &AppState, user: Option<&str>, allow: Option<&[String]>) -> Result<Arc<Engine>, (StatusCode, Json<Value>)> {
+    view_latest(state, user, allow).map(|(e, _)| e)
+}
+
+/// [`view`] and the repo of the user's most recently updated overlay.
+fn view_latest(state: &AppState, user: Option<&str>, allow: Option<&[String]>) -> Result<(Arc<Engine>, Option<String>), (StatusCode, Json<Value>)> {
     let allow = allow.filter(|a| !a.iter().any(|p| p == "*"));
     let stamp = user.map_or(0, |u| indexio_ingest::team::user_stamp(&state.data_dir, u));
     if stamp == 0 && allow.is_none() {
-        return Ok(View::Base(state.engine.read().expect("engine lock poisoned")));
+        return Ok((state.base(), None));
     }
     let key = format!("{}\0{}", user.unwrap_or(""), allow.map(|a| a.join(",")).unwrap_or_default());
     let gen = state.team.base_gen.load(Ordering::Acquire);
-    {
+    let cached = || {
         let mut map = state.team.map.lock().expect("team map poisoned");
-        if let Some(e) = map.get_mut(&key) {
-            if e.stamp == stamp && e.base_gen == gen {
-                e.used = Instant::now();
-                return Ok(View::Layered(Arc::clone(&e.engine)));
-            }
-        }
+        let e = map.get_mut(&key).filter(|e| e.stamp == stamp && e.base_gen == gen)?;
+        e.used = Instant::now();
+        Some((Arc::clone(&e.engine), e.latest.clone()))
+    };
+    if let Some(hit) = cached() {
+        return Ok(hit);
     }
-    let (upper, hidden) = match user.filter(|_| stamp != 0) {
+    let gate = Arc::clone(state.team.building.lock().expect("build gates poisoned").entry(key.clone()).or_default());
+    let _building = gate.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cached() {
+        return Ok(hit);
+    }
+    let (upper, hidden, latest) = match user.filter(|_| stamp != 0) {
         Some(u) => {
             let layer = indexio_ingest::team::user_layer(&state.data_dir, u);
-            (layer.shards_dir.into_iter().collect::<Vec<_>>(), layer.hidden)
+            (layer.shards_dir.into_iter().collect::<Vec<_>>(), layer.hidden, layer.latest)
         }
-        None => (Vec::new(), Default::default()),
+        None => (Vec::new(), Default::default(), None),
     };
     let allow_fn: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>> = allow.map(|a| {
         let a = a.to_vec();
         Arc::new(move |r: &str| repo_allowed(&a, r)) as Arc<dyn Fn(&str) -> bool + Send + Sync>
     });
-    let engine = Engine::open_layered(&state.data_dir, &upper, indexio_index::Visibility { hidden, allow: allow_fn })
+    // layered over the shared engine itself: only the overlay shards are
+    // opened, the base's mappings, live view and caches are shared
+    let engine = Engine::open_over(&state.base(), &upper, indexio_index::Visibility { hidden, allow: allow_fn })
         .map_err(|e| internal_error(format!("opening overlay view failed: {e}")))?;
-    engine.inherit_sidecars(&state.engine.read().expect("engine lock poisoned"));
+    engine.warm();
     let engine = Arc::new(engine);
     let mut map = state.team.map.lock().expect("team map poisoned");
     if map.len() >= TEAM_ENGINE_CAP && !map.contains_key(&key) {
@@ -568,8 +607,8 @@ fn view<'a>(state: &'a AppState, user: Option<&str>, allow: Option<&[String]>) -
             map.remove(&oldest);
         }
     }
-    map.insert(key, TeamEntry { stamp, base_gen: gen, used: Instant::now(), engine: Arc::clone(&engine) });
-    Ok(View::Layered(engine))
+    map.insert(key, TeamEntry { stamp, base_gen: gen, used: Instant::now(), engine: Arc::clone(&engine), latest: latest.clone() });
+    Ok((engine, latest))
 }
 
 fn user_of(u: &Option<Extension<TeamUser>>) -> Option<&str> {
@@ -620,14 +659,25 @@ async fn team_worktree(
         return Err(forbidden_err());
     }
     let dd = Arc::clone(&state.data_dir);
+    let who = user.clone();
     let res = tokio::task::spawn_blocking(move || {
         let cas = indexio_ingest::Cas::open(&dd.join("cas"))?;
-        indexio_ingest::team::apply_worktree_patch(&dd, &cas, &repo, &user, &base, &body)
+        indexio_ingest::team::apply_worktree_patch(&dd, &cas, &repo, &who, &base, &body)
     })
     .await
     .map_err(|e| internal_error(format!("overlay task failed: {e}")))?;
     match res {
-        Ok(r) => Ok(Json(serde_json::to_value(r).expect("OverlayReport is Serialize"))),
+        Ok(r) => {
+            // the hook posts right before the user's tool call: open their
+            // new view now, off this response, so that call finds it ready
+            if !r.unchanged {
+                tokio::task::spawn_blocking(move || {
+                    let allow = acl.as_ref().map(|Extension(a)| a.0.as_slice());
+                    let _ = view(&state, Some(&user), allow);
+                });
+            }
+            Ok(Json(serde_json::to_value(r).expect("OverlayReport is Serialize")))
+        }
         Err(e) => {
             use indexio_ingest::team::OverlayError as E;
             let code = match e.downcast_ref::<E>() {
@@ -661,6 +711,7 @@ async fn mcp_post(
     State(state): State<AppState>,
     user: Option<Extension<TeamUser>>,
     acl: Option<Extension<AclAllow>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let msg: Value = match serde_json::from_slice(&body) {
@@ -673,23 +724,37 @@ async fn mcp_post(
                 .into_response()
         }
     };
-    let allow = acl.as_ref().map(|Extension(a)| a.0.as_slice());
-    let engine = match view(&state, user_of(&user), allow) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-    let embedder = state.embedder.read().expect("embedder lock poisoned").clone();
-    let one = |m: &Value| crate::mcp::handle_remote(&engine, embedder.as_ref(), state.reranker.as_ref(), m);
-    let reply = match &msg {
-        Value::Array(batch) => {
-            let out: Vec<Value> = batch.iter().filter_map(one).collect();
-            (!out.is_empty()).then_some(Value::Array(out))
+    let reply = blocking(move || {
+        let allow = acl.as_ref().map(|Extension(a)| a.0.as_slice());
+        let (engine, latest) = view_latest(&state, user_of(&user), allow)?;
+        // the repo this session works in: the client's X-Indexio-Repo
+        // header (a name or origin URL, as the team hook sends it), else
+        // where the caller last synced edits
+        let current = match header(&headers, "x-indexio-repo") {
+            Some(h) => resolve_team_repo(&state, h),
+            None => latest,
         }
-        m => one(m),
-    };
+        .filter(|r| hit_allowed(&acl, r));
+        let base = state.base();
+        let (dd, who) = (Arc::clone(&state.data_dir), user_of(&user).map(str::to_string));
+        let patch = move |repo: &str| who.as_deref().and_then(|u| indexio_ingest::team::user_patch(&dd, u, repo));
+        let ctx = crate::mcp::RemoteCtx { current: current.as_deref(), base: &base, patch: &patch };
+        let embedder = state.embedder.read().expect("embedder lock poisoned").clone();
+        let one = |m: &Value| crate::mcp::handle_remote(&engine, embedder.as_ref(), state.reranker.as_ref(), m, &ctx);
+        Ok(match &msg {
+            Value::Array(batch) => {
+                let out: Vec<Value> = batch.iter().filter_map(one).collect();
+                (!out.is_empty()).then_some(Value::Array(out))
+            }
+            m => one(m),
+        })
+    })
+    .await
+    .and_then(|r| r);
     match reply {
-        Some(v) => Json(v).into_response(),
-        None => StatusCode::ACCEPTED.into_response(),
+        Ok(Some(v)) => Json(v).into_response(),
+        Ok(None) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -810,20 +875,34 @@ async fn search(
     if fusion != FusionAlgo::Rrf && mode != SearchMode::Hybrid {
         return Err(bad_request("fusion requires mode=hybrid"));
     }
-    let engine = view(&state, user_of(&user), None)?;
+    blocking(move || search_in(&state, &acl, &user, &q, limit, mode, rerank, fusion)).await?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_in(
+    state: &AppState,
+    acl: &Option<Extension<AclAllow>>,
+    user: &Option<Extension<TeamUser>>,
+    q: &str,
+    limit: usize,
+    mode: SearchMode,
+    rerank: bool,
+    fusion: FusionAlgo,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let engine = view(state, user_of(user), None)?;
     match mode {
         SearchMode::Lexical => {
-            let query = indexio_query::parse(&q).map_err(|e| bad_request(e.to_string()))?;
+            let query = indexio_query::parse(q).map_err(|e| bad_request(e.to_string()))?;
             let mut res = engine.search(&query, limit);
-            res.hits.retain(|h| hit_allowed(&acl, &h.repo));
+            res.hits.retain(|h| hit_allowed(acl, &h.repo));
             Ok(Json(search_result_to_json(&res)))
         }
         SearchMode::Semantic => {
             let embedder = state.embedder.read().expect("embedder lock poisoned").clone();
             let mut hits = engine
-                .search_semantic(&q, limit, embedder.as_ref())
+                .search_semantic(q, limit, embedder.as_ref())
                 .map_err(|e| internal_error(format!("semantic search failed: {e}")))?;
-            hits.retain(|h| hit_allowed(&acl, &h.repo));
+            hits.retain(|h| hit_allowed(acl, &h.repo));
             Ok(Json(
                 json!({ "hits": hits.iter().map(hit_to_json).collect::<Vec<_>>() }),
             ))
@@ -833,7 +912,7 @@ async fn search(
             let mut fused = if rerank {
                 engine
                     .search_hybrid_fused_reranked(
-                        &q,
+                        q,
                         limit,
                         embedder.as_ref(),
                         state.reranker.as_ref(),
@@ -842,10 +921,10 @@ async fn search(
                     .map_err(|e| internal_error(format!("hybrid rerank failed: {e}")))?
             } else {
                 engine
-                    .search_hybrid_fused(&q, limit, embedder.as_ref(), fusion)
+                    .search_hybrid_fused(q, limit, embedder.as_ref(), fusion)
                     .map_err(|e| internal_error(format!("hybrid search failed: {e}")))?
             };
-            fused.retain(|h| hit_allowed(&acl, &h.hit.repo));
+            fused.retain(|h| hit_allowed(acl, &h.hit.repo));
             Ok(Json(
                 json!({ "hits": fused.iter().map(hybrid_hit_to_json).collect::<Vec<_>>() }),
             ))
@@ -859,11 +938,16 @@ async fn symbol(
     user: Option<Extension<TeamUser>>,
     Path(name): Path<String>,
 ) -> Json<Value> {
-    let Ok(engine) = view(&state, user_of(&user), None) else {
-        return Json(Value::Array(Vec::new()));
-    };
-    let mut hits = engine.find_symbol(&name, DEFAULT_LIMIT);
-    hits.retain(|h| hit_allowed(&acl, &h.repo));
+    let hits = blocking(move || {
+        let Ok(engine) = view(&state, user_of(&user), None) else {
+            return Vec::new();
+        };
+        let mut hits = engine.find_symbol(&name, DEFAULT_LIMIT);
+        hits.retain(|h| hit_allowed(&acl, &h.repo));
+        hits
+    })
+    .await
+    .unwrap_or_default();
     Json(Value::Array(hits.iter().map(hit_to_json).collect()))
 }
 
@@ -873,25 +957,28 @@ async fn calls(
     user: Option<Extension<TeamUser>>,
     Path(name): Path<String>,
 ) -> Json<Value> {
-    let Ok(engine) = view(&state, user_of(&user), None) else {
-        return Json(Value::Array(Vec::new()));
-    };
-    let mut hits = engine.who_calls(&name, DEFAULT_LIMIT);
-    hits.retain(|h| hit_allowed(&acl, &h.repo));
+    let hits = blocking(move || {
+        let Ok(engine) = view(&state, user_of(&user), None) else {
+            return Vec::new();
+        };
+        let mut hits = engine.who_calls(&name, DEFAULT_LIMIT);
+        hits.retain(|h| hit_allowed(&acl, &h.repo));
+        hits
+    })
+    .await
+    .unwrap_or_default();
     Json(Value::Array(hits.iter().map(hit_to_json).collect()))
 }
 
 async fn reload(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let fresh = Engine::open(&state.data_dir)
-        .map_err(|e| internal_error(format!("reopen failed: {e}")))?;
-    let mut guard = state.engine.write().expect("engine lock poisoned");
-    *guard = fresh;
-    drop(guard);
-    state.team.base_gen.fetch_add(1, Ordering::AcqRel);
-    state.team.map.lock().expect("team map poisoned").clear();
-    Ok(Json(json!({ "ok": true })))
+    blocking(move || {
+        let fresh = prepare_base(&state).map_err(|e| internal_error(format!("reopen failed: {e}")))?;
+        state.swap_base(fresh);
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await?
 }
 
 /// Run embed_all over the current shard set (admin; may be slow on large
@@ -900,11 +987,11 @@ async fn admin_embed(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let embedder = state.embedder.read().expect("embedder lock poisoned").clone();
-    let reports = {
-        let engine = state.engine.read().expect("engine lock poisoned");
-        embed_all(engine.shard_set(), &state.data_dir, embedder.as_ref())
-            .map_err(|e| internal_error(format!("embed failed: {e}")))?
-    };
+    let engine = state.base();
+    let dd = Arc::clone(&state.data_dir);
+    let reports = blocking(move || embed_all(engine.shard_set(), &dd, embedder.as_ref()))
+        .await?
+        .map_err(|e| internal_error(format!("embed failed: {e}")))?;
     Ok(Json(
         json!({ "reports": reports.iter().map(embed_report_to_json).collect::<Vec<_>>() }),
     ))
@@ -984,10 +1071,13 @@ async fn impact_symbol(
         return Err(bad_request("missing query parameter 'name'"));
     }
     let opts = impact_options(params.depth, params.max_sites);
-    let engine = view(&state, user_of(&user), None)?;
-    let mut report = engine.impact_symbols(&names, &opts);
-    filter_report(&acl, &mut report);
-    Ok(Json(crate::impact_cli::impact_to_json(None, &report)))
+    blocking(move || {
+        let engine = view(&state, user_of(&user), None)?;
+        let mut report = engine.impact_symbols(&names, &opts);
+        filter_report(&acl, &mut report);
+        Ok(Json(crate::impact_cli::impact_to_json(None, &report)))
+    })
+    .await?
 }
 
 /// POST /impact/diff: the client supplies the patch text. The post-change
@@ -1005,12 +1095,15 @@ async fn impact_diff(
         return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))));
     }
     let opts = impact_options(body.depth, body.max_sites);
-    let repo_path = crate::impact_cli::resolve_repo_path(&state.data_dir, &body.repo).ok();
-    let provider = crate::impact_cli::working_tree_provider(repo_path);
-    let engine = state.engine.read().expect("engine lock poisoned");
-    let (changed, mut report) = engine.impact_diff(&body.repo, &body.diff, &provider, &opts);
-    filter_report(&acl, &mut report);
-    Ok(Json(crate::impact_cli::impact_to_json(Some(&changed), &report)))
+    blocking(move || {
+        let repo_path = crate::impact_cli::resolve_repo_path(&state.data_dir, &body.repo).ok();
+        let provider = crate::impact_cli::working_tree_provider(repo_path);
+        let engine = state.base();
+        let (changed, mut report) = engine.impact_diff(&body.repo, &body.diff, &provider, &opts);
+        filter_report(&acl, &mut report);
+        Ok(Json(crate::impact_cli::impact_to_json(Some(&changed), &report)))
+    })
+    .await?
 }
 
 fn file_params(p: &FileParams) -> Result<(&str, &str), (StatusCode, Json<Value>)> {
@@ -1030,11 +1123,15 @@ async fn outline(
     if !hit_allowed(&acl, repo) {
         return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))));
     }
-    let engine = view(&state, user_of(&user), None)?;
-    let items = engine
-        .outline(repo, path)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "not indexed" }))))?;
-    Ok(Json(crate::impact_cli::outline_to_json(repo, path, &items)))
+    let (repo, path) = (repo.to_string(), path.to_string());
+    blocking(move || {
+        let engine = view(&state, user_of(&user), None)?;
+        let items = engine
+            .outline(&repo, &path)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "not indexed" }))))?;
+        Ok(Json(crate::impact_cli::outline_to_json(&repo, &path, &items)))
+    })
+    .await?
 }
 
 async fn span(
@@ -1049,13 +1146,17 @@ async fn span(
     }
     let start = params.start.unwrap_or(1).max(1);
     let end = params.end.unwrap_or(start + 59);
-    let engine = view(&state, user_of(&user), None)?;
-    let (text, last) = engine
-        .read_span(repo, path, start, end)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "not indexed" }))))?;
-    Ok(Json(json!({
-        "repo": repo, "path": path, "start": start, "end": last, "text": text,
-    })))
+    let (repo, path) = (repo.to_string(), path.to_string());
+    blocking(move || {
+        let engine = view(&state, user_of(&user), None)?;
+        let (text, last) = engine
+            .read_span(&repo, &path, start, end)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "not indexed" }))))?;
+        Ok(Json(json!({
+            "repo": repo, "path": path, "start": start, "end": last, "text": text,
+        })))
+    })
+    .await?
 }
 
 /// Build the route table + auth middleware around a prepared AppState.
@@ -1084,8 +1185,90 @@ fn build_router(state: AppState) -> Router {
             auth_middleware,
         ))
         .layer(TraceLayer::new_for_http())
+        // tool output is text: gzip it for clients that accept it (the
+        // fastest level already shrinks it several-fold), and take gzipped
+        // uploads (worktree patches) from clients that send them
+        .layer(CompressionLayer::new().quality(CompressionLevel::Fastest))
+        .layer(RequestDecompressionLayer::new())
         .with_state(state)
 }
+
+/// Open the shared engine at the data dir's current state with its lazy
+/// views built and the semantic sidecars parsed (the parsed segments of the
+/// engine it replaces are reused), so the swap costs requests nothing.
+fn prepare_base(state: &AppState) -> anyhow::Result<Engine> {
+    let fresh = Engine::open(&state.data_dir)?;
+    fresh.inherit_sidecars(&state.base());
+    fresh.warm();
+    prewarm_sidecars(state, &fresh);
+    Ok(fresh)
+}
+
+/// Parse (or revalidate) the vector and BM25 sidecars of the active model.
+fn prewarm_sidecars(state: &AppState, engine: &Engine) {
+    let model = state.embedder.read().expect("embedder lock poisoned").model_id().to_string();
+    let _ = engine.vec_index(&model);
+    let _ = engine.bm25_index(&model);
+}
+
+/// How often the shard stamp and the semantic plane are re-checked when no
+/// file event arrives (filesystems without change notification).
+const BASE_POLL: Duration = Duration::from_secs(2);
+
+/// Keep the shared engine current without anyone calling /admin/reload: a
+/// sync, reindex or compaction writing `<data_dir>/shards` gets a reopened,
+/// warmed engine swapped in off the request path, and an embed's new
+/// semantic segments are parsed before the next hybrid query needs them.
+/// Warms the engine it starts with first.
+fn spawn_base_watch(state: AppState) {
+    std::thread::spawn(move || {
+        let base = state.base();
+        base.warm();
+        prewarm_sidecars(&state, &base);
+        drop(base);
+        let shards = state.data_dir.join("shards");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let _watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let relevant = match &res {
+                Ok(ev) => ev.paths.iter().any(|p| p.extension().and_then(|e| e.to_str()) == Some("cidx")),
+                Err(_) => true,
+            };
+            if relevant {
+                let _ = tx.send(());
+            }
+        })
+        .ok()
+        .and_then(|mut w| {
+            use notify::Watcher as _;
+            w.watch(&shards, notify::RecursiveMode::NonRecursive).ok().map(|_| w)
+        });
+        let mut seen = crate::mcp::shards_stamp(&shards);
+        loop {
+            if rx.recv_timeout(BASE_POLL).is_ok() {
+                // let the rest of a writer's burst (shard + tombstones) land
+                std::thread::sleep(Duration::from_millis(40));
+                while rx.try_recv().is_ok() {}
+            }
+            let now = crate::mcp::shards_stamp(&shards);
+            if now != seen {
+                let t0 = Instant::now();
+                match prepare_base(&state) {
+                    Ok(fresh) => {
+                        state.swap_base(fresh);
+                        seen = now;
+                        tracing::info!(ms = t0.elapsed().as_millis() as u64, "shards changed: engine reopened");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "reopening the engine after a shard change failed"),
+                }
+            } else {
+                prewarm_sidecars(&state, &state.base());
+            }
+        }
+    });
+}
+
+/// Default decompressed-content cache of `indexio serve`, in MiB.
+const SERVE_CONTENT_CACHE_MB: usize = 1024;
 
 /// Days an overlay nobody updated is kept (`INDEXIO_TEAM_TTL_DAYS`).
 fn team_ttl() -> Duration {
@@ -1103,6 +1286,16 @@ pub async fn run_server(
     auth: AuthConfig,
     users: HashMap<String, String>,
 ) -> anyhow::Result<()> {
+    // overlays run git with the repo's clone as its working directory, so a
+    // relative data dir would resolve against the clone
+    let data_dir = std::path::absolute(&data_dir).unwrap_or(data_dir);
+    // one shared content cache serves every user: hold the hot part of the
+    // corpus and let searches read through it (INDEXIO_CONTENT_CACHE_MB)
+    let cache_mb = std::env::var("INDEXIO_CONTENT_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(SERVE_CONTENT_CACHE_MB);
+    indexio_query::set_content_cache(cache_mb << 20, true);
     let engine = Engine::open(&data_dir)
         .with_context(|| format!("opening index at {}", data_dir.display()))?;
     // Embedder selection (SPEC-P4 §2): HTTP when INDEXIO_EMBED_BASE is set,
@@ -1113,7 +1306,7 @@ pub async fn run_server(
     // INDEXIO_RERANK_BASE is set, else the offline OverlapReranker.
     let reranker = crate::select_reranker_or_fallback();
     let state = AppState {
-        engine: Arc::new(RwLock::new(engine)),
+        engine: Arc::new(RwLock::new(Arc::new(engine))),
         embedder: Arc::new(RwLock::new(embedder)),
         reranker,
         auth: Arc::new(auth),
@@ -1131,6 +1324,7 @@ pub async fn run_server(
             tokio::time::sleep(Duration::from_secs(600)).await;
         }
     });
+    spawn_base_watch(state.clone());
     let app = build_router(state);
     let addr = std::net::SocketAddr::from((bind, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1387,7 +1581,7 @@ mod tests {
     ) -> (tempfile::TempDir, u16) {
         let engine = Engine::open(tmp.path()).unwrap();
         let state = AppState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(RwLock::new(Arc::new(engine))),
             embedder: Arc::new(RwLock::new(
                 Arc::new(indexio_embed::embed::HashEmbedder::new(512)) as Arc<dyn Embedder>
             )),
@@ -1794,6 +1988,32 @@ mod tests {
         assert!(!a.contains("old.rs"), "deleted file still visible to alice: {a}");
         let a = mcp_call(port, "tok-alice", "code_search", json!({ "query": "helper_v1" }));
         assert!(!a.contains("src/lib.rs"), "alice sees the base version of her edited file: {a}");
+        // her session's repo is where she syncs edits: repo-less reads work
+        let a = mcp_call(port, "tok-alice", "read_span", json!({ "path": "src/lib.rs", "start": 1, "end": 2 }));
+        assert!(a.contains("alice_wip_helper"), "{a}");
+        // impact_of_diff maps her synced worktree, no diff or checkout needed
+        let a = mcp_call(port, "tok-alice", "impact_of_diff", json!({}));
+        assert!(a.contains("shared_entry"), "{a}");
+        let a = mcp_call(port, "tok-alice", "impact_of_diff", json!({ "repo": "app" }));
+        assert!(a.contains("shared_entry"), "{a}");
+        // tool output is gzipped for a client that accepts it
+        let (_, raw) = {
+            use std::io::{Read as _, Write as _};
+            let body = json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                               "params": { "name": "list_files", "arguments": {} } })
+            .to_string();
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer tok-bob\r\n\
+                 Content-Type: application/json\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            ((), String::from_utf8_lossy(&buf).to_ascii_lowercase())
+        };
+        assert!(raw.contains("content-encoding: gzip"), "{raw}");
 
         // bob sees the shared default branch only
         let b = mcp_call(port, "tok-bob", "code_search", json!({ "query": "alice_wip_helper" }));

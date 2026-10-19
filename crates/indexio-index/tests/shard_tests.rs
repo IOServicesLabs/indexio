@@ -448,3 +448,91 @@ fn full_decode_matches_cursor() {
     let decoded = decode_postings(&indexio_types::codec::encode_postings(&via_cursor));
     assert_eq!(decoded, via_cursor);
 }
+
+/// A set opened over a shared base answers exactly like the layered set
+/// opened from both directories: same live docs in the same order, same
+/// totals, lookups, postings, symbols and calls; with and without an ACL.
+#[test]
+fn open_over_matches_open_layers() {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use indexio_index::Visibility;
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let upper_dir = tempfile::tempdir().unwrap();
+    let repos = ["repo-a".to_string(), "repo-b".to_string()];
+    // older base shard: files 0..20 in both repos
+    let mut w = ShardWriter::new(base_dir.path()).unwrap();
+    for i in 0..20u32 {
+        let (m, c, a) = make_doc(i, i % 2, default_content(i));
+        w.add_doc(&m, &c, &a).unwrap();
+    }
+    w.finish(&repos).unwrap();
+    sleep(Duration::from_millis(1100));
+    // newer base shard: a new version of file_0 (repo-a) and file_3 (repo-b)
+    let mut w = ShardWriter::new(base_dir.path()).unwrap();
+    for i in [0u32, 3] {
+        let (m, c, a) = make_doc(i, i % 2, format!("fn func_{i}() {{ helper(); /* v2 hello */ }}\n").into_bytes());
+        w.add_doc(&m, &c, &a).unwrap();
+    }
+    w.finish(&repos).unwrap();
+    {
+        // a tombstone in the base: file_5 is gone
+        let mut set = ShardSet::open_dir(base_dir.path()).unwrap();
+        let (si, d, _) = set.visible_docs().into_iter().find(|(_, _, m)| m.path == "src/file_5.rs").unwrap();
+        set.delete_docs(si, &[d]).unwrap();
+    }
+    // the user's overlay: file_2 changed, file_100 new (repo-a)
+    let mut w = ShardWriter::new(upper_dir.path()).unwrap();
+    for i in [2u32, 100] {
+        let (m, c, a) = make_doc(i, 0, format!("fn func_{i}() {{ helper(); /* mine hello */ }}\n").into_bytes());
+        w.add_doc(&m, &c, &a).unwrap();
+    }
+    w.finish(&["repo-a".to_string()]).unwrap();
+
+    let base = Arc::new(ShardSet::open_dir(base_dir.path()).unwrap());
+    let hidden: HashSet<(String, String)> = [("repo-a".to_string(), "src/file_4.rs".to_string())].into_iter().collect();
+    let only_a: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|r: &str| r == "repo-a");
+    let dirs = [upper_dir.path().to_path_buf(), base_dir.path().to_path_buf()];
+    let upper: Vec<PathBuf> = vec![upper_dir.path().to_path_buf()];
+    for (label, upper, view) in [
+        ("overlay", upper.clone(), Visibility { hidden: hidden.clone(), allow: None }),
+        ("overlay + acl", upper.clone(), Visibility { hidden: hidden.clone(), allow: Some(only_a.clone()) }),
+        ("acl only", Vec::new(), Visibility { hidden: HashSet::new(), allow: Some(only_a.clone()) }),
+        ("nothing", Vec::new(), Visibility::default()),
+    ] {
+        let dirs: Vec<PathBuf> = upper.iter().cloned().chain([dirs[1].clone()]).collect();
+        let old = ShardSet::open_layers(&dirs, view.clone()).unwrap();
+        let new = ShardSet::open_over(&upper, Arc::clone(&base), view).unwrap();
+        assert_eq!(old.len(), new.len(), "{label}");
+        for i in 0..old.len() {
+            assert_eq!(old.shard(i).unwrap().path(), new.shard(i).unwrap().path(), "{label} shard {i}");
+        }
+        let key = |v: &[(usize, u32, DocMeta)]| -> Vec<(usize, u32, String, u32, u32)> {
+            v.iter().map(|(si, d, m)| (*si, *d, m.path.clone(), m.repo_id, m.raw_len)).collect()
+        };
+        let docs = old.visible_docs();
+        assert_eq!(key(&docs), key(&new.visible_docs()), "{label}");
+        let raw: u64 = docs.iter().map(|(_, _, m)| m.raw_len as u64).sum();
+        assert_eq!(new.visible_totals(), (docs.len(), raw), "{label}");
+        assert_eq!(old.visible_totals(), (docs.len(), raw), "{label}");
+        for i in [0u32, 1, 2, 3, 4, 5, 6, 100, 999] {
+            for r in &repos {
+                let p = format!("src/file_{i}.rs");
+                let want = docs.iter().find(|(si, _, m)| m.path == p && old.shard(*si).unwrap().meta().repos[m.repo_id as usize] == *r).map(|(si, d, _)| (*si, *d));
+                assert_eq!(new.locate(r, &p), want, "{label} locate {r}:{p}");
+                assert_eq!(old.locate(r, &p), want, "{label} locate {r}:{p}");
+            }
+        }
+        assert_eq!(old.posting_doc_ids(b"hel"), new.posting_doc_ids(b"hel"), "{label}");
+        assert_eq!(old.posting_docs(b"elp"), new.posting_docs(b"elp"), "{label}");
+        assert_eq!(old.symbol_postings("SharedName"), new.symbol_postings("SharedName"), "{label}");
+        assert_eq!(old.call_postings("helper"), new.call_postings("helper"), "{label}");
+        let iter: Vec<_> = new.visible_iter().map(|(si, d, m)| (si, d, m.clone())).collect();
+        assert_eq!(key(&iter), key(&docs), "{label}");
+        for (si, d, _) in &docs {
+            assert!(new.is_live(*si, *d), "{label}");
+        }
+    }
+}

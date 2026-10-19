@@ -1381,7 +1381,19 @@ pub fn server_instructions(engine: &Engine, current: Option<&str>) -> String {
 /// Tools a remote (HTTP) client does not get: they act on the server's own
 /// machine (its checkouts, its transcripts) or list every repo regardless
 /// of the caller's ACL.
-const REMOTE_EXCLUDED_TOOLS: &[&str] = &["refresh_index", "recall", "impact_of_diff", "index_stats"];
+const REMOTE_EXCLUDED_TOOLS: &[&str] = &["refresh_index", "recall", "index_stats"];
+
+/// What a remote (team server) call knows beyond its engine view.
+pub struct RemoteCtx<'a> {
+    /// The repo the caller works in: own-repo-first answers and repo-less
+    /// `read_span`/`file_outline`, as a local session gets them.
+    pub current: Option<&'a str>,
+    /// The shared engine under the caller's view: the pre-change side of
+    /// their worktree diff.
+    pub base: &'a Engine,
+    /// The caller's synced worktree patch of a repo (team hook uploads).
+    pub patch: &'a (dyn Fn(&str) -> Option<String> + Sync),
+}
 
 /// MCP protocol versions the HTTP transport answers with (the client's own
 /// when it is one of these).
@@ -1391,7 +1403,7 @@ const REMOTE_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11
 /// server). `engine` is the caller's view: the shared index with their
 /// worktree overlay on top and their ACL applied, so every tool answers
 /// from what that user may see and is editing. `None` = notification.
-pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Reranker, msg: &Value) -> Option<Value> {
+pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Reranker, msg: &Value, ctx: &RemoteCtx<'_>) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -1408,7 +1420,7 @@ pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Re
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "indexio", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": remote_instructions(engine),
+                    "instructions": remote_instructions(engine, ctx.current),
                 }),
             ))
         }
@@ -1428,7 +1440,10 @@ pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Re
             }
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             let res = opt_format(&args, OutputFormat::from_env()).and_then(|format| {
-                call_tool(engine, embedder, reranker, name, &args, format, None, &Mutex::new(HashMap::new()), &mut None)
+                if name == "impact_of_diff" {
+                    return remote_impact_of_diff(engine, ctx, &args, format);
+                }
+                call_tool(engine, embedder, reranker, name, &args, format, ctx.current, &Mutex::new(HashMap::new()), &mut None)
             });
             Some(match res {
                 Ok(v) => result_response(id, v),
@@ -1439,9 +1454,47 @@ pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Re
     }
 }
 
+/// `impact_of_diff` for a remote caller: the server has no checkout of
+/// theirs, so the diff is the one given, else their synced worktree patch
+/// (the team hook's upload, against its merge-base); the pre-change side is
+/// the shared index and the post-change side their own view of each file.
+/// Sites outside the repos their view shows are left out.
+fn remote_impact_of_diff(view: &Engine, ctx: &RemoteCtx<'_>, args: &Value, format: OutputFormat) -> Result<Value, (i64, String)> {
+    let repo = match args.get("repo").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => r.to_string(),
+        None => ctx.current.map(str::to_string).ok_or_else(|| invalid("missing 'repo'"))?,
+    };
+    let visible: std::collections::HashSet<String> = view.visible_repos().into_iter().collect();
+    if !visible.contains(&repo) {
+        return Err(invalid(format!("no repo '{repo}' in this index")));
+    }
+    let opts = impact_opts(args)?;
+    let diff = match args.get("diff") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::Null) | None | Some(Value::String(_)) => (ctx.patch)(&repo).ok_or_else(|| {
+            invalid(format!("no synced worktree of '{repo}' for this user (the team hook uploads it); pass 'diff' text explicitly"))
+        })?,
+        Some(_) => return Err(invalid("'diff' must be a string")),
+    };
+    let provider = |path: &str| view.file_content(&repo, path);
+    let (changed, mut report) = ctx.base.impact_diff(&repo, &diff, &provider, &opts);
+    report.definitions.retain(|h| visible.contains(&h.repo));
+    report.sites.retain(|s| visible.contains(&s.repo));
+    report.files.retain(|f| visible.contains(&f.repo));
+    report.importers.retain(|h| visible.contains(&h.repo));
+    if format == OutputFormat::Text {
+        return Ok(plain_result(mcp_text::impact(Some(&changed), &report, Some(&repo))));
+    }
+    Ok(text_result(crate::impact_cli::impact_to_json(Some(&changed), &report)))
+}
+
 /// `initialize` instructions for a remote client: the repos this caller
 /// can see (not the whole server's), and how their own edits get in.
-fn remote_instructions(engine: &Engine) -> String {
+fn remote_instructions(engine: &Engine, current: Option<&str>) -> String {
+    let here = match current {
+        Some(r) => format!(" You are in repo \"{r}\": its hits come first (pass repo: to look elsewhere)."),
+        None => String::new(),
+    };
     let repos = engine.visible_repos();
     let shown: Vec<&str> = repos.iter().take(80).map(String::as_str).collect();
     let more = if repos.len() > 80 { format!(" … and {} more", repos.len() - 80) } else { String::new() };
@@ -1455,7 +1508,7 @@ fn remote_instructions(engine: &Engine) -> String {
          code_search (\"hybrid\" for questions, \"lexical\" for identifiers/regex) or code_grep \
          instead of grep; find_symbol/who_calls for definitions and call sites; list_files \
          instead of Glob; file_outline then read_span instead of reading whole files; \
-         impact_of_symbol BEFORE changing a function/type.",
+         impact_of_symbol BEFORE changing a function/type, impact_of_diff AFTER editing          (your synced worktree).{here}",
         repos.len(),
         shown.join(", "),
     )
@@ -2818,7 +2871,7 @@ fn focus_repo(
 }
 
 /// (files, bytes, newest mtime) of a shard directory.
-type ShardsStamp = (usize, u64, Option<std::time::SystemTime>);
+pub(crate) type ShardsStamp = (usize, u64, Option<std::time::SystemTime>);
 
 /// Open + warm an engine at the shards dir's current state on a
 /// background thread and park it in `slot`; bursts of writes collapse into
@@ -2849,7 +2902,7 @@ fn prepare_engine(
 }
 
 /// Cheap fingerprint of a shard directory: (files, bytes, newest mtime).
-fn shards_stamp(dir: &std::path::Path) -> ShardsStamp {
+pub(crate) fn shards_stamp(dir: &std::path::Path) -> ShardsStamp {
     let mut n = 0usize;
     let mut bytes = 0u64;
     let mut newest: Option<std::time::SystemTime> = None;

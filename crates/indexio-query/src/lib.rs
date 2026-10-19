@@ -680,6 +680,26 @@ fn snippet_position(found: &[(f64, Vec<(u32, u32)>)]) -> Option<(u32, u32)> {
 /// rayon fan-out only pays off once decompress + scan dominates.
 const PAR_VERIFY_MIN: usize = 16;
 
+/// Postings below which a lookup maps them on the calling thread. A
+/// parallel map submits to the shared rayon pool, and a job injected from
+/// outside waits until the workers run out of the heavier queries' work: on
+/// a busy team server a 0.5 ms `find_symbol` waited 10-200 ms that way.
+const PAR_POSTINGS_MIN: usize = 64;
+
+/// Summed posting bytes below which a query's gram lists are decoded on the
+/// calling thread (same reason; a rare identifier's lists are tiny).
+const PAR_GRAMS_MIN_BYTES: usize = 256 * 1024;
+
+/// `filter_map` over `items`, in parallel only from `min` items up (order
+/// kept either way).
+fn maybe_par<T: Sync, R: Send>(items: &[T], min: usize, f: impl Fn(&T) -> Option<R> + Sync + Send) -> Vec<R> {
+    if items.len() < min {
+        items.iter().filter_map(f).collect()
+    } else {
+        items.par_iter().filter_map(f).collect()
+    }
+}
+
 /// Per-query state shared by every `verify_doc` call.
 struct VerifyCtx<'a> {
     q: &'a Query,
@@ -692,7 +712,8 @@ struct VerifyCtx<'a> {
 }
 
 pub struct Engine {
-    set: ShardSet,
+    /// Shared with the engines layered over this one ([`Engine::open_over`]).
+    set: Arc<ShardSet>,
     /// Data dir the shard set was opened from (parent of `shards/`); the
     /// vector sidecar lives at `<data_dir>/vec/<model_id>.civec`. `None`
     /// for engines built via `from_shard_set` unless `with_data_dir` is set.
@@ -700,37 +721,86 @@ pub struct Engine {
     /// Opened semantic sidecars, keyed by model id and validated against
     /// the file's (len, mtime) on every use (SPEC-P6 perf): a long-lived
     /// engine (HTTP/MCP) pays the open once per rebuild, not per query.
-    sidecars: RwLock<SidecarCache>,
-    /// (repo, path) -> live doc, built on first use (the shard set is
-    /// immutable for the engine's lifetime; `indexio serve` reloads by building
-    /// a new Engine).
-    doc_map: std::sync::OnceLock<HashMap<String, HashMap<String, DocRef>>>,
+    sidecars: Arc<RwLock<SidecarCache>>,
     /// Parsed outlines per content blob (SPEC-P9): `read_span` sizes its
     /// default range by the enclosing definition and `find_symbol` reports
     /// definition ends; a tree-sitter parse per lookup would cost ms. Keyed
     /// by (blob, lang) rather than doc so it survives an engine reload
     /// (`inherit_caches`): a reload happens on every edit and every
     /// transcript import, and unchanged files keep their parse.
-    outline_cache: Mutex<HashMap<(BlobId, Lang), Arc<Vec<indexio_symbols::OutlineItem>>>>,
+    outline_cache: Arc<Mutex<HashMap<(BlobId, Lang), Arc<Vec<indexio_symbols::OutlineItem>>>>>,
     /// Decompressed doc contents for snippet extraction (SPEC-P9): the
     /// semantic/BM25 legs and symbol lookups each pull one line out of up
     /// to 50 docs per call, and agents keep returning to the same files.
     /// Keyed by blob (content-addressed, never stale); bounded, cleared
     /// wholesale when full.
-    content_cache: Mutex<ContentCache>,
+    content_cache: Arc<Mutex<ContentCache>>,
 }
 
-/// Max decompressed docs kept by `Engine::content_cache`.
-const CONTENT_CACHE_CAP: usize = 512;
-/// Max decompressed bytes it holds: 512 docs of up to 4 MiB each could pin
-/// 2 GiB per server (a session grepping minified bundles).
+/// Call sites `who_calls` judges per parallel round (at least `limit`).
+const WHO_CALLS_CHUNK: usize = 64;
+
+/// Default bound on the decompressed bytes `Engine::content_cache` holds
+/// (a session's working set; a team server raises it with
+/// [`set_content_cache_bytes`]).
 const CONTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Blob-keyed decompressed contents with a doc and a byte bound.
+static CONTENT_CACHE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(CONTENT_CACHE_BYTES);
+static CONTENT_CACHE_SCANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Size the decompressed-content cache of every engine of this process,
+/// and whether search verification goes through it too. A session's
+/// default (64 MiB, snippets and lookups only) keeps its working set out of
+/// the way of one broad grep; a team server holding the hot part of the
+/// whole corpus lets every user's greps skip the decompression.
+pub fn set_content_cache(bytes: usize, scans: bool) {
+    CONTENT_CACHE_BUDGET.store(bytes.max(1 << 20), std::sync::atomic::Ordering::Relaxed);
+    CONTENT_CACHE_SCANS.store(scans, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Blob-keyed decompressed contents bounded by bytes, in two generations:
+/// docs go into `new` until it holds half the budget, then `new` becomes
+/// `old` (the previous `old` is dropped). A hit in `old` moves the doc back
+/// up, so a working set under half the budget never falls out; the cache it
+/// replaces cleared everything at once when full, and a hub `who_calls` or
+/// a broad regex cycled it several times per call.
 #[derive(Clone, Default)]
 struct ContentCache {
-    map: HashMap<BlobId, Arc<Vec<u8>>>,
+    new: HashMap<BlobId, Arc<Vec<u8>>>,
+    old: HashMap<BlobId, Arc<Vec<u8>>>,
+    /// Bytes held by `new`.
     bytes: usize,
+}
+
+impl ContentCache {
+    fn get(&mut self, blob: &BlobId) -> Option<Arc<Vec<u8>>> {
+        if let Some(c) = self.new.get(blob) {
+            return Some(Arc::clone(c));
+        }
+        let c = self.old.remove(blob)?;
+        self.put(*blob, Arc::clone(&c));
+        Some(c)
+    }
+
+    fn put(&mut self, blob: BlobId, content: Arc<Vec<u8>>) {
+        let budget = CONTENT_CACHE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        // one doc may not take over the cache (minified bundles)
+        if content.len() > budget / 8 {
+            return;
+        }
+        if self.bytes + content.len() > budget / 2 {
+            self.old = std::mem::take(&mut self.new);
+            self.bytes = 0;
+        }
+        let n = content.len();
+        if self.new.insert(blob, content).is_none() {
+            self.bytes += n;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.new.is_empty() && self.old.is_empty()
+    }
 }
 
 /// (file length, mtime) of a sidecar at open time.
@@ -756,14 +826,17 @@ impl Engine {
         } else {
             data_dir.to_path_buf()
         };
-        Ok(Engine {
-            set: ShardSet::open_dir(&dir)?,
-            data_dir: Some(data_dir.to_path_buf()),
-            sidecars: RwLock::new(SidecarCache::default()),
-            doc_map: std::sync::OnceLock::new(),
-            outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(ContentCache::default()),
-        })
+        Ok(Engine::with_set(ShardSet::open_dir(&dir)?, Some(data_dir.to_path_buf())))
+    }
+
+    fn with_set(set: ShardSet, data_dir: Option<PathBuf>) -> Self {
+        Engine {
+            set: Arc::new(set),
+            data_dir,
+            sidecars: Default::default(),
+            outline_cache: Default::default(),
+            content_cache: Default::default(),
+        }
     }
 
     /// An engine over `data_dir`'s shards with `upper` shard dirs layered on
@@ -774,13 +847,21 @@ impl Engine {
     pub fn open_layered(data_dir: &Path, upper: &[PathBuf], view: indexio_index::Visibility) -> io::Result<Self> {
         let mut dirs = upper.to_vec();
         dirs.push(data_dir.join("shards"));
+        Ok(Engine::with_set(ShardSet::open_layers(&dirs, view)?, Some(data_dir.to_path_buf())))
+    }
+
+    /// [`open_layered`](Self::open_layered) over an engine that is already
+    /// open: only the `upper` shards are mapped, and the base's shard set,
+    /// live view, key map, semantic sidecars and content/outline caches are
+    /// shared rather than rebuilt (a team server opens one of these per user
+    /// and per overlay change).
+    pub fn open_over(base: &Engine, upper: &[PathBuf], view: indexio_index::Visibility) -> io::Result<Self> {
         Ok(Engine {
-            set: ShardSet::open_layers(&dirs, view)?,
-            data_dir: Some(data_dir.to_path_buf()),
-            sidecars: RwLock::new(SidecarCache::default()),
-            doc_map: std::sync::OnceLock::new(),
-            outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(ContentCache::default()),
+            set: Arc::new(ShardSet::open_over(upper, Arc::clone(&base.set), view)?),
+            data_dir: base.data_dir.clone(),
+            sidecars: Arc::clone(&base.sidecars),
+            outline_cache: Arc::clone(&base.outline_cache),
+            content_cache: Arc::clone(&base.content_cache),
         })
     }
 
@@ -788,6 +869,9 @@ impl Engine {
     /// engine then reuses every parsed segment whose file is unchanged
     /// instead of re-parsing gigabytes after each refresh.
     pub fn inherit_sidecars(&self, from: &Engine) {
+        if Arc::ptr_eq(&self.sidecars, &from.sidecars) {
+            return self.inherit_caches(from);
+        }
         let theirs = from.sidecars.read().expect("sidecar cache poisoned");
         let mut mine = self.sidecars.write().expect("sidecar cache poisoned");
         for (k, v) in &theirs.vec {
@@ -805,8 +889,12 @@ impl Engine {
     /// replaced (SPEC-P9 §22). Both are keyed by content blob, so nothing
     /// can be stale; a file that did not change keeps its parse.
     pub fn inherit_caches(&self, from: &Engine) {
+        // a view layered over `from` already shares them
+        if Arc::ptr_eq(&self.content_cache, &from.content_cache) {
+            return;
+        }
         if let (Ok(theirs), Ok(mut mine)) = (from.content_cache.lock(), self.content_cache.lock()) {
-            if mine.map.is_empty() {
+            if mine.is_empty() {
                 *mine = theirs.clone();
             }
         }
@@ -819,14 +907,7 @@ impl Engine {
 
     /// Build an engine directly from an opened shard set (used by tests).
     pub fn from_shard_set(set: ShardSet) -> Self {
-        Engine {
-            set,
-            data_dir: None,
-            sidecars: RwLock::new(SidecarCache::default()),
-            doc_map: std::sync::OnceLock::new(),
-            outline_cache: Mutex::new(HashMap::new()),
-            content_cache: Mutex::new(ContentCache::default()),
-        }
+        Engine::with_set(set, None)
     }
 
     /// Point the semantic plane at `dir` (for engines not built via `open`).
@@ -966,18 +1047,17 @@ impl Engine {
         }
         groups.sort_by_key(|(c, _)| *c);
         groups.truncate(MAX_CONSTRAINT_GRAMS);
-        let mut lists: Vec<Vec<DocRef>> = groups
-            .par_iter()
-            .map(|(_, variants)| {
-                let mut v: Vec<DocRef> = Vec::new();
-                for g in variants {
-                    v.extend(self.set.posting_doc_ids(g));
-                }
-                v.sort_unstable();
-                v.dedup();
-                v
-            })
-            .collect();
+        let cost: usize = groups.iter().map(|(c, _)| *c).sum();
+        let min = if cost < PAR_GRAMS_MIN_BYTES { usize::MAX } else { 0 };
+        let mut lists: Vec<Vec<DocRef>> = maybe_par(&groups, min, |(_, variants)| {
+            let mut v: Vec<DocRef> = Vec::new();
+            for g in variants {
+                v.extend(self.set.posting_doc_ids(g));
+            }
+            v.sort_unstable();
+            v.dedup();
+            Some(v)
+        });
         // Shortest list first; intersect the rest via galloping seek-merge.
         lists.sort_by_key(|l| l.len());
         let mut acc = std::mem::take(&mut lists[0]);
@@ -1013,9 +1093,7 @@ impl Engine {
         let t0 = Instant::now();
         let mut truncated = false;
 
-        let visible = self.set.visible_slice();
-        let total_docs = visible.len();
-        let total_raw: u64 = visible.iter().map(|(_, _, dm)| dm.raw_len as u64).sum();
+        let (total_docs, total_raw) = self.set.visible_totals();
         let avgdl = if total_docs > 0 {
             (total_raw as f64 / total_docs as f64).max(1.0)
         } else {
@@ -1077,8 +1155,8 @@ impl Engine {
             // filter-passing docs, bounded by content bytes (step 1).
             let mut scanned_bytes: u64 = 0;
             let mut cands = Vec::new();
-            for (si, docid, dm) in visible.iter() {
-                if !self.filters_pass(q, *si, dm) {
+            for (si, docid, dm) in self.set.visible_iter() {
+                if !self.filters_pass(q, si, dm) {
                     continue;
                 }
                 if scanned_bytes >= SCAN_BUDGET_BYTES {
@@ -1086,7 +1164,7 @@ impl Engine {
                     break;
                 }
                 scanned_bytes += dm.raw_len as u64;
-                cands.push((*si, *docid));
+                cands.push((si, docid));
             }
             let scan_df = cands.len().max(1);
             for d in lit_df.iter_mut() {
@@ -1178,21 +1256,12 @@ impl Engine {
             avgdl,
         };
         let mut hits: Vec<SearchHit> = if per_doc <= 1 {
-            if candidates.len() < PAR_VERIFY_MIN {
-                candidates.iter().filter_map(|&(si, docid)| self.verify_doc(&ctx, si, docid)).collect()
-            } else {
-                candidates.par_iter().filter_map(|&(si, docid)| self.verify_doc(&ctx, si, docid)).collect()
-            }
+            maybe_par(&candidates, PAR_VERIFY_MIN, |&(si, docid)| self.verify_doc(&ctx, si, docid))
         } else {
-            let per: Vec<Vec<SearchHit>> = if candidates.len() < PAR_VERIFY_MIN {
-                candidates.iter().filter_map(|&(si, docid)| self.verify_doc_lines(&ctx, si, docid, per_doc)).collect()
-            } else {
-                candidates
-                    .par_iter()
-                    .filter_map(|&(si, docid)| self.verify_doc_lines(&ctx, si, docid, per_doc))
-                    .collect()
-            };
-            per.into_iter().flatten().collect()
+            maybe_par(&candidates, PAR_VERIFY_MIN, |&(si, docid)| self.verify_doc_lines(&ctx, si, docid, per_doc))
+                .into_iter()
+                .flatten()
+                .collect()
         };
 
         sort_hits(&mut hits);
@@ -1219,7 +1288,7 @@ impl Engine {
     /// the single hit is the densest line, exactly as `verify_doc`.
     fn verify_doc_lines(&self, c: &VerifyCtx<'_>, si: usize, docid: u32, per_doc: usize) -> Option<Vec<SearchHit>> {
         let dm = self.set.doc(si, docid)?;
-        let content = self.set.content(si, docid).ok()?;
+        let content = self.scan_content(si, docid)?;
         let mut score: f64 = 0.0;
         // (df, matches) per constraint, for the snippet line choice below.
         let mut found: Vec<(f64, Vec<(u32, u32)>)> =
@@ -1314,10 +1383,7 @@ impl Engine {
     /// Map exact `symbol_postings(name)` entries to hits.
     fn symbol_hits(&self, name: &str, score: f32) -> Vec<SearchHit> {
         let postings = self.set.symbol_postings(name);
-        postings
-            .par_iter()
-            .filter_map(|(si, docid, _kind, line, _scope)| self.posting_hit(*si, *docid, *line, score))
-            .collect()
+        maybe_par(&postings, PAR_POSTINGS_MIN, |(si, docid, _kind, line, _scope)| self.posting_hit(*si, *docid, *line, score))
     }
 
     /// Substring variant: find docs whose content contains `name`, extract
@@ -1362,30 +1428,14 @@ impl Engine {
     /// now, so the first lookup on a freshly opened engine does not pay for
     /// them (an engine prepared off the call path is warmed before use).
     pub fn warm(&self) {
-        let _ = self.set.visible_slice();
-        let _ = self.locate_doc("", "");
+        self.set.warm();
     }
 
-    /// Locate a live doc by (repo, path) through a lazily built map (one
-    /// visible-docs scan per engine instead of one per lookup).
+    /// Locate a live doc by (repo, path) through the shard set's lazily
+    /// built map (one visible-docs scan per set instead of one per lookup;
+    /// a layered view asks its own small map, then the shared base's).
     fn locate_doc(&self, repo: &str, path: &str) -> Option<DocRef> {
-        // repo -> path -> doc, built from the borrowed view (no copy of the
-        // visible list, one repo String per shard repo instead of per doc)
-        let map = self.doc_map.get_or_init(|| {
-            let mut m: HashMap<String, HashMap<String, DocRef>> = HashMap::new();
-            for (si, docid, dm) in self.set.visible_slice() {
-                let Some(r) = self.set.shard(*si).and_then(|s| s.meta().repos.get(dm.repo_id as usize)) else {
-                    continue;
-                };
-                let paths = match m.get_mut(r.as_str()) {
-                    Some(p) => p,
-                    None => m.entry(r.clone()).or_default(),
-                };
-                paths.insert(dm.path.clone(), (*si, *docid));
-            }
-            m
-        });
-        map.get(repo)?.get(path).copied()
+        self.set.locate(repo, path)
     }
 
     /// Repos with at least one live doc in this view, sorted (a layered
@@ -1394,9 +1444,8 @@ impl Engine {
     pub fn visible_repos(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .set
-            .visible_slice()
-            .iter()
-            .map(|(si, _, dm)| self.repo_name(*si, dm))
+            .visible_iter()
+            .map(|(si, _, dm)| self.repo_name(si, dm))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -1444,14 +1493,13 @@ impl Engine {
         };
         let mut out: Vec<(String, String)> = self
             .set
-            .visible_docs()
-            .into_iter()
+            .visible_iter()
             .filter_map(|(si, _, dm)| {
-                let r = self.repo_name(si, &dm);
+                let r = self.repo_name(si, dm);
                 if repo.is_some_and(|want| want != r) || !matcher(&dm.path) {
                     return None;
                 }
-                Some((r, dm.path))
+                Some((r, dm.path.clone()))
             })
             .collect();
         out.sort();
@@ -1468,39 +1516,66 @@ impl Engine {
         // definitions (SPEC-P9 §20): `tokio::spawn(` is not a call of the
         // repo's `spawn`
         let shape = self.root_shape(name);
-        let mut hits: Vec<SearchHit> = postings
-            .par_iter()
-            .filter_map(|(si, docid, _caller, line)| {
-                if !shape.lang_plausible(self.set.doc(*si, *docid)?.lang) {
-                    return None;
-                }
+        // Every hit scores 1.0, so the answer is the first `limit` plausible
+        // sites in (repo, path, line) order: order the postings by that from
+        // the doc metas, then judge them (which needs each file's content) a
+        // chunk at a time until `limit` passed. A hub name like `new` has
+        // thousands of sites; judging all of them decompressed every file
+        // that calls it (~0.7 CPU-seconds per call).
+        let mut keyed: Vec<(String, DocMeta, usize, u32, u32)> = maybe_par(&postings, PAR_POSTINGS_MIN * 4, |(si, docid, _caller, line)| {
+            let dm = self.set.doc(*si, *docid)?;
+            if !shape.lang_plausible(dm.lang) {
+                return None;
+            }
+            Some((self.repo_name(*si, &dm), dm, *si, *docid, *line))
+        });
+        // stable: equal keys keep the postings' order, as `sort_hits` did
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)).then_with(|| a.4.cmp(&b.4)));
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for chunk in keyed.chunks(limit.max(WHO_CALLS_CHUNK)) {
+            let judged: Vec<SearchHit> = maybe_par(chunk, PAR_POSTINGS_MIN, |(repo, dm, si, docid, line)| {
                 let content = self.cached_content(*si, *docid)?;
                 if !impact::site_plausible(&content_line(&content, *line), name, &shape) {
                     return None;
                 }
-                self.posting_hit(*si, *docid, *line, 1.0)
-            })
-            .collect();
-        sort_hits(&mut hits);
+                Some(SearchHit {
+                    repo: repo.clone(),
+                    path: dm.path.clone(),
+                    line: *line,
+                    col: 0,
+                    snippet: snippet_line(&content, *line),
+                    score: 1.0,
+                    lang: dm.lang,
+                })
+            });
+            hits.extend(judged);
+            if hits.len() >= limit {
+                break;
+            }
+        }
         hits.truncate(limit);
         hits
+    }
+
+    /// A doc's content for search verification: through the cache when the
+    /// process caches scans ([`set_content_cache`]), else decompressed.
+    fn scan_content(&self, si: usize, docid: u32) -> Option<Arc<Vec<u8>>> {
+        if CONTENT_CACHE_SCANS.load(std::sync::atomic::Ordering::Relaxed) {
+            self.cached_content(si, docid)
+        } else {
+            self.set.content(si, docid).ok().map(Arc::new)
+        }
     }
 
     /// Decompressed content of a doc through the bounded engine cache.
     fn cached_content(&self, si: usize, docid: u32) -> Option<Arc<Vec<u8>>> {
         let blob = self.set.doc(si, docid)?.blob;
-        if let Some(c) = self.content_cache.lock().ok()?.map.get(&blob) {
-            return Some(Arc::clone(c));
+        if let Some(c) = self.content_cache.lock().ok()?.get(&blob) {
+            return Some(c);
         }
         let content = Arc::new(self.set.content(si, docid).ok()?);
         if let Ok(mut cache) = self.content_cache.lock() {
-            if cache.map.len() >= CONTENT_CACHE_CAP || cache.bytes + content.len() > CONTENT_CACHE_BYTES {
-                cache.map.clear();
-                cache.bytes = 0;
-            }
-            if content.len() <= CONTENT_CACHE_BYTES / 4 && cache.map.insert(blob, Arc::clone(&content)).is_none() {
-                cache.bytes += content.len();
-            }
+            cache.put(blob, Arc::clone(&content));
         }
         Some(content)
     }
@@ -1830,7 +1905,7 @@ impl Engine {
         let mut repos: Vec<String> = Vec::new();
         let mut total_raw = 0u64;
         let mut index_bytes = 0u64;
-        for shard in self.set.shards() {
+        for shard in self.set.all_shards() {
             for r in &shard.meta().repos {
                 if !repos.contains(r) {
                     repos.push(r.clone());

@@ -119,6 +119,21 @@ fn save_overlay(data_dir: &Path, st: &OverlayState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The last accepted patch of `user`'s overlay of `repo` (what remote
+/// `impact_of_diff` maps when the caller sends no diff).
+fn patch_path(data_dir: &Path, user: &str, repo: &str) -> PathBuf {
+    user_dir(data_dir, user).join("patches").join(format!("{repo}.diff"))
+}
+
+/// `user`'s current worktree patch of `repo` (against the overlay's base).
+pub fn user_patch(data_dir: &Path, user: &str, repo: &str) -> Option<String> {
+    if !valid_user(user) || !valid_repo_name(repo) {
+        return None;
+    }
+    let bytes = fs::read(patch_path(data_dir, user, repo)).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn load_overlay(data_dir: &Path, user: &str, repo: &str) -> Option<OverlayState> {
     let bytes = fs::read(overlay_state_path(data_dir, user, repo)).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -144,6 +159,9 @@ pub fn user_overlays(data_dir: &Path, user: &str) -> Vec<OverlayState> {
 pub struct UserLayer {
     pub shards_dir: Option<PathBuf>,
     pub hidden: HashSet<(String, String)>,
+    /// The repo of the most recently updated overlay (where the user is
+    /// working now, as far as the server can tell).
+    pub latest: Option<String>,
 }
 
 pub fn user_layer(data_dir: &Path, user: &str) -> UserLayer {
@@ -156,6 +174,7 @@ pub fn user_layer(data_dir: &Path, user: &str) -> UserLayer {
     UserLayer {
         shards_dir: overlays.iter().any(|o| o.shard.is_some()).then_some(dir),
         hidden,
+        latest: overlays.iter().max_by(|a, b| a.updated_at.cmp(&b.updated_at)).map(|o| o.repo.clone()),
     }
 }
 
@@ -335,9 +354,10 @@ fn has_commit(repo: &Path, commit: &str) -> bool {
     git(repo, None, &["cat-file", "-e", &format!("{commit}^{{commit}}")], None).is_ok()
 }
 
-/// Contents of `paths` in `tree` via one `git cat-file --batch`. A path
-/// missing from the tree (or not a blob) is absent from the result.
-fn read_tree_blobs(repo: &Path, tree: &str, paths: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+/// Contents of `(path, blob id)` pairs via one `git cat-file --batch`. An
+/// id that is missing (or not a blob: a submodule commit) is absent from
+/// the result.
+fn read_blobs(repo: &Path, items: &[(String, String)]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -348,16 +368,17 @@ fn read_tree_blobs(repo: &Path, tree: &str, paths: &[String]) -> anyhow::Result<
         .spawn()
         .context("running git cat-file --batch")?;
     let mut input = String::new();
-    for p in paths {
-        input.push_str(&format!("{tree}:{p}\n"));
+    for (_, oid) in items {
+        input.push_str(oid);
+        input.push('\n');
     }
     let mut pipe = child.stdin.take().expect("piped stdin");
     let writer = std::thread::spawn(move || {
         let _ = pipe.write_all(input.as_bytes());
     });
     let mut rd = BufReader::new(child.stdout.take().expect("piped stdout"));
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
+    let mut out = Vec::with_capacity(items.len());
+    for (p, _) in items {
         let mut header = String::new();
         if rd.read_line(&mut header)? == 0 {
             break;
@@ -446,30 +467,49 @@ pub fn apply_worktree_patch(
             }
             let _ = fs::remove_file(overlay_state_path(data_dir, user, repo));
         }
+        let _ = fs::remove_file(patch_path(data_dir, user, repo));
         report.cleared = true;
         report.elapsed_ms = t0.elapsed().as_millis() as u64;
         return Ok(report);
     }
 
-    // The base must be in the server's clone: a commit the user made
-    // locally and never pushed is not, so clients diff against their
+    // The work index starts as the base tree: a copy of the one read for
+    // this base before (the same work uploaded again, the common case), else
+    // `read-tree`. The base must be in the server's clone: a commit the user
+    // made locally and never pushed is not, so clients diff against their
     // merge-base with the remote. One fetch covers a push the sync has not
     // picked up yet.
     let clone = state.path.as_path();
-    if !has_commit(clone, &base) {
-        if fetch_due(data_dir, repo) {
-            fetch_origin(clone);
-        }
-        if !has_commit(clone, &base) {
-            return Err(OverlayError::UnknownBase(base).into());
-        }
-    }
-
     let tmp = udir.join("tmp");
     fs::create_dir_all(&tmp)?;
     let index = tmp.join(format!("{repo}.index"));
+    let base_index = tmp.join(format!("{repo}.{base}.base-index"));
     let _ = fs::remove_file(&index);
-    git(clone, Some(&index), &["read-tree", &base], None)?;
+    if fs::copy(&base_index, &index).is_err() {
+        if git(clone, Some(&index), &["read-tree", &base], None).is_err() {
+            if !has_commit(clone, &base) && fetch_due(data_dir, repo) {
+                fetch_origin(clone);
+            }
+            if !has_commit(clone, &base) {
+                return Err(OverlayError::UnknownBase(base).into());
+            }
+            git(clone, Some(&index), &["read-tree", &base], None)?;
+        }
+        // one cached base index per repo: the older bases' go
+        if let Ok(rd) = fs::read_dir(&tmp) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let old = name
+                    .strip_prefix(&format!("{repo}."))
+                    .and_then(|r| r.strip_suffix(".base-index"))
+                    .is_some_and(is_hex_commit);
+                if old {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+        let _ = fs::copy(&index, &base_index);
+    }
     git(
         clone,
         Some(&index),
@@ -477,37 +517,46 @@ pub fn apply_worktree_patch(
         Some(patch),
     )
     .map_err(|e| OverlayError::Invalid(format!("patch does not apply to {base}: {e:#}")))?;
-    let tree = String::from_utf8(git(clone, Some(&index), &["write-tree"], None)?)?.trim().to_string();
+    // what changed against the base, with each new blob id, straight from
+    // the work index (no tree to write and diff)
+    let raw = git(clone, Some(&index), &["diff-index", "--cached", "--raw", "-z", "--no-renames", &base], None)?;
     let _ = fs::remove_file(&index);
 
-    let status = git(clone, None, &["diff-tree", "-r", "-z", "--no-renames", "--name-status", &base, &tree], None)?;
-    let mut changed: Vec<String> = Vec::new();
+    let mut changed_ids: Vec<(String, String)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
-    let mut fields = status.split(|&b| b == 0).filter(|f| !f.is_empty());
-    while let (Some(st), Some(path)) = (fields.next(), fields.next()) {
+    let mut fields = raw.split(|&b| b == 0).filter(|f| !f.is_empty());
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        // `:<old mode> <new mode> <old id> <new id> <status>`
+        let meta = String::from_utf8_lossy(meta);
+        let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        if parts.len() < 5 {
+            continue;
+        }
         let path = String::from_utf8_lossy(path).into_owned();
         if under_skipped_dir(&path) {
             continue;
         }
-        match st.first() {
+        match parts[4].as_bytes().first() {
             Some(b'D') => deleted.push(path),
-            Some(_) => changed.push(path),
+            Some(_) => changed_ids.push((path, parts[3].to_string())),
             None => {}
         }
     }
-    let wanted: Vec<String> = changed
-        .iter()
-        .filter(|p| !Lang::is_secret_path(p) && !p.contains('\n'))
-        .cloned()
+    let mut changed: Vec<String> = changed_ids.iter().map(|(p, _)| p.clone()).collect();
+    let wanted: Vec<(String, String)> = changed_ids
+        .into_iter()
+        .filter(|(p, _)| !Lang::is_secret_path(p) && !p.contains('\n'))
         .collect();
-    let contents: Vec<(String, Vec<u8>)> = read_tree_blobs(clone, &tree, &wanted)?
+    let contents: Vec<(String, Vec<u8>)> = read_blobs(clone, &wanted)?
         .into_iter()
         .map(|(p, c)| {
             let c = normalize_crlf(&c).unwrap_or(c);
             (p, c)
         })
         .collect();
+    let t_git = t0.elapsed().as_millis() as u64;
     let docs = extract_docs(contents, cas);
+    let t_extract = t0.elapsed().as_millis() as u64 - t_git;
     let indexed: HashSet<&str> = docs.iter().map(|d| d.meta.path.as_str()).collect();
     // changed into something not indexable: the base doc is stale, hide it
     for p in &changed {
@@ -535,6 +584,13 @@ pub fn apply_worktree_patch(
         updated_at: iso_now(),
     };
     save_overlay(data_dir, &st)?;
+    let pp = patch_path(data_dir, user, repo);
+    if fs::create_dir_all(pp.parent().expect("patch path has a parent")).is_ok() {
+        let tmp = pp.with_extension("diff.tmp");
+        if fs::write(&tmp, patch).is_ok() {
+            let _ = fs::rename(&tmp, &pp);
+        }
+    }
     if let Some(old) = prev.and_then(|p| p.shard) {
         if Some(&old) != st.shard.as_ref() {
             retire_shard(&udir.join("shards").join(old));
@@ -544,7 +600,7 @@ pub fn apply_worktree_patch(
     report.changed = st.changed.len() as u64;
     report.deleted = st.deleted.len() as u64;
     report.elapsed_ms = t0.elapsed().as_millis() as u64;
-    debug!(repo, user, docs = report.docs, deleted = report.deleted, ms = report.elapsed_ms, "team overlay");
+    debug!(repo, user, docs = report.docs, deleted = report.deleted, git_ms = t_git, extract_ms = t_extract, ms = report.elapsed_ms, "team overlay");
     Ok(report)
 }
 
@@ -583,6 +639,9 @@ pub fn prune_overlays(data_dir: &Path, max_age: Duration) -> usize {
                     }
                 }
                 None => warn!(path = %path.display(), "unreadable overlay state; removing"),
+            }
+            if let Some(stem) = path.file_stem() {
+                let _ = fs::remove_file(u.path().join("patches").join(stem).with_extension("diff"));
             }
             if fs::remove_file(&path).is_ok() {
                 removed += 1;

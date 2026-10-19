@@ -424,6 +424,30 @@ to the name to act as.
 - Overlay user names are constrained to `[A-Za-z0-9._@-]`, no leading dot,
   so overlay state stays path-safe (SSO identities are usually emails).
 
+### Serving many developers at once
+
+- The server reopens its index by itself when a `sync`, `reindex` or
+  compaction writes new shards: the new engine is opened and warmed off the
+  request path and swapped in, so nobody calls `/admin/reload` and no
+  request waits for it. The semantic plane is parsed at startup and after
+  each embed.
+- Every request runs on a worker pool, and small lookups stay off the shared
+  parallel pool, so a `find_symbol` or `read_span` answers in about a
+  millisecond while other users run broad greps and hybrid searches.
+- A developer's view is their overlay layered over the one shared index:
+  about 1 MB per developer, opened in milliseconds, and opened in the
+  background right after each upload.
+- One content cache serves everyone: `INDEXIO_CONTENT_CACHE_MB` (default
+  1024) holds decompressed files for every user's searches.
+- Responses are gzipped for clients that accept it; the hook uploads large
+  patches gzipped.
+- A session's own repo comes first in results and is the default of
+  `read_span` and `file_outline`, as in a local session: the repo the client
+  names in an `X-Indexio-Repo` header (a name or the origin URL), else the
+  repo the developer last synced edits for.
+- `impact_of_diff` without a `diff` maps the developer's synced worktree
+  against its merge-base.
+
 ### Limits
 
 - Overlays are lexical planes. Vector search ranks the base content; edits
@@ -863,6 +887,7 @@ indexio cas-stats
 | `INDEXIO_BIND` | Bind address of `serve`. Not loopback needs a token or an ACL. |
 | `INDEXIO_AUTH_TOKEN` | Bearer token of `serve`. |
 | `INDEXIO_TEAM_TTL_DAYS` | Days a team worktree overlay is kept without an update. Default 7. |
+| `INDEXIO_CONTENT_CACHE_MB` | Decompressed-content cache of `serve`, shared by all users. Default 1024. |
 | `INDEXIO_URL`, `INDEXIO_TOKEN`, `INDEXIO_USER` | The team-sync hook's server, bearer token, and user to act as (only with a shared token). |
 | `INDEXIO_EMBED_BASE`, `INDEXIO_EMBED_MODEL`, `INDEXIO_EMBED_DIM`, `INDEXIO_EMBED_KEY` | An OpenAI-compatible embeddings endpoint. |
 | `INDEXIO_RERANK_BASE`, `INDEXIO_RERANK_MODEL`, `INDEXIO_RERANK_KEY` | A reranker endpoint. |

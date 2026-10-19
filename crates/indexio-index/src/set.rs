@@ -30,13 +30,25 @@ pub fn is_abandoned(path: &Path) -> bool {
 pub struct ShardSet {
     /// Newest-first (by created_unix in the shard header); in a layered set
     /// ([`open_layers`](Self::open_layers)) newest-first within each layer,
-    /// top layer first.
+    /// top layer first. Over a shared `base` these are the top layer only.
     shards: Vec<Shard>,
+    /// A shared lower layer ([`open_over`](Self::open_over)): a team server
+    /// keeps one base set and puts every user's overlay on top of it, so the
+    /// base's mappings, live view and key map are built once for everyone.
+    /// Its shards follow this set's own in the shard index space.
+    base: Option<Arc<ShardSet>>,
     /// Live-doc view, computed on first use and dropped by every mutation
     /// (`delete_docs`, `merge`). Every fan-out lookup used to rescan all
     /// shards to build this; on a 40-repo set that was the dominant cost
-    /// of a query (one full scan per n-gram).
+    /// of a query (one full scan per n-gram). Over a `base`: the top layer's.
     visible: OnceLock<VisibleCache>,
+    /// (repo, path) -> live doc of `visible`, built on first lookup.
+    keys: OnceLock<Keys>,
+    /// What the top layer takes out of the base (built on first use).
+    over: OnceLock<Over>,
+    /// The whole view materialized over a `base` (only for callers that
+    /// need it as one slice or set; the hot paths stream instead).
+    full: OnceLock<VisibleCache>,
     /// What this view hides on top of tombstones (team overlays, ACLs).
     view: Visibility,
     /// Opened from several directories: never compacted as one.
@@ -58,16 +70,58 @@ pub struct Visibility {
 struct VisibleCache {
     docs: Vec<(usize, u32, DocMeta)>,
     ids: HashSet<(usize, u32)>,
+    /// Summed `raw_len` of `docs`.
+    raw: u64,
+}
+
+impl VisibleCache {
+    fn new(docs: Vec<(usize, u32, DocMeta)>) -> Self {
+        let ids = docs.iter().map(|(si, d, _)| (*si, *d)).collect();
+        let raw = docs.iter().map(|(_, _, dm)| dm.raw_len as u64).sum();
+        VisibleCache { docs, ids, raw }
+    }
+}
+
+/// Live docs by repo, then path, with per-repo totals.
+#[derive(Default)]
+struct Keys {
+    repos: HashMap<String, RepoKeys>,
+}
+
+#[derive(Default)]
+struct RepoKeys {
+    docs: HashMap<String, (usize, u32)>,
+    raw: u64,
+}
+
+/// What a top layer takes out of its shared base.
+struct Over {
+    /// repo -> paths the top layer shadows (its own live docs) or hides.
+    shadow: HashMap<String, HashSet<String>>,
+    /// base shard -> shard-local repo id -> allowed by the view.
+    allowed: Vec<Vec<bool>>,
+    /// Neither applies: every live base doc is live here.
+    trivial: bool,
+    /// Live doc count and raw bytes of the whole view.
+    totals: (usize, u64),
 }
 
 impl ShardSet {
-    pub fn open_dir(dir: &Path) -> io::Result<Self> {
-        Ok(ShardSet {
-            shards: Self::load_dir(dir)?,
+    fn with_shards(shards: Vec<Shard>, base: Option<Arc<ShardSet>>, view: Visibility, layered: bool) -> Self {
+        ShardSet {
+            shards,
+            base,
             visible: OnceLock::new(),
-            view: Visibility::default(),
-            layered: false,
-        })
+            keys: OnceLock::new(),
+            over: OnceLock::new(),
+            full: OnceLock::new(),
+            view,
+            layered,
+        }
+    }
+
+    pub fn open_dir(dir: &Path) -> io::Result<Self> {
+        Ok(Self::with_shards(Self::load_dir(dir)?, None, Visibility::default(), false))
     }
 
     /// One view over several shard directories, `dirs[0]` on top: a doc of
@@ -80,7 +134,36 @@ impl ShardSet {
         for d in dirs {
             shards.extend(Self::load_dir(d)?);
         }
-        Ok(ShardSet { shards, visible: OnceLock::new(), view, layered: true })
+        Ok(Self::with_shards(shards, None, view, true))
+    }
+
+    /// [`open_layers`](Self::open_layers) with an already opened base as the
+    /// bottom layer: the same view, but only the `upper` shards are mapped
+    /// and scanned; the base's live view and key map are shared, not copied.
+    /// The base must not itself be layered over another set.
+    pub fn open_over(upper: &[PathBuf], base: Arc<ShardSet>, view: Visibility) -> io::Result<Self> {
+        if base.base.is_some() {
+            return Err(invalid("a shared base cannot itself sit over another set"));
+        }
+        let mut shards = Vec::new();
+        for d in upper {
+            shards.extend(Self::load_dir(d)?);
+        }
+        Ok(Self::with_shards(shards, Some(base), view, true))
+    }
+
+    /// Every shard with its index: the top layer, then a shared base's.
+    fn each_shard(&self) -> impl Iterator<Item = (usize, &Shard)> {
+        let n = self.shards.len();
+        self.shards
+            .iter()
+            .enumerate()
+            .chain(self.base.iter().flat_map(move |b| b.shards.iter().enumerate().map(move |(i, s)| (i + n, s))))
+    }
+
+    /// Every shard, top layer first (a shared base's included).
+    pub fn all_shards(&self) -> impl Iterator<Item = &Shard> {
+        self.each_shard().map(|(_, s)| s)
     }
 
     /// The shards of one directory, newest first.
@@ -115,54 +198,217 @@ impl ShardSet {
         Ok(shards)
     }
 
+    /// The live docs of this set's own shards (the top layer over a base).
     fn cache(&self) -> &VisibleCache {
-        self.visible.get_or_init(|| {
-            let docs = self.scan_visible();
-            let ids = docs.iter().map(|(si, d, _)| (*si, *d)).collect();
-            VisibleCache { docs, ids }
+        self.visible.get_or_init(|| VisibleCache::new(self.scan_visible()))
+    }
+
+    fn keys(&self) -> &Keys {
+        self.keys.get_or_init(|| {
+            let mut k = Keys::default();
+            for (si, docid, dm) in &self.cache().docs {
+                let Some(r) = self.shards[*si].meta().repos.get(dm.repo_id as usize) else { continue };
+                let repo = match k.repos.get_mut(r.as_str()) {
+                    Some(p) => p,
+                    None => k.repos.entry(r.clone()).or_default(),
+                };
+                repo.docs.insert(dm.path.clone(), (*si, *docid));
+                repo.raw += dm.raw_len as u64;
+            }
+            k
         })
+    }
+
+    fn over(&self) -> &Over {
+        self.over.get_or_init(|| {
+            let base = self.base.as_ref().expect("only a set over a base has an overlay");
+            let mut shadow: HashMap<String, HashSet<String>> = HashMap::new();
+            for (repo, k) in &self.keys().repos {
+                shadow.entry(repo.clone()).or_default().extend(k.docs.keys().cloned());
+            }
+            for (r, p) in &self.view.hidden {
+                shadow.entry(r.clone()).or_default().insert(p.clone());
+            }
+            let allowed: Vec<Vec<bool>> = base
+                .shards
+                .iter()
+                .map(|s| s.meta().repos.iter().map(|r| self.repo_allowed(r)).collect())
+                .collect();
+            let trivial = shadow.is_empty() && allowed.iter().all(|a| a.iter().all(|x| *x));
+            // base totals, less what the view takes out of them
+            let own = self.cache();
+            let (mut n, mut raw) = (own.docs.len(), own.raw);
+            let base_keys = base.keys();
+            for (repo, k) in &base_keys.repos {
+                if !self.repo_allowed(repo) {
+                    continue;
+                }
+                n += k.docs.len();
+                raw += k.raw;
+                for p in shadow.get(repo).into_iter().flatten() {
+                    if let Some(&(si, docid)) = k.docs.get(p) {
+                        n -= 1;
+                        raw -= base.doc(si, docid).map_or(0, |dm| dm.raw_len as u64);
+                    }
+                }
+            }
+            Over { shadow, allowed, trivial, totals: (n, raw) }
+        })
+    }
+
+    fn repo_allowed(&self, repo: &str) -> bool {
+        self.view.allow.as_ref().is_none_or(|f| f(repo))
+    }
+
+    /// Whether the live base doc at (`bsi`, repo id `rid`, `path`) survives
+    /// the top layer (allowed, neither shadowed nor hidden).
+    fn base_passes(&self, over: &Over, bsi: usize, rid: u32, path: &[u8]) -> bool {
+        if over.trivial {
+            return true;
+        }
+        if !over.allowed.get(bsi).and_then(|a| a.get(rid as usize)).copied().unwrap_or(false) {
+            return false;
+        }
+        if over.shadow.is_empty() {
+            return true;
+        }
+        let Some(repo) = self.base.as_ref().and_then(|b| b.shards.get(bsi)).and_then(|s| s.meta().repos.get(rid as usize)) else {
+            return false;
+        };
+        match (over.shadow.get(repo.as_str()), std::str::from_utf8(path)) {
+            (Some(paths), Ok(p)) => !paths.contains(p),
+            _ => true,
+        }
+    }
+
+    /// Whether (`shard_idx`, `docid`) is a live doc of this view: not
+    /// tombstoned, newest of its (repo, path), allowed and not hidden.
+    pub fn is_live(&self, shard_idx: usize, docid: u32) -> bool {
+        let n = self.shards.len();
+        match &self.base {
+            None => self.cache().ids.contains(&(shard_idx, docid)),
+            Some(_) if shard_idx < n => self.cache().ids.contains(&(shard_idx, docid)),
+            Some(b) => {
+                let bsi = shard_idx - n;
+                if !b.is_live(bsi, docid) {
+                    return false;
+                }
+                let over = self.over();
+                if over.trivial {
+                    return true;
+                }
+                match b.shards.get(bsi).and_then(|s| s.doc_key(docid)) {
+                    Some((rid, path)) => self.base_passes(over, bsi, rid, path),
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// The live doc at (repo, path), through a map built on first use.
+    pub fn locate(&self, repo: &str, path: &str) -> Option<(usize, u32)> {
+        if let Some(r) = self.keys().repos.get(repo).and_then(|k| k.docs.get(path)) {
+            return Some(*r);
+        }
+        let b = self.base.as_ref()?;
+        let over = self.over();
+        if !over.trivial
+            && (!self.repo_allowed(repo) || over.shadow.get(repo).is_some_and(|p| p.contains(path)))
+        {
+            return None;
+        }
+        b.locate(repo, path).map(|(si, d)| (si + self.shards.len(), d))
+    }
+
+    /// Build the lazily computed views now (an engine prepared off the
+    /// call path is warmed before use).
+    pub fn warm(&self) {
+        let _ = self.keys();
+        if let Some(b) = &self.base {
+            b.warm();
+            let _ = self.over();
+        }
+    }
+
+    /// Live docs of the whole view, borrowed, in [`visible_slice`]
+    /// order (top layer first), without materializing a view over a base.
+    ///
+    /// [`visible_slice`]: Self::visible_slice
+    pub fn visible_iter(&self) -> Box<dyn Iterator<Item = (usize, u32, &DocMeta)> + '_> {
+        let own = self.cache().docs.iter().map(|(si, d, dm)| (*si, *d, dm));
+        let Some(b) = &self.base else {
+            return Box::new(own);
+        };
+        let n = self.shards.len();
+        let over = self.over();
+        Box::new(own.chain(b.visible_slice().iter().filter_map(move |(bsi, d, dm)| {
+            self.base_passes(over, *bsi, dm.repo_id, dm.path.as_bytes()).then_some((bsi + n, *d, dm))
+        })))
+    }
+
+    /// (live doc count, summed raw bytes) of the whole view.
+    pub fn visible_totals(&self) -> (usize, u64) {
+        match &self.base {
+            None => {
+                let c = self.cache();
+                (c.docs.len(), c.raw)
+            }
+            Some(_) => self.over().totals,
+        }
+    }
+
+    /// The whole view of a set over a base, materialized once.
+    fn full(&self) -> &VisibleCache {
+        match &self.base {
+            None => self.cache(),
+            Some(_) => self
+                .full
+                .get_or_init(|| VisibleCache::new(self.visible_iter().map(|(si, d, dm)| (si, d, dm.clone())).collect())),
+        }
     }
 
     fn invalidate(&mut self) {
         self.visible = OnceLock::new();
+        self.keys = OnceLock::new();
+        self.over = OnceLock::new();
+        self.full = OnceLock::new();
     }
 
     pub fn len(&self) -> usize {
-        self.shards.len()
+        self.shards.len() + self.base.as_ref().map_or(0, |b| b.len())
     }
     pub fn is_empty(&self) -> bool {
-        self.shards.is_empty()
+        self.len() == 0
     }
+    /// This set's own shards: over a shared base, the top layer only
+    /// ([`all_shards`](Self::all_shards) covers both).
     pub fn shards(&self) -> &[Shard] {
         &self.shards
     }
     pub fn shard(&self, idx: usize) -> Option<&Shard> {
-        self.shards.get(idx)
+        match self.shards.get(idx) {
+            Some(s) => Some(s),
+            None => self.base.as_ref()?.shard(idx - self.shards.len()),
+        }
     }
 
     /// Live doc count across all shards (tombstoned excluded).
     pub fn doc_count(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|s| s.doc_count() - s.tombstones().len())
-            .sum()
+        self.all_shards().map(|s| s.doc_count() - s.tombstones().len()).sum()
     }
 
     pub fn doc(&self, shard_idx: usize, docid: u32) -> Option<DocMeta> {
-        self.shards.get(shard_idx)?.doc(docid)
+        self.shard(shard_idx)?.doc(docid)
     }
 
     pub fn content(&self, shard_idx: usize, docid: u32) -> io::Result<Vec<u8>> {
-        self.shards
-            .get(shard_idx)
+        self.shard(shard_idx)
             .ok_or_else(|| invalid(format!("shard index {shard_idx} out of range")))?
             .content(docid)
     }
 
     pub fn is_tombstoned(&self, shard_idx: usize, docid: u32) -> bool {
-        self.shards
-            .get(shard_idx)
-            .is_some_and(|s| s.tombstones().contains(docid))
+        self.shard(shard_idx).is_some_and(|s| s.tombstones().contains(docid))
     }
 
     pub fn delete_docs(&mut self, shard_idx: usize, docids: &[u32]) -> io::Result<()> {
@@ -186,7 +432,7 @@ impl ShardSet {
     /// All live docs, newest shard first (an owned copy of the cached
     /// view; prefer [`visible_slice`](Self::visible_slice) on hot paths).
     pub fn visible_docs(&self) -> Vec<(usize, u32, DocMeta)> {
-        self.cache().docs.clone()
+        self.visible_iter().map(|(si, d, dm)| (si, d, dm.clone())).collect()
     }
 
     /// The live docs of `repo` at `paths` only (what a delta over a few
@@ -194,6 +440,13 @@ impl ShardSet {
     /// rules as [`visible_docs`](Self::visible_docs) without building the
     /// whole view, and only the matches are decoded.
     pub fn visible_at(&self, repo: &str, paths: &HashSet<String>) -> Vec<(usize, u32, DocMeta)> {
+        if self.base.is_some() {
+            return self
+                .visible_iter()
+                .filter(|(si, _, dm)| paths.contains(&dm.path) && self.shard(*si).is_some_and(|s| Self::repo_name(s, dm.repo_id) == repo))
+                .map(|(si, d, dm)| (si, d, dm.clone()))
+                .collect();
+        }
         let wanted: HashSet<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
         let mut seen: HashSet<&[u8]> = HashSet::new();
         let mut out = Vec::new();
@@ -225,12 +478,12 @@ impl ShardSet {
     /// Borrowed live-doc view: newest shard first, newest-wins on
     /// (repo, path), tombstoned docs excluded.
     pub fn visible_slice(&self) -> &[(usize, u32, DocMeta)] {
-        &self.cache().docs
+        &self.full().docs
     }
 
     /// Borrowed (shard_idx, docid) set of [`visible_slice`](Self::visible_slice).
     pub fn visible_set(&self) -> &HashSet<(usize, u32)> {
-        &self.cache().ids
+        &self.full().ids
     }
 
     /// Duplicate suppression: same (repo, path) — the newest shard wins;
@@ -282,21 +535,16 @@ impl ShardSet {
     /// Fan-out gram postings: one cursor per shard that contains the gram.
     /// Cursors are raw — filter with `is_tombstoned` when consuming.
     pub fn postings(&self, gram: &[u8]) -> Vec<(usize, PostingCursor<'_>)> {
-        self.shards
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.postings(gram).map(|c| (i, c)))
-            .collect()
+        self.each_shard().filter_map(|(i, s)| s.postings(gram).map(|c| (i, c))).collect()
     }
 
     /// Live (docid, positions) pairs for a gram across all shards,
     /// tombstoned and duplicate-suppressed docs excluded.
     pub fn posting_docs(&self, gram: &[u8]) -> Vec<(usize, u32, Vec<u32>)> {
-        let visible = self.visible_set();
         let mut out = Vec::new();
         for (si, mut cursor) in self.postings(gram) {
             while let Some((docid, positions)) = cursor.next_entry() {
-                if visible.contains(&(si, docid)) {
+                if self.is_live(si, docid) {
                     out.push((si, docid, positions));
                 }
             }
@@ -307,18 +555,17 @@ impl ShardSet {
     /// Summed posting payload bytes for `gram` over all shards (0 when no
     /// shard has it): a decode-free rarity estimate.
     pub fn posting_bytes(&self, gram: &[u8]) -> usize {
-        self.shards.iter().map(|s| s.posting_bytes(gram)).sum()
+        self.all_shards().map(|s| s.posting_bytes(gram)).sum()
     }
 
     /// Live doc refs for a gram across all shards, positions skipped (no
     /// per-posting allocation): what the query planner's candidate
     /// intersection needs. Sorted by (shard_idx, docid).
     pub fn posting_doc_ids(&self, gram: &[u8]) -> Vec<(usize, u32)> {
-        let visible = self.visible_set();
         let mut out = Vec::new();
         for (si, mut cursor) in self.postings(gram) {
             while let Some(docid) = cursor.next_docid() {
-                if visible.contains(&(si, docid)) {
+                if self.is_live(si, docid) {
                     out.push((si, docid));
                 }
             }
@@ -329,25 +576,16 @@ impl ShardSet {
     /// The (shard_idx, docid) set `visible_docs` yields, without the metas
     /// (an owned copy; prefer [`visible_set`](Self::visible_set)).
     pub fn visible_ids(&self) -> HashSet<(usize, u32)> {
-        self.cache().ids.clone()
+        self.full().ids.clone()
     }
 
     /// Fan-out: (shard_idx, docid, kind, line, scope). Tombstoned and
     /// duplicate-suppressed docs excluded.
     pub fn symbol_postings(&self, name: &str) -> Vec<(usize, u32, u8, u32, String)> {
-        self.symbol_postings_visible(name, self.visible_set())
-    }
-
-    /// `symbol_postings` against a precomputed visible set.
-    pub fn symbol_postings_visible(
-        &self,
-        name: &str,
-        visible: &HashSet<(usize, u32)>,
-    ) -> Vec<(usize, u32, u8, u32, String)> {
         let mut out = Vec::new();
-        for (si, shard) in self.shards.iter().enumerate() {
+        for (si, shard) in self.each_shard() {
             for (docid, k, line, scope) in shard.symbol_postings(name) {
-                if visible.contains(&(si, docid)) {
+                if self.is_live(si, docid) {
                     out.push((si, docid, k, line, scope));
                 }
             }
@@ -355,21 +593,12 @@ impl ShardSet {
         out
     }
 
-    /// Fan-out: (shard_idx, docid, caller, line).
+    /// Fan-out: (shard_idx, docid, caller, line), live docs only.
     pub fn call_postings(&self, callee: &str) -> Vec<(usize, u32, String, u32)> {
-        self.call_postings_visible(callee, self.visible_set())
-    }
-
-    /// `call_postings` against a precomputed visible set.
-    pub fn call_postings_visible(
-        &self,
-        callee: &str,
-        visible: &HashSet<(usize, u32)>,
-    ) -> Vec<(usize, u32, String, u32)> {
         let mut out = Vec::new();
-        for (si, shard) in self.shards.iter().enumerate() {
+        for (si, shard) in self.each_shard() {
             for (docid, caller, line) in shard.call_postings(callee) {
-                if visible.contains(&(si, docid)) {
+                if self.is_live(si, docid) {
                     out.push((si, docid, caller, line));
                 }
             }

@@ -2,7 +2,8 @@ name: release
 
 # A merge to main whose Cargo.toml version has no release yet gets one:
 #
-#   release   tag v<version> + GitHub release with generated notes (90 s cap)
+#   release   tag v<version> + GitHub release: the CHANGELOG.md section of
+#             the version, then generated notes (90 s cap)
 #   binaries  Linux x86_64/aarch64, Windows x86_64,
 #             each a .tar.gz/.zip with a .sha256, attached to the release
 #             (macOS legs removed 2026-09-22: 10x billing, Darwin binaries
@@ -71,7 +72,10 @@ jobs:
               echo "build=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            gh release create "$tag" --target "$GITHUB_SHA" --title "indexio $version" --generate-notes
+            # the CHANGELOG.md section of this version (A/B results and all),
+            # then the generated list of merged changes
+            bash tools/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"
+            gh release create "$tag" --target "$GITHUB_SHA" --title "indexio $version" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "released $tag"
           '

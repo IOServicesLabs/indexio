@@ -61,7 +61,7 @@ pub(crate) fn git_diff(repo_path: &Path, base: &str) -> anyhow::Result<String> {
 
 /// Post-change file provider for `impact_diff`: the working tree of the
 /// registered repo (None when unknown/unreadable → old-side mapping only).
-pub(crate) fn working_tree_provider(repo_path: Option<PathBuf>) -> impl Fn(&str) -> Option<Vec<u8>> {
+pub(crate) fn working_tree_provider(repo_path: Option<PathBuf>) -> impl Fn(&str) -> Option<Vec<u8>> + Sync {
     move |rel: &str| {
         let root = repo_path.as_ref()?;
         // Reject traversal outside the repo (diff text is untrusted input).

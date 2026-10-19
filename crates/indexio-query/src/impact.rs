@@ -14,12 +14,15 @@
 //!     reading whole files.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use serde::{Deserialize, Serialize};
 
 use indexio_symbols::{enclosing, outline as ts_outline, OutlineItem};
-use indexio_types::{DocMeta, Lang, SearchHit, SymbolKind};
+use indexio_types::{BlobId, DocMeta, Lang, SearchHit, SymbolKind};
 
 use crate::{content_line, snippet_line, sort_hits, DocRef, Engine, Filters, Literal, Query};
 
@@ -29,6 +32,9 @@ pub const MAX_SPAN_LINES: u32 = 400;
 const MAX_RANGE_LINES: u32 = 5_000;
 /// Direct call postings of a root judged for plausibility, as a multiple of
 /// `max_fanout` (hub names have thousands; the rest is sampled as before).
+/// Names a walk looks up side by side before taking their sites.
+const WALK_CHUNK: usize = 32;
+
 const PLAUSIBILITY_BUDGET: usize = 5;
 
 // ---------------------------------------------------------------------------
@@ -517,30 +523,36 @@ fn is_type_like(ident: &str) -> bool {
 }
 
 /// Per-walk decompressed-content cache: many sites land in the same file.
+/// A doc's meta, repo name and content, as one walk reads them.
+type WalkDoc = Arc<(DocMeta, String, Arc<Vec<u8>>)>;
+
+/// The docs one impact walk has read, shared by its parallel lookups.
 struct DocCache<'a> {
     engine: &'a Engine,
-    docs: HashMap<DocRef, Option<(DocMeta, String, Vec<u8>)>>,
+    docs: std::sync::Mutex<HashMap<DocRef, Option<WalkDoc>>>,
 }
 
 impl<'a> DocCache<'a> {
     fn new(engine: &'a Engine) -> Self {
         DocCache {
             engine,
-            docs: HashMap::new(),
+            docs: Default::default(),
         }
     }
 
-    fn get(&mut self, si: usize, docid: u32) -> Option<&(DocMeta, String, Vec<u8>)> {
+    fn get(&self, si: usize, docid: u32) -> Option<WalkDoc> {
+        if let Some(d) = self.docs.lock().expect("doc cache poisoned").get(&(si, docid)) {
+            return d.clone();
+        }
         let engine = self.engine;
-        self.docs
-            .entry((si, docid))
-            .or_insert_with(|| {
-                let dm = engine.set.doc(si, docid)?;
-                let content = engine.set.content(si, docid).ok()?;
-                let repo = engine.repo_name(si, &dm);
-                Some((dm, repo, content))
-            })
-            .as_ref()
+        let doc = (|| {
+            let dm = engine.set.doc(si, docid)?;
+            let content = engine.scan_content(si, docid)?;
+            let repo = engine.repo_name(si, &dm);
+            Some(Arc::new((dm, repo, content)))
+        })();
+        self.docs.lock().expect("doc cache poisoned").insert((si, docid), doc.clone());
+        doc
     }
 }
 
@@ -549,14 +561,15 @@ impl Engine {
     fn root_shapes(
         &self,
         roots: &[String],
-        cache: &mut DocCache<'_>,
+        cache: &DocCache<'_>,
     ) -> HashMap<String, RootShape> {
         let mut out = HashMap::new();
         for n in roots {
             let mut shape = RootShape::default();
             let mut any = false;
             for (si, docid, _kind, line, scope) in self.set.symbol_postings(n) {
-                let Some((dm, _, content)) = cache.get(si, docid) else { continue };
+                let Some(doc) = cache.get(si, docid) else { continue };
+                let (dm, _, content) = &*doc;
                 any = true;
                 let def_line = content_line(content, line);
                 shape.add_definition(n, &dm.path, dm.lang, &scope, &def_line);
@@ -610,11 +623,11 @@ impl Engine {
         exclude: &HashSet<(String, String)>,
         given: HashMap<String, RootShape>,
     ) -> (Vec<ImpactSite>, bool) {
-        let mut cache = DocCache::new(self);
+        let cache = DocCache::new(self);
         // shapes handed in (a diff knows exactly which definitions changed)
         // win over the every-definition-of-that-name view
         let missing: Vec<String> = roots.iter().filter(|r| !given.contains_key(*r)).cloned().collect();
-        let mut shapes = self.root_shapes(&missing, &mut cache);
+        let mut shapes = self.root_shapes(&missing, &cache);
         shapes.extend(given);
         let mut visited: HashSet<String> = roots.iter().cloned().collect();
         let mut frontier: Vec<String> = roots.to_vec();
@@ -624,59 +637,75 @@ impl Engine {
         'outer: while !frontier.is_empty() && depth < opts.depth {
             depth += 1;
             let mut next: Vec<String> = Vec::new();
-            for name in &frontier {
-                let mut postings = self.set.call_postings(name);
-                // Direct sites of a root: drop the ones whose qualifier
-                // says they are someone else's `name` (`tokio::spawn`,
-                // `cmd.spawn()` for a free fn), before the hub sampling.
-                if let Some(shape) = shapes.get(name).filter(|s| !s.unknown) {
-                    let budget = opts.max_fanout.saturating_mul(PLAUSIBILITY_BUDGET);
-                    if postings.len() > budget {
+            // each name's call sites, judged against its definitions, a chunk
+            // of names side by side (a 1,300-name diff looked them up one
+            // after another); the sites are then taken in frontier order, as
+            // before, and a full report stops before the next chunk
+            for chunk in frontier.chunks(WALK_CHUNK) {
+                let judged: Vec<(Vec<(usize, u32, String, u32)>, bool)> = chunk
+                    .par_iter()
+                    .map(|name| {
+                        let mut postings = self.set.call_postings(name);
+                        let mut cut = false;
+                        // Direct sites of a root: drop the ones whose qualifier
+                        // says they are someone else's `name` (`tokio::spawn`,
+                        // `cmd.spawn()` for a free fn), before the hub sampling.
+                        if let Some(shape) = shapes.get(name).filter(|s| !s.unknown) {
+                            let budget = opts.max_fanout.saturating_mul(PLAUSIBILITY_BUDGET);
+                            if postings.len() > budget {
+                                cut = true;
+                                postings.truncate(budget);
+                            }
+                            postings.retain(|(si, docid, _, line)| {
+                                cache.get(*si, *docid).is_some_and(|doc| {
+                                    let (dm, _, content) = &*doc;
+                                    shape.lang_plausible(dm.lang) && site_plausible(&content_line(content, *line), name, shape)
+                                })
+                            });
+                        }
+                        (postings, cut)
+                    })
+                    .collect();
+                for (name, (postings, cut)) in chunk.iter().zip(judged) {
+                    truncated |= cut;
+                    // Hub protection: over the per-symbol cap, sample the
+                    // posting list evenly (every k-th entry) instead of taking a
+                    // shard-order prefix, so every repo/file keeps representation.
+                    let stride = if postings.len() > opts.max_fanout {
                         truncated = true;
-                        postings.truncate(budget);
-                    }
-                    postings.retain(|(si, docid, _, line)| {
-                        cache.get(*si, *docid).is_some_and(|(dm, _, content)| {
-                            shape.lang_plausible(dm.lang) && site_plausible(&content_line(content, *line), name, shape)
-                        })
-                    });
-                }
-                // Hub protection: over the per-symbol cap, sample the
-                // posting list evenly (every k-th entry) instead of taking a
-                // shard-order prefix, so every repo/file keeps representation.
-                let stride = if postings.len() > opts.max_fanout {
-                    truncated = true;
-                    postings.len().div_ceil(opts.max_fanout)
-                } else {
-                    1
-                };
-                for (si, docid, caller, line) in
-                    postings.into_iter().step_by(stride).take(opts.max_fanout)
-                {
-                    if sites.len() >= opts.max_sites {
-                        truncated = true;
-                        break 'outer;
-                    }
-                    let Some((dm, repo, content)) = cache.get(si, docid) else {
-                        continue;
+                        postings.len().div_ceil(opts.max_fanout)
+                    } else {
+                        1
                     };
-                    // Excluded files (the diff's own files) are not reported
-                    // as sites, but their enclosing functions still propagate:
-                    // a caller inside a changed file has callers of its own.
-                    if !exclude.contains(&(repo.clone(), dm.path.clone())) {
-                        sites.push(ImpactSite {
-                            repo: repo.clone(),
-                            path: dm.path.clone(),
-                            line,
-                            lang: dm.lang,
-                            symbol: name.clone(),
-                            caller: caller.clone(),
-                            depth,
-                            snippet: snippet_line(content, line),
-                        });
-                    }
-                    if !caller.is_empty() && caller != *name && visited.insert(caller.clone()) {
-                        next.push(caller);
+                    for (si, docid, caller, line) in
+                        postings.into_iter().step_by(stride).take(opts.max_fanout)
+                    {
+                        if sites.len() >= opts.max_sites {
+                            truncated = true;
+                            break 'outer;
+                        }
+                        let Some(doc) = cache.get(si, docid) else {
+                            continue;
+                        };
+                        let (dm, repo, content) = &*doc;
+                        // Excluded files (the diff's own files) are not reported
+                        // as sites, but their enclosing functions still propagate:
+                        // a caller inside a changed file has callers of its own.
+                        if !exclude.contains(&(repo.clone(), dm.path.clone())) {
+                            sites.push(ImpactSite {
+                                repo: repo.clone(),
+                                path: dm.path.clone(),
+                                line,
+                                lang: dm.lang,
+                                symbol: name.clone(),
+                                caller: caller.clone(),
+                                depth,
+                                snippet: snippet_line(content, line),
+                            });
+                        }
+                        if !caller.is_empty() && caller != *name && visited.insert(caller.clone()) {
+                            next.push(caller);
+                        }
                     }
                 }
             }
@@ -693,6 +722,14 @@ impl Engine {
         let Some((key, pat)) = import_pattern(lang, path) else {
             return Vec::new();
         };
+        let mut hits = self.import_search(lang, key, pat, limit.saturating_add(1));
+        hits.retain(|h| !(h.repo == repo && h.path == path));
+        hits.truncate(limit);
+        hits
+    }
+
+    /// The ranked lexical search behind [`who_imports`](Self::who_imports).
+    fn import_search(&self, lang: Lang, key: String, pat: String, limit: usize) -> Vec<SearchHit> {
         let q = Query {
             literals: vec![Literal {
                 text: key.into_bytes(),
@@ -706,10 +743,7 @@ impl Engine {
                 path: None,
             },
         };
-        let mut hits = self.search(&q, limit.saturating_add(1)).hits;
-        hits.retain(|h| !(h.repo == repo && h.path == path));
-        hits.truncate(limit);
-        hits
+        self.search(&q, limit).hits
     }
 
     /// Definitions with ranges for one indexed file (SPEC-P6 §2.4).
@@ -718,29 +752,38 @@ impl Engine {
     }
 
     /// [`outline`](Self::outline) through the per-engine cache (SPEC-P9).
-    pub fn outline_cached(&self, repo: &str, path: &str) -> Option<std::sync::Arc<Vec<OutlineItem>>> {
-        const CAP: usize = 512;
+    pub fn outline_cached(&self, repo: &str, path: &str) -> Option<Arc<Vec<OutlineItem>>> {
         let (si, docid) = self.locate_doc(repo, path)?;
         let dm = self.set.doc(si, docid)?;
         let key = (dm.blob, dm.lang);
         if let Some(o) = self.outline_cache.lock().ok()?.get(&key) {
-            return Some(std::sync::Arc::clone(o));
+            return Some(o);
         }
         let content = self.set.content(si, docid).ok()?;
         let lower = dm.path.to_ascii_lowercase();
         let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdx");
-        let items = std::sync::Arc::new(if dm.lang == Lang::Text && is_markdown {
-            indexio_symbols::markdown_outline(&content)
-        } else {
-            ts_outline(dm.lang, &content)
-        });
-        if let Ok(mut cache) = self.outline_cache.lock() {
-            if cache.len() >= CAP {
-                cache.clear();
+        if dm.lang == Lang::Text && is_markdown {
+            let items = Arc::new(indexio_symbols::markdown_outline(&content));
+            if let Ok(mut cache) = self.outline_cache.lock() {
+                cache.put(key, Arc::clone(&items));
             }
-            cache.insert(key, std::sync::Arc::clone(&items));
+            return Some(items);
         }
-        Some(items)
+        Some(self.code_outline(dm.blob, dm.lang, &content))
+    }
+
+    /// The tree-sitter outline of `content` (whose blob id is `blob`)
+    /// through the shared outline cache.
+    fn code_outline(&self, blob: BlobId, lang: Lang, content: &[u8]) -> Arc<Vec<OutlineItem>> {
+        let key = (blob, lang);
+        if let Some(o) = self.outline_cache.lock().ok().and_then(|mut c| c.get(&key)) {
+            return o;
+        }
+        let items = Arc::new(ts_outline(lang, content));
+        if let Ok(mut cache) = self.outline_cache.lock() {
+            cache.put(key, Arc::clone(&items));
+        }
+        items
     }
 
     /// `(start, end)` of the innermost definition containing `line`
@@ -805,7 +848,7 @@ impl Engine {
         &self,
         repo: &str,
         changes: &[FileChange],
-        new_content: &dyn Fn(&str) -> Option<Vec<u8>>,
+        new_content: &(dyn Fn(&str) -> Option<Vec<u8>> + Sync),
     ) -> Vec<ChangedSymbol> {
         let mut acc: HashMap<(String, String, u8, String), Vec<u32>> = HashMap::new();
         let mut order: Vec<(String, String, u8, String)> = Vec::new();
@@ -828,25 +871,42 @@ impl Engine {
                 }
             }
         };
-        for c in changes {
-            let lang = Lang::from_path(&c.path);
-            if !lang.is_code() {
-                continue;
-            }
-            if !c.deleted && !c.new_ranges.is_empty() {
-                if let Some(content) = new_content(&c.path) {
-                    let items = ts_outline(lang, &content);
-                    note(&c.path, &items, &content, &c.new_ranges);
+        // Both sides of every file are parsed in parallel and through the
+        // content-keyed outline cache (a 158-file diff parsed 316 files one
+        // after another, 1.7 s, and again on every repeat call); the lines
+        // are then mapped in diff order, as before.
+        type Side = Option<(Arc<Vec<OutlineItem>>, Vec<u8>)>;
+        let sides: Vec<(Side, Side)> = changes
+            .par_iter()
+            .map(|c| {
+                let lang = Lang::from_path(&c.path);
+                if !lang.is_code() {
+                    return (None, None);
                 }
+                let new = if !c.deleted && !c.new_ranges.is_empty() {
+                    new_content(&c.path).map(|content| (self.code_outline(BlobId::from_content(&content), lang, &content), content))
+                } else {
+                    None
+                };
+                let old = if !c.added && !c.old_ranges.is_empty() {
+                    let old_path = c.old_path.as_deref().unwrap_or(&c.path);
+                    self.locate_doc(repo, old_path).and_then(|(si, docid)| {
+                        let blob = self.set.doc(si, docid)?.blob;
+                        let content = self.set.content(si, docid).ok()?;
+                        Some((self.code_outline(blob, lang, &content), content))
+                    })
+                } else {
+                    None
+                };
+                (new, old)
+            })
+            .collect();
+        for (c, (new, old)) in changes.iter().zip(&sides) {
+            if let Some((items, content)) = new {
+                note(&c.path, items, content, &c.new_ranges);
             }
-            if !c.added && !c.old_ranges.is_empty() {
-                let old_path = c.old_path.as_deref().unwrap_or(&c.path);
-                if let Some((si, docid)) = self.locate_doc(repo, old_path) {
-                    if let Ok(content) = self.set.content(si, docid) {
-                        let items = ts_outline(lang, &content);
-                        note(&c.path, &items, &content, &c.old_ranges);
-                    }
-                }
+            if let Some((items, content)) = old {
+                note(&c.path, items, content, &c.old_ranges);
             }
         }
         order
@@ -874,12 +934,13 @@ impl Engine {
         &self,
         repo: &str,
         diff: &str,
-        new_content: &dyn Fn(&str) -> Option<Vec<u8>>,
+        new_content: &(dyn Fn(&str) -> Option<Vec<u8>> + Sync),
         opts: &ImpactOptions,
     ) -> (Vec<ChangedSymbol>, ImpactReport) {
         let t0 = Instant::now();
         let changes = parse_unified_diff(diff);
         let changed = self.changed_symbols(repo, &changes, new_content);
+        let t_changed = t0.elapsed().as_millis() as u64;
         let exclude: HashSet<(String, String)> = changes
             .iter()
             .map(|c| (repo.to_string(), c.path.clone()))
@@ -901,13 +962,48 @@ impl Engine {
                 .add_definition(&c.name, &c.path, lang, &c.scope, &c.signature);
         }
         let (sites, truncated) = self.walk(&roots, opts, &exclude, given);
+        let t_walk = t0.elapsed().as_millis() as u64 - t_changed;
+        // one import search per distinct (language, module key), side by
+        // side: files sharing a key (every `crates/*/src/lib.rs` is `src`)
+        // share it, fetched `k` deeper for `k` files so each one's top 50
+        // without itself is exactly what its own search returned. 158 files
+        // searched one after another took 1 s. Merged in diff order.
+        const PER_FILE: usize = 50;
+        // an added file: nothing could import it yet
+        let keyed: Vec<Option<(Lang, String, String)>> = changes
+            .iter()
+            .map(|c| {
+                let lang = Lang::from_path(&c.path);
+                (!c.added).then(|| import_pattern(lang, &c.path).map(|(k, p)| (lang, k, p))).flatten()
+            })
+            .collect();
+        let mut shared: Vec<((Lang, String, String), usize)> = Vec::new();
+        for k in keyed.iter().flatten() {
+            match shared.iter_mut().find(|(s, _)| s == k) {
+                Some((_, n)) => *n += 1,
+                None => shared.push((k.clone(), 1)),
+            }
+        }
+        let _cached = crate::ScanCacheScope::new();
+        let results: Vec<Vec<SearchHit>> = shared
+            .par_iter()
+            .map(|((lang, key, pat), n)| self.import_search(*lang, key.clone(), pat.clone(), PER_FILE + n))
+            .collect();
+        let found: Vec<Vec<SearchHit>> = changes
+            .iter()
+            .zip(&keyed)
+            .map(|(c, k)| {
+                let Some(k) = k else { return Vec::new() };
+                let i = shared.iter().position(|(s, _)| s == k).expect("every key was searched");
+                let mut hits: Vec<SearchHit> = results[i].iter().filter(|h| !(h.repo == repo && h.path == c.path)).cloned().collect();
+                hits.truncate(PER_FILE);
+                hits
+            })
+            .collect();
         let mut importers: Vec<SearchHit> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for c in &changes {
-            if c.added {
-                continue; // nothing could import it yet
-            }
-            for h in self.who_imports(repo, &c.path, 50) {
+        for hits in found {
+            for h in hits {
                 let key = (h.repo.clone(), h.path.clone());
                 if !exclude.contains(&key) && seen.insert(key) {
                     importers.push(h);
@@ -918,6 +1014,8 @@ impl Engine {
         let mut report = finish_report(roots, Vec::new(), sites, truncated);
         report.importers = importers;
         report.took_ms = t0.elapsed().as_millis() as u64;
+        tracing::debug!(files = changes.len(), changed = changed.len(), changed_ms = t_changed, walk_ms = t_walk,
+            importers_ms = report.took_ms - t_changed - t_walk, "impact_diff");
         (changed, report)
     }
 

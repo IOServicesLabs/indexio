@@ -680,20 +680,42 @@ fn snippet_position(found: &[(f64, Vec<(u32, u32)>)]) -> Option<(u32, u32)> {
 /// rayon fan-out only pays off once decompress + scan dominates.
 const PAR_VERIFY_MIN: usize = 16;
 
-/// Postings below which a lookup maps them on the calling thread. A
-/// parallel map submits to the shared rayon pool, and a job injected from
-/// outside waits until the workers run out of the heavier queries' work: on
-/// a busy team server a 0.5 ms `find_symbol` waited 10-200 ms that way.
+/// Postings below which a lookup maps them on the calling thread while
+/// other requests are in flight. A parallel map submits to the shared rayon
+/// pool, and a job injected from outside waits until the workers run out of
+/// the heavier queries' work: on a busy team server a 0.5 ms `find_symbol`
+/// waited 10-200 ms that way. Alone, the pool is idle and splitting pays.
 const PAR_POSTINGS_MIN: usize = 64;
+
+/// Requests this process is answering right now (a team server's workers;
+/// a stdio session answers one at a time).
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one request in flight until dropped ([`begin_request`]).
+pub struct RequestGuard(());
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Mark a request as in flight for its lifetime: with several in flight,
+/// small parallel maps run on the calling thread instead.
+pub fn begin_request() -> RequestGuard {
+    IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RequestGuard(())
+}
 
 /// Summed posting bytes below which a query's gram lists are decoded on the
 /// calling thread (same reason; a rare identifier's lists are tiny).
 const PAR_GRAMS_MIN_BYTES: usize = 256 * 1024;
 
-/// `filter_map` over `items`, in parallel only from `min` items up (order
-/// kept either way).
+/// `filter_map` over `items` (order kept): in parallel, except below `min`
+/// items while other requests are in flight.
 fn maybe_par<T: Sync, R: Send>(items: &[T], min: usize, f: impl Fn(&T) -> Option<R> + Sync + Send) -> Vec<R> {
-    if items.len() < min {
+    let busy = IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) > 1;
+    if items.len() < 2 || (busy && items.len() < min) {
         items.iter().filter_map(f).collect()
     } else {
         items.par_iter().filter_map(f).collect()
@@ -702,6 +724,10 @@ fn maybe_par<T: Sync, R: Send>(items: &[T], min: usize, f: impl Fn(&T) -> Option
 
 /// Per-query state shared by every `verify_doc` call.
 struct VerifyCtx<'a> {
+    /// Literal indexes, rarest first: the order they are looked for in a
+    /// doc, so a candidate that lacks one fails before the common words of
+    /// the query are scanned (scores still add up in query order).
+    lit_order: &'a [usize],
     q: &'a Query,
     lit_df: &'a [Option<usize>],
     regex_dfs: &'a [usize],
@@ -728,7 +754,7 @@ pub struct Engine {
     /// by (blob, lang) rather than doc so it survives an engine reload
     /// (`inherit_caches`): a reload happens on every edit and every
     /// transcript import, and unchanged files keep their parse.
-    outline_cache: Arc<Mutex<HashMap<(BlobId, Lang), Arc<Vec<indexio_symbols::OutlineItem>>>>>,
+    outline_cache: Arc<Mutex<OutlineCache>>,
     /// Decompressed doc contents for snippet extraction (SPEC-P9): the
     /// semantic/BM25 legs and symbol lookups each pull one line out of up
     /// to 50 docs per call, and agents keep returning to the same files.
@@ -747,6 +773,27 @@ const CONTENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 static CONTENT_CACHE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(CONTENT_CACHE_BYTES);
 static CONTENT_CACHE_SCANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Searches running inside a [`ScanCacheScope`] (an impact report's import
+/// searches: a hundred of them verify mostly the same files).
+static SCAN_SCOPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// While alive, search verification reads through the content cache as if
+/// the process cached scans.
+pub(crate) struct ScanCacheScope(());
+
+impl ScanCacheScope {
+    pub(crate) fn new() -> Self {
+        SCAN_SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ScanCacheScope(())
+    }
+}
+
+impl Drop for ScanCacheScope {
+    fn drop(&mut self) {
+        SCAN_SCOPES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Size the decompressed-content cache of every engine of this process,
 /// and whether search verification goes through it too. A session's
@@ -796,6 +843,39 @@ impl ContentCache {
         if self.new.insert(blob, content).is_none() {
             self.bytes += n;
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.new.is_empty() && self.old.is_empty()
+    }
+}
+
+/// Parsed outlines per (blob, lang), in two generations of at most
+/// [`OUTLINE_CACHE_GEN`] entries each (like [`ContentCache`]: the old cache
+/// was cleared wholesale at 512, which one large diff's impact did).
+#[derive(Clone, Default)]
+struct OutlineCache {
+    new: HashMap<(BlobId, Lang), Arc<Vec<indexio_symbols::OutlineItem>>>,
+    old: HashMap<(BlobId, Lang), Arc<Vec<indexio_symbols::OutlineItem>>>,
+}
+
+const OUTLINE_CACHE_GEN: usize = 1024;
+
+impl OutlineCache {
+    fn get(&mut self, key: &(BlobId, Lang)) -> Option<Arc<Vec<indexio_symbols::OutlineItem>>> {
+        if let Some(o) = self.new.get(key) {
+            return Some(Arc::clone(o));
+        }
+        let o = self.old.remove(key)?;
+        self.put(*key, Arc::clone(&o));
+        Some(o)
+    }
+
+    fn put(&mut self, key: (BlobId, Lang), items: Arc<Vec<indexio_symbols::OutlineItem>>) {
+        if self.new.len() >= OUTLINE_CACHE_GEN {
+            self.old = std::mem::take(&mut self.new);
+        }
+        self.new.insert(key, items);
     }
 
     fn is_empty(&self) -> bool {
@@ -1246,7 +1326,22 @@ impl Engine {
                 }
             })
             .collect();
+        // rarity of each literal: its rarest gram's posting bytes (a
+        // literal too short for a gram goes last; it is found at once)
+        let mut lit_order: Vec<usize> = (0..q.literals.len()).collect();
+        if lit_order.len() > 1 {
+            let rarity: Vec<usize> = q
+                .literals
+                .iter()
+                .map(|lit| {
+                    let text = if lit.case_insensitive { lit.text.to_ascii_lowercase() } else { lit.text.clone() };
+                    text.windows(3).map(|g| self.set.posting_bytes(g)).min().unwrap_or(usize::MAX)
+                })
+                .collect();
+            lit_order.sort_by_key(|&i| rarity[i]);
+        }
         let ctx = VerifyCtx {
+            lit_order: &lit_order,
             q,
             lit_df: &lit_df,
             regex_dfs: &regex_dfs,
@@ -1255,14 +1350,29 @@ impl Engine {
             n,
             avgdl,
         };
+        let t_plan = t0.elapsed().as_micros() as u64;
+        // a few candidates verify on this thread; more go parallel unless
+        // other requests are in flight and they are still few
+        let seq = candidates.len() < PAR_VERIFY_MIN;
         let mut hits: Vec<SearchHit> = if per_doc <= 1 {
-            maybe_par(&candidates, PAR_VERIFY_MIN, |&(si, docid)| self.verify_doc(&ctx, si, docid))
+            let one = |&(si, docid): &DocRef| self.verify_doc(&ctx, si, docid);
+            if seq { candidates.iter().filter_map(one).collect() } else { maybe_par(&candidates, PAR_POSTINGS_MIN, one) }
         } else {
-            maybe_par(&candidates, PAR_VERIFY_MIN, |&(si, docid)| self.verify_doc_lines(&ctx, si, docid, per_doc))
-                .into_iter()
-                .flatten()
-                .collect()
+            let lines = |&(si, docid): &DocRef| self.verify_doc_lines(&ctx, si, docid, per_doc);
+            let per: Vec<Vec<SearchHit>> =
+                if seq { candidates.iter().filter_map(lines).collect() } else { maybe_par(&candidates, PAR_POSTINGS_MIN, lines) };
+            per.into_iter().flatten().collect()
         };
+        tracing::debug!(
+            literals = q.literals.len(),
+            regexes = q.regexes.len(),
+            candidates = candidates.len(),
+            pre_verify = pre_verify_count,
+            hits = hits.len(),
+            plan_us = t_plan,
+            verify_us = t0.elapsed().as_micros() as u64 - t_plan,
+            "lexical search"
+        );
 
         sort_hits(&mut hits);
         if hits.len() > limit {
@@ -1293,11 +1403,16 @@ impl Engine {
         // (df, matches) per constraint, for the snippet line choice below.
         let mut found: Vec<(f64, Vec<(u32, u32)>)> =
             Vec::with_capacity(c.q.literals.len() + c.regexes.len());
-        for (i, lit) in c.q.literals.iter().enumerate() {
+        let mut lit_matches: Vec<Vec<(u32, u32)>> = vec![Vec::new(); c.q.literals.len()];
+        for &i in c.lit_order {
+            let lit = &c.q.literals[i];
             let m = verify::find_literal(&content, &lit.text, lit.case_insensitive, MAX_HITS_PER_DOC);
             if m.is_empty() {
                 return None;
             }
+            lit_matches[i] = m;
+        }
+        for (i, m) in lit_matches.into_iter().enumerate() {
             let df = c.lit_df[i].unwrap_or(1).max(1) as f64;
             score += bm25(c.n, df, m.len() as f64, dm.raw_len as f64, c.avgdl);
             found.push((df, m));
@@ -1560,7 +1675,9 @@ impl Engine {
     /// A doc's content for search verification: through the cache when the
     /// process caches scans ([`set_content_cache`]), else decompressed.
     fn scan_content(&self, si: usize, docid: u32) -> Option<Arc<Vec<u8>>> {
-        if CONTENT_CACHE_SCANS.load(std::sync::atomic::Ordering::Relaxed) {
+        if CONTENT_CACHE_SCANS.load(std::sync::atomic::Ordering::Relaxed)
+            || SCAN_SCOPES.load(std::sync::atomic::Ordering::Relaxed) > 0
+        {
             self.cached_content(si, docid)
         } else {
             self.set.content(si, docid).ok().map(Arc::new)

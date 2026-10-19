@@ -44,6 +44,14 @@ const COLLAPSE_DIRECT_ABOVE: usize = 30;
 /// (up to [`MAX_DEFS_SHOWN`]) and other repos collapse to per-repo counts
 /// (SPEC-P9 §20: `main` had 305 definitions across 41 repos).
 const COLLAPSE_DEFS_ABOVE: usize = 12;
+/// Changed definitions an `impact_of_diff` lists with their lines; the
+/// rest are counted per file (a 158-file diff listed 935, 84 KB, a recap of
+/// the caller's own edit).
+const MAX_CHANGED_SHOWN: usize = 150;
+/// Importers listed; the rest are counted per repo.
+const MAX_IMPORTERS_SHOWN: usize = 40;
+/// Files named in a collapsed tail before `+N more files`.
+const MAX_TAIL_FILES: usize = 30;
 const MAX_DEFS_SHOWN: usize = 20;
 
 /// Direct-caller rows shown in full for one repo; the remaining files are
@@ -449,25 +457,61 @@ fn line_ranges(lines: &[u32]) -> String {
 pub fn impact(changed: Option<&[ChangedSymbol]>, r: &ImpactReport, current: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(changed) = changed {
-        let _ = writeln!(out, "changed definitions ({}):", changed.len());
+        // one row per file (the path once, not once per definition), the
+        // first MAX_CHANGED_SHOWN definitions with their lines
+        let mut files: Vec<(&str, Vec<&ChangedSymbol>)> = Vec::new();
         for c in changed {
-            let scope = if c.scope.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", c.scope)
-            };
+            match files.iter_mut().find(|(p, _)| *p == c.path) {
+                Some((_, v)) => v.push(c),
+                None => files.push((c.path.as_str(), vec![c])),
+            }
+        }
+        if files.len() > 1 {
+            let _ = writeln!(out, "changed definitions ({} in {} files):", changed.len(), files.len());
+        } else {
+            let _ = writeln!(out, "changed definitions ({}):", changed.len());
+        }
+        let mut shown = 0usize;
+        let mut tail: Vec<(&str, usize)> = Vec::new();
+        for (path, defs) in &files {
+            if shown >= MAX_CHANGED_SHOWN {
+                tail.push((path, defs.len()));
+                continue;
+            }
+            let take = defs.len().min(MAX_CHANGED_SHOWN - shown);
+            let items: Vec<String> = defs[..take]
+                .iter()
+                .map(|c| {
+                    let scope = if c.scope.is_empty() { String::new() } else { format!(" [{}]", c.scope) };
+                    format!("{} {}{} {}", c.kind.name(), c.name, scope, line_ranges(&c.lines))
+                })
+                .collect();
+            let more = if take < defs.len() { format!("; +{} more", defs.len() - take) } else { String::new() };
+            let _ = writeln!(out, "  {path}: {}{more}", items.join("; "));
+            shown += take;
+        }
+        if !tail.is_empty() {
+            let n: usize = tail.iter().map(|(_, k)| k).sum();
+            let named: Vec<String> = tail.iter().take(MAX_TAIL_FILES).map(|(p, k)| format!("{p} ({k})")).collect();
+            let rest = tail.len().saturating_sub(MAX_TAIL_FILES);
             let _ = writeln!(
                 out,
-                "  {} {} {}{} lines {}",
-                c.path,
-                c.kind.name(),
-                c.name,
-                scope,
-                line_ranges(&c.lines)
+                "  … {n} more in {} files: {}{}",
+                tail.len(),
+                named.join(", "),
+                if rest > 0 { format!(", +{rest} more files") } else { String::new() }
             );
         }
+        // the roots are the changed names: only the ones added to them
+        // (the types of changed constructors) are news
+        let names: BTreeSet<&str> = changed.iter().map(|c| c.name.as_str()).collect();
+        let extra: Vec<&str> = r.roots.iter().map(String::as_str).filter(|n| !names.contains(n)).collect();
+        if !extra.is_empty() {
+            let _ = writeln!(out, "roots also: {} (types of changed constructors)", extra.join(", "));
+        }
+    } else {
+        let _ = writeln!(out, "roots: {}", r.roots.join(", "));
     }
-    let _ = writeln!(out, "roots: {}", r.roots.join(", "));
     if !r.definitions.is_empty() {
         let _ = writeln!(out, "definitions ({}):", r.definitions.len());
         let (shown, rest): (Vec<&SearchHit>, Vec<&SearchHit>) = if r.definitions.len() <= COLLAPSE_DEFS_ABOVE {
@@ -617,8 +661,23 @@ pub fn impact(changed: Option<&[ChangedSymbol]>, r: &ImpactReport, current: Opti
     }
     if !r.importers.is_empty() {
         let _ = writeln!(out, "importers ({}):", r.importers.len());
-        for h in &r.importers {
+        for h in r.importers.iter().take(MAX_IMPORTERS_SHOWN) {
             let _ = writeln!(out, "  {}:{}:{} {}", h.repo, h.path, h.line, snippet(&h.snippet));
+        }
+        if r.importers.len() > MAX_IMPORTERS_SHOWN {
+            let mut by_repo: BTreeMap<&str, usize> = BTreeMap::new();
+            for h in &r.importers[MAX_IMPORTERS_SHOWN..] {
+                *by_repo.entry(h.repo.as_str()).or_insert(0) += 1;
+            }
+            let mut repos: Vec<(&str, usize)> = by_repo.into_iter().collect();
+            repos.sort_by_key(|(name, n)| (std::cmp::Reverse(*n), *name));
+            let list: Vec<String> = repos.iter().map(|(name, n)| format!("{name} {n}")).collect();
+            let _ = writeln!(
+                out,
+                "  … {} more (a smaller diff lists them): {}",
+                r.importers.len() - MAX_IMPORTERS_SHOWN,
+                list.join(", ")
+            );
         }
     }
     if r.truncated {

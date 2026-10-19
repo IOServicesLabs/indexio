@@ -965,14 +965,14 @@ impl WorktreeCache {
 
     /// Read the saved cache in once, when this one is still empty (a new
     /// process), and save it after a pass that changed it.
-    fn load_once(&mut self, data_dir: &Path, repo: &str) {
+    pub fn load_once(&mut self, data_dir: &Path, repo: &str) {
         if !self.loaded && self.files.is_empty() {
             *self = WorktreeCache::load(data_dir, repo);
         }
         self.loaded = true;
     }
 
-    fn save_if_dirty(&mut self, data_dir: &Path, repo: &str) {
+    pub fn save_if_dirty(&mut self, data_dir: &Path, repo: &str) {
         if self.dirty && self.save(data_dir, repo).is_ok() {
             self.dirty = false;
         }

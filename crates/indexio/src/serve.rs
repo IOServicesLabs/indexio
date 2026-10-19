@@ -518,9 +518,12 @@ impl AppState {
 /// (and fan out over rayon), and running them on the async workers stalled
 /// every other request, `/health` included, behind the slowest one.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, (StatusCode, Json<Value>)> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| internal_error(format!("request task failed: {e}")))
+    tokio::task::spawn_blocking(move || {
+        let _in_flight = indexio_query::begin_request();
+        f()
+    })
+    .await
+    .map_err(|e| internal_error(format!("request task failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +543,13 @@ struct TeamEngines {
     /// being opened (the upload's prebuild, a parallel tool call) waits for
     /// it instead of opening it again.
     building: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// User -> overlay stamp. Only this server writes overlays, so a stamp
+    /// stays valid until its upload or prune handler drops it; a request no
+    /// longer lists and stats the user's overlay files to learn nothing moved.
+    stamps: Mutex<HashMap<String, u64>>,
+    /// Bumped (before the drop) by every upload and prune: a stamp read
+    /// while one ran is not cached, so an old one cannot outlive the drop.
+    stamp_gen: AtomicU64,
     /// Origin URL -> repo name, with the time it was read.
     remotes: Mutex<Option<(Instant, HashMap<String, String>)>>,
 }
@@ -564,7 +574,7 @@ fn view(state: &AppState, user: Option<&str>, allow: Option<&[String]>) -> Resul
 /// [`view`] and the repo of the user's most recently updated overlay.
 fn view_latest(state: &AppState, user: Option<&str>, allow: Option<&[String]>) -> Result<(Arc<Engine>, Option<String>), (StatusCode, Json<Value>)> {
     let allow = allow.filter(|a| !a.iter().any(|p| p == "*"));
-    let stamp = user.map_or(0, |u| indexio_ingest::team::user_stamp(&state.data_dir, u));
+    let stamp = user.map_or(0, |u| user_stamp(state, u));
     if stamp == 0 && allow.is_none() {
         return Ok((state.base(), None));
     }
@@ -609,6 +619,20 @@ fn view_latest(state: &AppState, user: Option<&str>, allow: Option<&[String]>) -
     }
     map.insert(key, TeamEntry { stamp, base_gen: gen, used: Instant::now(), engine: Arc::clone(&engine), latest: latest.clone() });
     Ok((engine, latest))
+}
+
+/// `user`'s overlay stamp, from memory when nothing changed it since.
+fn user_stamp(state: &AppState, user: &str) -> u64 {
+    if let Some(s) = state.team.stamps.lock().expect("stamps poisoned").get(user) {
+        return *s;
+    }
+    let gen = state.team.stamp_gen.load(Ordering::Acquire);
+    let s = indexio_ingest::team::user_stamp(&state.data_dir, user);
+    let mut stamps = state.team.stamps.lock().expect("stamps poisoned");
+    if state.team.stamp_gen.load(Ordering::Acquire) == gen {
+        stamps.insert(user.to_string(), s);
+    }
+    s
 }
 
 fn user_of(u: &Option<Extension<TeamUser>>) -> Option<&str> {
@@ -671,6 +695,8 @@ async fn team_worktree(
             // the hook posts right before the user's tool call: open their
             // new view now, off this response, so that call finds it ready
             if !r.unchanged {
+                state.team.stamp_gen.fetch_add(1, Ordering::AcqRel);
+                state.team.stamps.lock().expect("stamps poisoned").remove(&user);
                 tokio::task::spawn_blocking(move || {
                     let allow = acl.as_ref().map(|Extension(a)| a.0.as_slice());
                     let _ = view(&state, Some(&user), allow);
@@ -1316,11 +1342,16 @@ pub async fn run_server(
     };
     // stale team overlays go after INDEXIO_TEAM_TTL_DAYS without an update
     let dd = Arc::clone(&state.data_dir);
+    let team = Arc::clone(&state.team);
     tokio::spawn(async move {
         let ttl = team_ttl();
         loop {
             let d = Arc::clone(&dd);
-            let _ = tokio::task::spawn_blocking(move || indexio_ingest::team::prune_overlays(&d, ttl)).await;
+            let removed = tokio::task::spawn_blocking(move || indexio_ingest::team::prune_overlays(&d, ttl)).await.unwrap_or(0);
+            if removed > 0 {
+                team.stamp_gen.fetch_add(1, Ordering::AcqRel);
+                team.stamps.lock().expect("stamps poisoned").clear();
+            }
             tokio::time::sleep(Duration::from_secs(600)).await;
         }
     });

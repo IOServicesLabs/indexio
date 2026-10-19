@@ -25,7 +25,9 @@ use indexio_query::Engine;
 /// of the indexio call.
 const RAW: &str = " (You already saw this: if the shell is really needed, add `# raw` to the command.)";
 
-/// Registered repos as (name, canonical root).
+/// Registered repos as (name, root as registered). [`locate`] matches
+/// against these first and canonicalizes them only when that fails:
+/// canonicalizing all ~50 roots cost every hook call a few milliseconds.
 fn repos(data_dir: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for name in indexio_ingest::sources::registered_repo_names(data_dir).unwrap_or_default() {
@@ -33,11 +35,20 @@ fn repos(data_dir: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         if let Ok(st) = indexio_ingest::repo_state(data_dir, &name) {
-            let root = st.path.canonicalize().unwrap_or(st.path.clone());
-            out.push((name, root));
+            out.push((name, st.path));
         }
     }
     out
+}
+
+/// A canonical path without the Windows verbatim prefix (`\\?\C:\..`
+/// -> `C:\..`), comparable with a root as it was registered.
+fn plain(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => p.to_path_buf(),
+    }
 }
 
 /// Whether the index holds `rel`'s CONTENTS as the file itself: a name-only
@@ -45,26 +56,48 @@ fn repos(data_dir: &Path) -> Vec<(String, PathBuf)> {
 /// layer stand in for the file, and the file itself is what a Read or a
 /// `cat` of it should get.
 fn contents_indexed(engine: &Engine, repo: &str, rel: &str) -> bool {
-    engine.outline(repo, rel).is_some()
-        && !engine.read_span(repo, rel, 1, 1).is_some_and(|(body, _)| {
-            body.contains(indexio_ingest::NAME_ONLY_MARKER) || body.contains(indexio_ingest::PDF_TEXT_MARKER)
-        })
+    // one scoped lookup: a hook opens a fresh engine per call, and building
+    // the whole (repo, path) map plus an outline parse to answer this took
+    // ~30 ms of a deny
+    let set = engine.shard_set();
+    let one: std::collections::HashSet<String> = [rel.to_string()].into_iter().collect();
+    let Some((si, docid, _)) = set.visible_at(repo, &one).into_iter().next() else {
+        return false;
+    };
+    let Ok(content) = set.content(si, docid) else {
+        return true;
+    };
+    let first = content.split(|&b| b == b'\n').next().unwrap_or_default();
+    let first = String::from_utf8_lossy(first.strip_suffix(b"\r").unwrap_or(first));
+    !(first.contains(indexio_ingest::NAME_ONLY_MARKER) || first.contains(indexio_ingest::PDF_TEXT_MARKER))
 }
 
 /// (repo, repo-relative path with '/') for an absolute path inside a repo.
 fn locate(repos: &[(String, PathBuf)], abs: &Path) -> Option<(String, String)> {
-    let abs = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
-    let mut best: Option<(usize, String, String)> = None;
-    for (name, root) in repos {
-        if let Ok(rel) = abs.strip_prefix(root) {
-            let depth = root.components().count();
-            if best.as_ref().is_none_or(|(d, _, _)| depth > *d) {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                best = Some((depth, name.clone(), rel));
+    let canonical = abs.canonicalize().ok();
+    let exists = canonical.is_some();
+    let abs = canonical.unwrap_or_else(|| abs.to_path_buf());
+    let deepest = |roots: &mut dyn Iterator<Item = (&String, PathBuf)>, abs: &Path| {
+        let mut best: Option<(usize, String, String)> = None;
+        for (name, root) in roots {
+            if let Ok(rel) = abs.strip_prefix(&root) {
+                let depth = root.components().count();
+                if best.as_ref().is_none_or(|(d, _, _)| depth > *d) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    best = Some((depth, name.clone(), rel));
+                }
             }
         }
-    }
-    best.map(|(_, n, r)| (n, r))
+        best.map(|(_, n, r)| (n, r))
+    };
+    // an existing path against the registered roots as they are (no
+    // syscalls), then against the canonicalized roots (a root reached
+    // through a link or spelled otherwise), which is all a path that does
+    // not exist is compared with
+    exists
+        .then(|| deepest(&mut repos.iter().map(|(n, r)| (n, r.clone())), &plain(&abs)))
+        .flatten()
+        .or_else(|| deepest(&mut repos.iter().map(|(n, r)| (n, r.canonicalize().unwrap_or_else(|_| r.clone()))), &abs))
 }
 
 /// Split a command line into pipelines on `&&`, `||`, `;`, then each
@@ -398,10 +431,39 @@ fn is_outline_pattern(ere: &str) -> bool {
 /// cache it is a stat pass when nothing changed (without one, every hook
 /// call re-read and re-hashed the whole tree). Errors are ignored.
 fn freshen(data_dir: &Path, repo: &str) {
+    freshen_paths(data_dir, repo, None);
+}
+
+/// [`freshen`] for a read of known files: only those are stat'ed (and
+/// re-indexed when they changed), with the whole-tree pass as the fallback
+/// for a file the saved cache does not list. The denied read is what the
+/// suggested call will ask for; the session's own repo is refreshed by its
+/// server before every call anyway. A whole-repo pass cost 25-45 ms a deny.
+fn freshen_file(data_dir: &Path, repo: &str, rel: &str) {
+    freshen_paths(data_dir, repo, Some(rel));
+}
+
+fn freshen_paths(data_dir: &Path, repo: &str, rel: Option<&str>) {
+    let t0 = std::time::Instant::now();
+    if let (Some(rel), Ok(cas)) = (rel, indexio_ingest::Cas::open(&data_dir.join("cas"))) {
+        let mut cache = indexio_ingest::WorktreeCache::default();
+        cache.load_once(data_dir, repo);
+        let one: std::collections::HashSet<String> = [rel.to_string()].into_iter().collect();
+        if let Ok(Some(_)) = indexio_ingest::reindex_worktree_paths(repo, data_dir, &cas, &mut cache, &one) {
+            cache.save_if_dirty(data_dir, repo);
+            if std::env::var_os("INDEXIO_HOOK_DEBUG").is_some() {
+                eprintln!("hook: freshen {repo}:{rel} ({} us)", t0.elapsed().as_micros());
+            }
+            return;
+        }
+    }
     if let Ok(cas) = indexio_ingest::Cas::open(&data_dir.join("cas")) {
         // the saved cache is loaded, and saved again when the pass changed it
         let mut cache = indexio_ingest::WorktreeCache::default();
         let _ = indexio_ingest::reindex_worktree_cached(repo, data_dir, &cas, Some(&mut cache));
+    }
+    if std::env::var_os("INDEXIO_HOOK_DEBUG").is_some() {
+        eprintln!("hook: freshen {repo} ({} us)", t0.elapsed().as_micros());
     }
 }
 
@@ -548,10 +610,11 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
     if split(command).iter().any(|p| is_other_work(p)) {
         return None;
     }
+    let t0 = std::time::Instant::now();
     let repos = repos(data_dir);
     let debug = std::env::var_os("INDEXIO_HOOK_DEBUG").is_some();
     if debug {
-        eprintln!("hook: cwd={} repos={} cmd={command:?}", cwd.display(), repos.len());
+        eprintln!("hook: cwd={} repos={} cmd={command:?} ({} us)", cwd.display(), repos.len(), t0.elapsed().as_micros());
     }
     if repos.is_empty() {
         return None;
@@ -615,11 +678,17 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                         continue;
                     }
                     let Some((repo, rel)) = locate(&repos, &abs) else { continue };
+                    if debug {
+                        eprintln!("hook: located ({} us)", t0.elapsed().as_micros());
+                    }
                     if !indexed(&repo, &rel) {
                         if debug {
                             eprintln!("hook: {repo}:{rel} not indexed");
                         }
                         continue;
+                    }
+                    if debug {
+                        eprintln!("hook: indexed checked ({} us)", t0.elapsed().as_micros());
                     }
                     let range = if cmd == "sed" {
                         sed_range(args)
@@ -641,7 +710,7 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                             "mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need"
                         ),
                     };
-                    freshen(data_dir, &repo);
+                    freshen_file(data_dir, &repo, &rel);
                     return Some(format!("{a} is indexed: use {call} instead (numbered, fresh)"));
                 }
             }
@@ -741,7 +810,7 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                 if !indexed(&repo, &rel) {
                     continue;
                 }
-                freshen(data_dir, &repo);
+                freshen_file(data_dir, &repo, &rel);
                 let call = match needle {
                     Some(n) => format!(
                         "mcp__indexio__code_grep {{pattern:\"{}\", repo:\"{repo}\", path:\"{rel}\"}} then read_span {{repo, path, start:line, end:line+60}}",
@@ -928,7 +997,7 @@ pub fn read_verdict(data_dir: &Path, file_path: &str, offset: Option<u64>, limit
     if !contents_indexed(&engine, &repo, &rel) {
         return None;
     }
-    freshen(data_dir, &repo);
+    freshen_file(data_dir, &repo, &rel);
     let name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
     Some(match (offset, limit) {
         (Some(start), Some(n)) if n > 0 => format!(

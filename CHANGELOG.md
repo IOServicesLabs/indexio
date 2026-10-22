@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.1.10
+
+Hooks that follow how agents actually read files, a PowerShell hook, Claude Code
+memory notes in `recall`, fewer repeated answers, and compaction that no longer
+rewrites the whole index. 30 changes, every one A/B tested against 0.1.9 on a
+copy of a real 49-repo, 12k-file index by replaying real calls from two weeks of
+Claude Code sessions.
+
+### A/B results
+
+Measured on Windows 11, 32 cores. "Before" is 0.1.9.
+
+| Case | 0.1.9 | 0.1.10 |
+|---|---|---|
+| Greps with 5+ alternatives (1,972 real calls) | some files dropped | 82 calls gain lines, 0 lose any |
+| Hook that cannot decide in time | waits for the 10.7 s timeout | allows after 3 s |
+| Time to deny a read | 40.8 ms median | 17.8 ms median |
+| PowerShell reads of indexed files | not hooked | routed to indexio (108 denies over 2,065 calls, 394.6k chars) |
+| Identical `read_span` answers repeated in a session | sent in full | one line; -10.3% `read_span` output |
+| Repeated `code_grep` / `code_search` / `file_outline` answers | sent in full | -5.9% / -12.3% / -15.1% output |
+| Reads of an agent worktree's identical copy | not hooked | routed to indexio (0.93M of 1.75M chars) |
+| Failed calls from real sessions (55) | 39 answered | 45 answered, 0 broken |
+| Grep across all repos (`fn locate`) | 17.4 ms | 9.7 ms |
+| Shard compaction while shards are being written | 28-30 s, ~2.5 GB | 13-25 ms, 220 MB or less |
+| `indexio compact` of 48 shards | 32.0 s | 0.9 s |
+| Vector compaction of 13 segments | 11.2 s, 2.8 GB | 0.8 s, 101 MB |
+| Hybrid answers after vector compaction (vs before it) | 83% identical | 100% identical |
+
+1,500 real hook calls and 1,520 real search calls return the same verdicts and
+answers as 0.1.9 wherever a change was not meant to alter them.
+
+### Hooks
+
+- New PreToolUse hook for PowerShell: `Get-Content`, `Select-String`,
+  `Get-ChildItem | Select-String`, `-Tail N`, and `$c = Get-Content f` followed
+  by line ranges or loops get the same treatment as the Bash hook. Run
+  `indexio hook install` again to add it.
+- A hook gives a verdict within 3 s or allows the call.
+- The re-index after a deny runs in a detached process, and is skipped for the
+  session's own repo (the server already watches it).
+- Reads of 60 lines or less go through, whether a Read range, `sed -n`,
+  `head`, `tail`, `Get-Content`, or a whole file that short.
+- Sending a denied call again unchanged lets it through.
+- Byte views and counts (`cat -A`, `head -c`, `tail -f`, `| wc`,
+  `| uniq -c`), `grep -c/-l/-L/-q/-o` and Python byte-analysis one-liners are
+  no longer denied.
+- `tail -n N` and multi-range `sed -n 'A,Bp;C,Dp'` are answered with exact
+  `read_span` ranges instead of a whole-file outline.
+- A read of a file in `.claude/worktrees/<wt>/` that is byte-identical to the
+  indexed file is redirected to it; an edited copy is left alone.
+
+### Search and lookups
+
+- Regex prefilters keep every alternation branch (5+ branches lost files).
+- `(?i)` regexes use the trigram index instead of a brute-force scan.
+- Lookaround regexes return a superset with a note instead of an error.
+- `code_grep` and lexical `code_search` leave session transcripts out of the
+  search itself unless asked for (`repo:sessions`).
+- File tools without `repo` use the session repo when it has the path, else
+  the one repo that does; `repo` plus a path that starts with the repo folder
+  name resolves.
+- `code_search` accepts `code_grep`'s `pattern`, `repo` and `path`.
+- An answer identical to one the session got in the last 20 minutes from
+  `read_span`, `code_grep`, `code_search` or `file_outline` (400+ chars) comes
+  back as one line. Sending it again returns the text; a compaction or
+  `/clear` resets this.
+- `read_span`, `code_grep`, `file_outline`, `code_search`, `recall` and
+  `list_files` are marked always-load, so Claude Code skips a ToolSearch round
+  trip before using them.
+
+### Sources
+
+- Claude Code memory notes (`~/.claude/projects/*/memory/`) are indexed with
+  the transcripts; `recall` searches them, this project's notes first.
+- A session whose unregistered checkout sits beside three or more registered
+  repos adds it (git or a plain project folder up to 20,000 files, never a
+  folder of repos). Opt out with `INDEXIO_NO_AUTO_ADD` or
+  `<data_dir>/auto-add-skip`.
+- A repo with no commit yet is indexed from its working tree.
+- Config files opened by name are indexed: `Caddyfile`, `Dockerfile.*`,
+  `.gitignore`, `.dockerignore`, `*.example`, `*.inf`, `*.patch` and similar.
+  Secret files are still skipped.
+
+### Compaction
+
+- Shard compaction merges the cheapest run of adjacent shards instead of
+  always the oldest, so the big base shard is not rewritten for every few
+  small deltas. Once tombstones pass 30% the oldest run is merged, which drops
+  dead docs.
+- Vector compaction merges only the small segments when that is enough and
+  carries the large one over untouched.
+
 ## 0.1.9
 
 Faster freshness, a self-healing semantic plane, a team server built for many

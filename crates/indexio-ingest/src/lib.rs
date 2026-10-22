@@ -79,6 +79,11 @@ pub struct RepoState {
     /// process deltas the folder the same way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pdf_text: bool,
+    /// Plain folders: only files under a folder of one of these names are
+    /// indexed (the Claude Code `memory` source: `projects/*/memory/**`, not
+    /// the transcripts and tool output beside it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub within: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -410,6 +415,26 @@ pub fn index_repo(
         }
         Err(e) => return Err(e).with_context(|| format!("opening {}", repo_path.display())),
     };
+    // a fresh `git init` with no commit yet: there is no tree, only the
+    // working tree (a 1,667-file project failed to index, and its sessions
+    // fell back to the shell)
+    if is_unborn(&repo) {
+        save_state(
+            data_dir,
+            &RepoState {
+                name: name.to_string(),
+                path: repo_path.to_path_buf(),
+                last_commit: None,
+                indexed_at: iso_now(),
+                plain: false,
+                worktree: true,
+                skip: Vec::new(),
+                pdf_text: false,
+                within: Vec::new(),
+            },
+        )?;
+        return reindex_worktree(name, data_dir, cas);
+    }
     let (commit, tree_id) = head(&repo)?;
     let files = tree_files(&repo, tree_id)?;
     let contents = read_all(&repo, files)?;
@@ -442,9 +467,25 @@ pub fn index_repo(
             worktree: false,
             skip: Vec::new(),
             pdf_text: false,
+            within: Vec::new(),
         },
     )?;
     Ok(report)
+}
+
+impl RepoState {
+    /// Indexed from the filesystem rather than git: a plain folder, or a
+    /// `within` folder (stored with `plain: false` so that binaries without
+    /// the `within` rule take it for a git repo they cannot open and leave
+    /// it alone, instead of indexing the whole tree around the notes).
+    pub fn is_plain(&self) -> bool {
+        self.plain || !self.within.is_empty()
+    }
+}
+
+/// Whether HEAD names a branch with no commit yet (a fresh `git init`).
+fn is_unborn(repo: &gix::Repository) -> bool {
+    repo.head().is_ok_and(|h| h.is_unborn())
 }
 
 // ---------------------------------------------------------------------------
@@ -725,9 +766,10 @@ fn plain_bytes(root: &Path, rel: &str, pdf_text: bool) -> Option<Vec<u8>> {
 /// Read the indexable files of a plain tree: (relative path, content), the
 /// content being the file, its PDF text or its name-only entry (binary
 /// detection happens in `extract_docs`).
-fn read_plain_tree(root: &Path, skip: &[String], pdf_text: bool) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+fn read_plain_tree(root: &Path, skip: &[String], pdf_text: bool, within: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     Ok(walk_plain_tree_skipping(root, skip)?
         .into_iter()
+        .filter(|rel| is_within(rel, within))
         .filter_map(|rel| plain_bytes(root, &rel, pdf_text).map(|c| (rel, c)))
         .collect())
 }
@@ -736,9 +778,15 @@ fn read_plain_tree(root: &Path, skip: &[String], pdf_text: bool) -> anyhow::Resu
 /// [`WorktreeCache`] so a file whose mtime and length are unchanged since
 /// the last pass is only stat'ed (SPEC-P10: the `sessions` folder and
 /// plain-folder repos were re-read and re-hashed whole on every refresh).
-fn read_plain_tree_cached(root: &Path, skip: &[String], pdf_text: bool, mut cache: Option<&mut WorktreeCache>) -> anyhow::Result<Vec<WtFile>> {
+fn read_plain_tree_cached(
+    root: &Path,
+    skip: &[String],
+    pdf_text: bool,
+    within: &[String],
+    mut cache: Option<&mut WorktreeCache>,
+) -> anyhow::Result<Vec<WtFile>> {
     let mut files = Vec::new();
-    for rel in walk_plain_tree_skipping(root, skip)? {
+    for rel in walk_plain_tree_skipping(root, skip)?.into_iter().filter(|rel| is_within(rel, within)) {
         let path = root.join(&rel);
         let Ok(meta) = fs::metadata(&path) else { continue };
         if !meta.is_file() {
@@ -782,6 +830,12 @@ fn read_plain_tree_cached(root: &Path, skip: &[String], pdf_text: bool, mut cach
     Ok(files)
 }
 
+/// Whether `rel` lies under a folder named one of `within` (always, when
+/// `within` is empty).
+fn is_within(rel: &str, within: &[String]) -> bool {
+    within.is_empty() || rel.split('/').rev().skip(1).any(|dir| within.iter().any(|w| w.eq_ignore_ascii_case(dir)))
+}
+
 /// Index a plain directory (no git) as repo `name`. Files are read from the
 /// filesystem; the state records `plain: true` and no commit.
 pub fn index_dir(
@@ -791,6 +845,12 @@ pub fn index_dir(
     cas: &Cas,
 ) -> anyhow::Result<IndexReport> {
     index_dir_skipping(dir, name, data_dir, cas, Vec::new(), false)
+}
+
+/// [`index_dir`] of only the files under folders named one of `within`
+/// (remembered in the repo state for every later delta).
+pub fn index_dir_within(dir: &Path, name: &str, data_dir: &Path, cas: &Cas, within: Vec<String>) -> anyhow::Result<IndexReport> {
+    index_dir_inner(dir, name, data_dir, cas, Vec::new(), false, within)
 }
 
 /// The folders a plain folder at `root` leaves out: its own `skip` list
@@ -848,6 +908,18 @@ pub fn index_dir_skipping(
     skip: Vec<String>,
     pdf_text: bool,
 ) -> anyhow::Result<IndexReport> {
+    index_dir_inner(dir, name, data_dir, cas, skip, pdf_text, Vec::new())
+}
+
+fn index_dir_inner(
+    dir: &Path,
+    name: &str,
+    data_dir: &Path,
+    cas: &Cas,
+    skip: Vec<String>,
+    pdf_text: bool,
+    within: Vec<String>,
+) -> anyhow::Result<IndexReport> {
     let t0 = Instant::now();
     if state_path(data_dir, name).exists() {
         bail!("repo '{name}' is already registered; use reindex_repo");
@@ -856,7 +928,7 @@ pub fn index_dir_skipping(
     let shards_dir = data_dir.join("shards");
     fs::create_dir_all(&shards_dir)?;
     fs::create_dir_all(repos_dir(data_dir))?;
-    let contents = read_plain_tree(dir, &plain_skips(data_dir, dir, name, &skip), pdf_text)?;
+    let contents = read_plain_tree(dir, &plain_skips(data_dir, dir, name, &skip), pdf_text, &within)?;
     let docs = extract_docs(contents, cas);
     let cas_hits = docs.iter().filter(|d| d.cas_hit).count() as u64;
     let docs_added = docs.len() as u64;
@@ -869,10 +941,11 @@ pub fn index_dir_skipping(
             path: dir.to_path_buf(),
             last_commit: None,
             indexed_at: iso_now(),
-            plain: true,
+            plain: within.is_empty(),
             worktree: false,
             skip,
             pdf_text,
+            within,
         },
     )?;
     Ok(IndexReport {
@@ -899,7 +972,7 @@ fn reindex_dir(
     cache: Option<&mut WorktreeCache>,
 ) -> anyhow::Result<IndexReport> {
     let skip = plain_skips(data_dir, &state.path, &state.name, &state.skip);
-    let current = read_plain_tree_cached(&state.path, &skip, state.pdf_text, cache)?;
+    let current = read_plain_tree_cached(&state.path, &skip, state.pdf_text, &state.within, cache)?;
     let next = RepoState {
         indexed_at: iso_now(),
         ..state.clone()
@@ -1115,7 +1188,7 @@ fn delta_by_content_in(
                 // unchanged on disk but its doc is gone (a HEAD sync from
                 // another process tombstoned it): read it after all — a
                 // plain folder's way, so a document gets its name-only entry
-                let reread = if state.plain { plain_bytes(&state.path, &rel, state.pdf_text) } else { fs::read(state.path.join(&rel)).ok() };
+                let reread = if state.is_plain() { plain_bytes(&state.path, &rel, state.pdf_text) } else { fs::read(state.path.join(&rel)).ok() };
                 match reread {
                     Some(c) => c,
                     None => continue,
@@ -1149,8 +1222,13 @@ fn delta_by_content_in(
         // A doc this binary's walker does not recognise (a file type a
         // newer binary indexed) is not a deleted file: leave it to the
         // binary that knows it, or two versions serving one data dir
-        // add and tombstone the same docs in turns.
-        if !Lang::is_secret_path(old_path) && Lang::from_path(old_path) == Lang::Unknown && state.path.join(old_path).is_file() {
+        // add and tombstone the same docs in turns. Outside `within` it is
+        // never wanted, whatever its type.
+        if !Lang::is_secret_path(old_path)
+            && is_within(old_path, &state.within)
+            && Lang::from_path(old_path) == Lang::Unknown
+            && state.path.join(old_path).is_file()
+        {
             continue;
         }
         doomed.insert((*old_path).to_string());
@@ -1210,7 +1288,7 @@ fn delta_by_content_in(
 /// cases a background sync should leave alone.
 pub fn head_moved(data_dir: &Path, name: &str) -> bool {
     let Ok(state) = load_state(data_dir, name) else { return false };
-    if state.plain || state.worktree {
+    if state.is_plain() || state.worktree {
         return false;
     }
     let Ok(repo) = gix::open(&state.path) else { return false };
@@ -1454,7 +1532,7 @@ fn reindex_worktree_inner(
 ) -> anyhow::Result<IndexReport> {
     let state = load_state(data_dir, name)
         .map_err(|e| anyhow!("repo '{name}' is not registered (run index_repo first): {e}"))?;
-    if state.plain {
+    if state.is_plain() {
         return reindex_dir(&state, data_dir, cas, cache);
     }
     let current = read_worktree(&state.path, cache)?;
@@ -1487,7 +1565,7 @@ pub fn reindex_worktree_paths(
     }
     let state = load_state(data_dir, name)
         .map_err(|e| anyhow!("repo '{name}' is not registered (run index_repo first): {e}"))?;
-    if state.plain {
+    if state.is_plain() {
         return Ok(None);
     }
     let mut current: Vec<WtFile> = Vec::new();
@@ -1566,13 +1644,16 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
     let t0 = Instant::now();
     let state = load_state(data_dir, name)
         .map_err(|e| anyhow!("repo '{name}' is not registered (run index_repo first): {e}"))?;
-    if state.plain {
+    if state.is_plain() {
         return reindex_dir(&state, data_dir, cas, None);
     }
     let shards_dir = data_dir.join("shards");
     fs::create_dir_all(&shards_dir)?;
 
     let repo = gix::open(&state.path).with_context(|| format!("opening {}", state.path.display()))?;
+    if is_unborn(&repo) {
+        return reindex_worktree(name, data_dir, cas); // still no commit
+    }
     let (commit, tree_id) = head(&repo)?;
     let head_files = tree_files(&repo, tree_id)?;
     if state.worktree {
@@ -1712,6 +1793,7 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
             worktree: false,
             skip: Vec::new(),
             pdf_text: false,
+            within: Vec::new(),
         },
     )?;
     Ok(report)
@@ -1950,6 +2032,70 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_without_commits_is_indexed_from_its_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["init", "-q"]).status().unwrap().success());
+        write_files(dir.path(), &[("src/main.rs", MAIN_RS), ("util.py", UTIL_PY)]);
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        let r = index_repo(dir.path(), "fresh", data.path(), &cas).unwrap();
+        assert_eq!(r.docs_added, 2, "{r:?}");
+        assert_eq!(visible_paths(data.path(), "fresh"), vec!["src/main.rs", "util.py"]);
+        // a later HEAD pass (still no commit) is the working tree again
+        write_files(dir.path(), &[("more.py", UTIL_PY)]);
+        let r = reindex_repo("fresh", data.path(), &cas).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (1, 0), "{r:?}");
+    }
+
+    #[test]
+    fn a_within_folder_keeps_only_files_under_those_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("p1/memory/MEMORY.md", b"# index\n"),
+                ("p1/memory/deploy.md", b"# deploy\nsteps\n"),
+                ("p1/tool-results/out.txt", b"big tool output\n"),
+                ("p1/tool-results/page.pdf", b"%PDF-1.4 not really\n"),
+                ("p1/notes.md", b"# not memory\n"),
+                ("p2/memory/x.md", b"# x\n"),
+            ],
+        );
+        let data = tempfile::tempdir().unwrap();
+        let cas = open_cas(data.path());
+        index_dir_within(dir.path(), "memory", data.path(), &cas, vec!["memory".into()]).unwrap();
+        assert_eq!(visible_paths(data.path(), "memory"), vec!["p1/memory/MEMORY.md", "p1/memory/deploy.md", "p2/memory/x.md"]);
+        // a delta keeps the rule: a new note is added, other files stay out
+        write_files(dir.path(), &[("p2/memory/y.md", b"# y\n"), ("p2/other.md", b"# no\n")]);
+        let state = load_state(data.path(), "memory").unwrap();
+        // stored as not-plain so older binaries (no `within`) skip it
+        assert!(!state.plain && state.is_plain());
+        let r = reindex_repo("memory", data.path(), &cas).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (1, 0), "{r:?}");
+        // an older binary indexed the whole tree under that name: the next
+        // pass drops everything outside `within`, PDFs it cannot read included
+        let old = tempfile::tempdir().unwrap();
+        index_dir_within(dir.path(), "memory", old.path(), &cas, Vec::new()).unwrap();
+        assert!(visible_paths(old.path(), "memory").contains(&"p1/tool-results/out.txt".to_string()));
+        let mut st = load_state(old.path(), "memory").unwrap();
+        st.within = vec!["memory".into()];
+        save_state(old.path(), &st).unwrap();
+        reindex_repo("memory", old.path(), &cas).unwrap();
+        assert_eq!(visible_paths(old.path(), "memory"), visible_paths(data.path(), "memory"));
+        assert!(is_within("a/memory/b.md", &["memory".into()]) && !is_within("memory.md", &["memory".into()]));
+    }
+
+    #[test]
+    fn configs_opened_by_name_are_text() {
+        for p in ["Caddyfile", "deploy/Dockerfile.backend", ".gitignore", "web/.dockerignore", ".env.local.example", "drv/x.inf", "fix.patch"] {
+            assert_eq!(Lang::from_path(p), Lang::Text, "{p}");
+        }
+        for p in [".npmrc", ".env", "x.out", "a.comp", "Dockerfile.bak.png"] {
+            assert_eq!(Lang::from_path(p), Lang::Unknown, "{p}");
+        }
+    }
+
+    #[test]
     fn credential_files_are_never_indexed_and_old_ones_are_purged() {
         assert!(Lang::is_secret_path("prod.env"));
         assert!(Lang::is_secret_path("app/.env"));
@@ -2138,7 +2284,8 @@ mod tests {
         index_repo(repo.path(), "r1", data.path(), &cas).unwrap();
 
         // Uncommitted: edit main.rs (CRLF, as a Windows checkout would have
-        // it), add an untracked file, add an ignored one.
+        // it), add an untracked file, add an ignored one (and the .gitignore,
+        // itself indexed).
         write_files(
             repo.path(),
             &[
@@ -2150,7 +2297,7 @@ mod tests {
         );
         let r = reindex_worktree("r1", data.path(), &cas).unwrap();
         assert_eq!(r.commit, "worktree");
-        assert_eq!((r.docs_added, r.docs_deleted, r.docs_unchanged), (2, 1, 1), "{r:?}");
+        assert_eq!((r.docs_added, r.docs_deleted, r.docs_unchanged), (3, 1, 1), "{r:?}");
         assert!(content_contains(data.path(), "r1", b"worktree_only_token"));
         assert!(content_contains(data.path(), "r1", b"FRESH_UNTRACKED_TOKEN"));
         assert!(!content_contains(data.path(), "r1", b"IGNORED_TOKEN"));
@@ -2162,13 +2309,13 @@ mod tests {
 
         // A second worktree pass is a no-op (CRLF on disk must not count).
         let r2 = reindex_worktree("r1", data.path(), &cas).unwrap();
-        assert_eq!((r2.docs_added, r2.docs_deleted, r2.docs_unchanged), (0, 0, 3), "{r2:?}");
+        assert_eq!((r2.docs_added, r2.docs_deleted, r2.docs_unchanged), (0, 0, 4), "{r2:?}");
 
         // HEAD-based reindex reconciles by content: the uncommitted edit and
         // the untracked file disappear again, util.py stays untouched.
         let r3 = reindex_repo("r1", data.path(), &cas).unwrap();
         assert_eq!(r3.commit, head_hex(repo.path()));
-        assert_eq!((r3.docs_added, r3.docs_deleted, r3.docs_unchanged), (1, 2, 1), "{r3:?}");
+        assert_eq!((r3.docs_added, r3.docs_deleted, r3.docs_unchanged), (1, 3, 1), "{r3:?}");
         assert!(content_contains(data.path(), "r1", b"hello world"));
         assert!(!content_contains(data.path(), "r1", b"worktree_only_token"));
         assert!(!content_contains(data.path(), "r1", b"FRESH_UNTRACKED_TOKEN"));
@@ -2177,12 +2324,12 @@ mod tests {
         // Commit the edits: a worktree pass then a HEAD pass agree.
         commit_all(repo.path(), "edits");
         let r4 = reindex_worktree("r1", data.path(), &cas).unwrap();
-        assert_eq!((r4.docs_added, r4.docs_deleted), (2, 1), "{r4:?}");
+        assert_eq!((r4.docs_added, r4.docs_deleted), (3, 1), "{r4:?}");
         let r5 = reindex_repo("r1", data.path(), &cas).unwrap();
-        assert_eq!((r5.docs_added, r5.docs_deleted, r5.docs_unchanged), (0, 0, 3), "{r5:?}");
+        assert_eq!((r5.docs_added, r5.docs_deleted, r5.docs_unchanged), (0, 0, 4), "{r5:?}");
         assert_eq!(
             visible_paths(data.path(), "r1"),
-            vec!["fresh.py", "src/main.rs", "util.py"]
+            vec![".gitignore", "fresh.py", "src/main.rs", "util.py"]
         );
     }
 

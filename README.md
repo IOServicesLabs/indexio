@@ -262,6 +262,14 @@ A running `indexio mcp` server does more on its own:
   an unchanged file costs one stat).
 - A session that starts before its folder is registered adopts the repository within one
   minute of `indexio add`. No restart is necessary.
+- A session whose checkout is not registered but sits beside three or more registered
+  repositories adds it on its own (a git repository or a plain project folder of up to
+  20,000 files, never a folder that holds repositories). Set `INDEXIO_NO_AUTO_ADD`, or
+  create `<data_dir>/auto-add-skip`, to turn this off.
+- An answer from `read_span`, `code_grep`, `code_search` or `file_outline` that is
+  identical to one this session got in the last 20 minutes comes back as a one-line
+  note. Sending the same call again returns the full text, and a compaction or `/clear`
+  resets this.
 
 ## Embeddings
 
@@ -635,13 +643,14 @@ Do one of these:
 indexio hook install
 ```
 
-This writes four Claude Code hooks into `~/.claude/settings.json`:
+This writes five Claude Code hooks into `~/.claude/settings.json`:
 
 | Hook | Effect |
 |---|---|
 | PreToolUse, Bash | A shell read or search of an indexed file (`cat`, `sed -n`, `head`, `grep`, `rg`, `find`, a `python -c` or `node -e` one-liner that only opens the file) is refused. The refusal names the indexio call that gives the same result. A command that also does other work, for example a script or a build, runs as typed. |
-| PreToolUse, Read | A whole-file Read of an indexed file is refused. The refusal names `file_outline` and `read_span`. |
-| PreCompact | Session transcripts are imported for the `recall` tool. |
+| PreToolUse, Read | A whole-file Read of an indexed file over 60 lines is refused. The refusal names `file_outline` and `read_span`. A Read of an agent worktree's copy that is identical to the indexed file counts as a read of that file. |
+| PreToolUse, PowerShell | The same rule for `Get-Content`, `Select-String` and `Get-ChildItem \| Select-String` reads and searches, including `$c = Get-Content f` followed by line ranges or loops. |
+| PreCompact | Session transcripts and Claude Code memory notes (`~/.claude/projects/*/memory/`) are imported for the `recall` tool. |
 | SessionStart | A new session gets one line about the previous session in the same project: its title, dates, files changed, commits and the `recall` call for its card (70–115 tokens). After a compaction, the session gets its own changed files and commits back (75–300 tokens). A resumed session gets nothing. |
 
 The Bash hook also routes scripts and builds (`python`, `node`, `npm`, `pytest`, `go`,
@@ -667,7 +676,7 @@ To run a refused command as typed, add `# raw` to it and send it again, or set
 | `impact_of_symbol` | The transitive callers of a symbol across all repositories. |
 | `impact_of_diff` | The callers and importers touched by a patch or by the uncommitted working tree. |
 | `refresh_index` | A delta re-index, embed and reload from inside the session. |
-| `recall` | Search of earlier sessions and of stored command output: requests, answers, tool calls, results, build and test logs. A lone hit comes with its exchange. With `brief: true`, it returns session cards instead: about 1,000 tokens per session with the requests, the files changed, the commits and the outcome. `query: ""` gives the latest sessions of this project. |
+| `recall` | Search of earlier sessions, Claude Code memory notes and stored command output: requests, answers, tool calls, results, build and test logs. A lone hit comes with its exchange. With `brief: true`, it returns session cards instead: about 1,000 tokens per session with the requests, the files changed, the commits and the outcome. `query: ""` gives the latest sessions of this project. |
 | `index_stats` | What is indexed, how current it is, and the last week of usage against the built-in tools. |
 
 The server tells Claude which built-in tool each indexio tool replaces, and which
@@ -897,6 +906,7 @@ indexio cas-stats
 | `INDEXIO_EXPAND` | Enable thesaurus query expansion. Off by default; it measured worse. |
 | `INDEXIO_RETAIN_DAYS` | Days that run logs and rendered session transcripts are kept. Default 30, 0 keeps everything. |
 | `INDEXIO_NO_USAGE` | Do not write the usage log. For benchmarks. |
+| `INDEXIO_NO_AUTO_ADD` | A session does not add its unregistered checkout to the index. |
 | `INDEXIO_RAW` | Run a hooked Bash command as typed. |
 | `INDEXIO_HOOK_DEBUG` | The Bash hook explains its decision on stderr. |
 

@@ -741,6 +741,7 @@ impl Engine {
                 repo: None,
                 lang: Some(lang),
                 path: None,
+                skip_repos: Vec::new(),
             },
         };
         self.search(&q, limit).hits

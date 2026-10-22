@@ -194,12 +194,23 @@ impl Lang {
             | "ino" | "pde" | "cu" | "cuh" | "cl" | "glsl" | "hlsl" | "wgsl" | "metal"
             | "asm" | "s" | "f" | "f90" | "f95" | "f03" | "for" | "pas" | "tcl" | "awk"
             | "el" | "lisp" | "scm" | "rkt" | "coffee" | "pug" | "hbs" | "mustache" | "jinja" | "j2" | "twig"
-            | "erb" | "haml" | "liquid" | "njk" | "ejs" | "tsv" | "csv" | "log" => Lang::Text,
+            | "erb" | "haml" | "liquid" | "njk" | "ejs" | "tsv" | "csv" | "log"
+            // templates, patches, build and platform configs agents open by
+            // name (`.env.example`, `Caddyfile`, `.gitignore`, `driver.inf`)
+            | "example" | "sample" | "template" | "tmpl" | "in" | "patch" | "diff" | "inf" | "webmanifest"
+            | "spec" | "pro" | "gbnf" | "vim" | "ld" | "idl" | "sdp" => Lang::Text,
             "" => match lower.as_str() {
-                "dockerfile" | "makefile" | "justfile" | "rakefile" | "gemfile" | "procfile"
-                | "readme" | "license" | "changelog" | "authors" | "contributing" | "notice" => Lang::Text,
+                "dockerfile" | "containerfile" | "makefile" | "justfile" | "rakefile" | "gemfile" | "procfile"
+                | "caddyfile" | "jenkinsfile" | "vagrantfile" | "brewfile" | "podfile" | "codeowners" | "gradlew"
+                | "readme" | "license" | "changelog" | "authors" | "contributing" | "notice"
+                | ".gitignore" | ".dockerignore" | ".gitattributes" | ".editorconfig" | ".prettierrc" | ".eslintrc"
+                | ".prettierignore" | ".eslintignore" | ".babelrc" | ".nvmrc" | ".clang-format" => Lang::Text,
                 _ => Lang::Unknown,
             },
+            // `Dockerfile.backend`, `Caddyfile.prod` (one suffix: not `Dockerfile.bak.png`)
+            _ if lower.matches('.').count() == 1 && ["dockerfile.", "containerfile.", "caddyfile."].iter().any(|p| lower.starts_with(p)) => {
+                Lang::Text
+            }
             _ => Lang::Unknown,
         }
     }

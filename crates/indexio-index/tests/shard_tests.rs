@@ -404,6 +404,44 @@ fn merge_applies_tombstones_and_keeps_postings() {
 }
 
 #[test]
+fn merge_folds_young_deltas_and_leaves_the_big_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    // the base: 200 docs
+    let base = {
+        let mut w = ShardWriter::new(dir.path()).unwrap();
+        for i in 0..200u32 {
+            let (m, c, a) = make_doc(i, 0, default_content(i));
+            w.add_doc(&m, &c, &a).unwrap();
+        }
+        w.finish(&["repo-a".to_string()]).unwrap()
+    };
+    // six one-doc deltas; the first rewrites file_5 (its base doc tombstoned)
+    for k in 0..6u32 {
+        sleep(Duration::from_millis(1100));
+        let mut w = ShardWriter::new(dir.path()).unwrap();
+        let i = if k == 0 { 5 } else { 1000 + k };
+        let (m, _, a) = make_doc(i, 0, default_content(i));
+        w.add_doc(&m, format!("fn edited_{k}() {{}}\n").as_bytes(), &a).unwrap();
+        w.finish(&["repo-a".to_string()]).unwrap();
+        if k == 0 {
+            Shard::open(&base).unwrap().delete_docs(&[5]).unwrap();
+        }
+    }
+    let mut set = ShardSet::open_dir(dir.path()).unwrap();
+    assert_eq!(set.len(), 7);
+    set.merge(dir.path(), 3).unwrap();
+    assert_eq!(set.len(), 3);
+    assert!(base.exists(), "the big shard is not rewritten for five small deltas");
+    let visible = set.visible_docs();
+    assert_eq!(visible.len(), 205);
+    let f5 = visible.iter().find(|(_, _, dm)| dm.path == "src/file_5.rs").unwrap();
+    assert_eq!(set.content(f5.0, f5.1).unwrap(), b"fn edited_0() {}\n", "the delta's version wins");
+    // reopened from disk: same view
+    let set2 = ShardSet::open_dir(dir.path()).unwrap();
+    assert_eq!(set2.visible_docs().len(), 205);
+}
+
+#[test]
 fn merge_noop_when_within_limit() {
     let dir = tempfile::tempdir().unwrap();
     {

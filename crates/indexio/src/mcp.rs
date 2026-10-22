@@ -154,6 +154,8 @@ pub struct McpServer {
     sessions_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
     /// The same for the `runs` folder (SPEC-P10 §31).
     runs_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
+    /// The `memory` source's stat cache (see `sessions::index_memory`).
+    memory_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
     /// Last background sync of the other registered repos (SPEC-P10 §21);
     /// throttled to [`SYNC_EVERY`], one server at a time across the data dir.
     sync_last: Mutex<Option<std::time::Instant>>,
@@ -168,7 +170,19 @@ pub struct McpServer {
     /// (SPEC-P10 §22): only the first `read_span` of a file is measured
     /// against the harness reading it whole.
     read_seen: Mutex<HashMap<(String, String), [u8; 16]>>,
+    /// Recent `read_span` answers by content id (see `elide_repeat_span`).
+    span_seen: Mutex<HashMap<indexio_types::BlobId, std::time::SystemTime>>,
 }
+
+/// The tools whose repeated answers are elided (see `elide_repeat`); the
+/// rest answer in a few hundred chars.
+const ELIDE_REPEATS: [&str; 4] = ["read_span", "code_grep", "code_search", "file_outline"];
+
+/// Answers shorter than this are cheaper to repeat than to explain.
+const ELIDE_MIN_CHARS: usize = 400;
+
+/// How long an answer counts as still in the session's view.
+const SPAN_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// The files this session has read by span, with the content id it read:
 /// the whole-file `Read` baseline is charged on the first span of a file
@@ -250,6 +264,7 @@ impl McpServer {
             sessions_busy: Arc::new(AtomicBool::new(false)),
             sessions_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             runs_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
+            memory_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             shards_seen: Mutex::new((0, 0, None)),
             prepared: Arc::new(Mutex::new(None)),
             prepare_busy: Arc::new(AtomicBool::new(false)),
@@ -264,6 +279,7 @@ impl McpServer {
             sync_last: Mutex::new(None),
             sync_busy: Arc::new(AtomicBool::new(false)),
             read_seen: Mutex::new(HashMap::new()),
+            span_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -320,7 +336,8 @@ impl McpServer {
             let names = indexio_ingest::sources::registered_repo_names(&data_dir).unwrap_or_default();
             let others: Vec<String> = names
                 .into_iter()
-                .filter(|n| current.as_deref() != Some(n.as_str()) && n != crate::sessions::REPO && n != crate::runs::REPO)
+                // (sessions, runs and memory are refreshed by the import cycle)
+                .filter(|n| current.as_deref() != Some(n.as_str()) && ![crate::sessions::REPO, crate::runs::REPO, crate::sessions::MEMORY_REPO].contains(&n.as_str()))
                 .collect();
             let moved: Vec<String> = others.iter().filter(|n| indexio_ingest::head_moved(&data_dir, n)).cloned().collect();
             // plain folders have no HEAD to watch: delta each one by content,
@@ -328,7 +345,7 @@ impl McpServer {
             // stat'ed after this server's first pass
             let plain: Vec<String> = others
                 .iter()
-                .filter(|n| indexio_ingest::repo_state(&data_dir, n).is_ok_and(|s| s.plain))
+                .filter(|n| indexio_ingest::repo_state(&data_dir, n).is_ok_and(|s| s.is_plain()))
                 .cloned()
                 .collect();
             let mut changed: Vec<String> = Vec::new();
@@ -467,6 +484,7 @@ impl McpServer {
         let reload = Arc::clone(&self.reload_needed);
         let cache = Arc::clone(&self.sessions_cache);
         let runs_cache = Arc::clone(&self.runs_cache);
+        let memory_cache = Arc::clone(&self.memory_cache);
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
             // SPEC-P10 §31: the command-output source rides the same cycle —
@@ -541,6 +559,17 @@ impl McpServer {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "sessions: import failed"),
+            }
+            let memory = indexio_ingest::Cas::open(&data_dir.join("cas"))
+                .map_err(anyhow::Error::from)
+                .and_then(|cas| crate::sessions::index_memory(&claude, &data_dir, &cas, Some(&mut memory_cache.lock().expect("memory_cache poisoned"))));
+            match memory {
+                Ok(ir) if ir.docs_added > 0 || ir.docs_deleted > 0 => {
+                    tracing::info!(added = ir.docs_added, deleted = ir.docs_deleted, "memory indexed");
+                    reload.store(true, Ordering::Release);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "memory: index skipped"),
             }
             busy.store(false, Ordering::Release);
         });
@@ -975,6 +1004,26 @@ impl McpServer {
         if let Some(name) = repo_containing(&data_dir, cwd) {
             tracing::info!(repo = %name, "working directory is now under a registered repo; adopting it");
             self.set_current_repo(Some(name));
+            return;
+        }
+        // a new checkout next to registered ones: index it in the background;
+        // the next look (a minute on) adopts it
+        if let Some(root) = auto_add_candidate(&data_dir, cwd) {
+            if !AUTO_ADD_TRIED.swap(true, Ordering::AcqRel) {
+                std::thread::spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    let added = indexio_ingest::sources::parse_source(&root.to_string_lossy())
+                        .and_then(|src| {
+                            indexio_ingest::sources::add_source(&data_dir, src.clone())?;
+                            let cas = indexio_ingest::Cas::open(&data_dir.join("cas"))?;
+                            indexio_ingest::sources::sync_source(&src, &data_dir, &cas, &indexio_ingest::sources::SyncOptions::default())
+                        });
+                    match added {
+                        Ok(r) => tracing::info!(root = %root.display(), repos = r.indexed.len(), ms = t0.elapsed().as_millis() as u64, "auto-added the session's checkout"),
+                        Err(e) => tracing::warn!(error = %e, "auto-add failed"),
+                    }
+                });
+            }
         }
     }
 
@@ -1182,7 +1231,50 @@ impl McpServer {
             &self.read_seen,
             &mut baseline,
         )?;
+        drop(engine);
+        if format == OutputFormat::Text && ELIDE_REPEATS.contains(&name) {
+            return Ok((self.elide_repeat(name, v), baseline));
+        }
         Ok((v, baseline))
+    }
+
+    /// A `read_span` (or grep, search, outline) whose answer is byte for byte
+    /// one this session got moments ago is answered with a line saying so:
+    /// 505 such read_span repeats in two weeks, 2.1M chars, half of them
+    /// within 17 s of the first (and 640 grep/search/outline ones, 0.6M).
+    /// The repeat is forgotten once elided, so sending the same call again
+    /// returns the text; a compaction or `/clear` anywhere (the SessionStart
+    /// hook touches `<data_dir>/hook/compacted`) forgets every earlier answer.
+    fn elide_repeat(&self, tool: &str, v: Value) -> Value {
+        let Some(text) = v["content"][0]["text"].as_str() else { return v };
+        if text.len() < ELIDE_MIN_CHARS {
+            return v;
+        }
+        let hash = indexio_types::BlobId::from_content(format!("{tool}\n{text}").as_bytes());
+        let now = std::time::SystemTime::now();
+        let reset = self
+            .engine
+            .read()
+            .ok()
+            .and_then(|e| e.data_dir().map(crate::hook::compacted_marker))
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let Ok(mut seen) = self.span_seen.lock() else { return v };
+        seen.retain(|_, t| now.duration_since(*t).is_ok_and(|d| d < SPAN_REPEAT_WINDOW));
+        match seen.remove(&hash) {
+            Some(t) if reset.is_none_or(|r| r < t) => {
+                let ago = now.duration_since(t).map_or(0, |d| d.as_secs());
+                plain_result(if tool == "read_span" {
+                    let header = text.lines().next().unwrap_or("");
+                    format!("{header}: unchanged since this session read it {ago}s ago (same lines, same text). Send the same call again if it is no longer in your context.")
+                } else {
+                    format!("Same answer as this session's identical {tool} call {ago}s ago (nothing changed). Send the same call again if it is no longer in your context.")
+                })
+            }
+            _ => {
+                seen.insert(hash, now);
+                v
+            }
+        }
     }
 
     /// Delta re-index every registered repo (or one), embed the repos that
@@ -1526,11 +1618,14 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
+/// The tools a session reaches for first (see `tools_list`).
+const ALWAYS_LOAD: &[&str] = &["read_span", "code_grep", "file_outline", "code_search", "recall", "list_files"];
+
 fn tools_list() -> Value {
     let string_prop = |desc: &str| json!({ "type": "string", "description": desc });
     let limit_prop = json!({ "type": "integer", "description": "max results (default 50)", "minimum": 1 });
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
-        json!({
+        let mut t = json!({
             "name": name,
             "description": desc,
             "inputSchema": {
@@ -1538,7 +1633,15 @@ fn tools_list() -> Value {
                 "properties": props,
                 "required": required,
             },
-        })
+        });
+        // Claude Code defers MCP tools behind ToolSearch: these six were
+        // loaded that way 72 times in two weeks (up to 10 times in one
+        // session, again after each compaction) in 47 of 52 sessions, so
+        // they come loaded (~1.3k tokens) and the rest stay deferred
+        if ALWAYS_LOAD.contains(&name) {
+            t["_meta"] = json!({ "anthropic/alwaysLoad": true });
+        }
+        t
     };
     json!({
         "tools": [
@@ -1558,7 +1661,9 @@ fn tools_list() -> Value {
                     "rerank": json!({ "type": "boolean", "description": "hybrid only (default false); needs a configured rerank endpoint, otherwise no effect" }),
                     "fusion": json!({ "type": "string", "enum": ["rrf", "combmnz"], "description": "hybrid only (default rrf)" }),
                 }),
-                &["query"],
+                // not required: a call with code_grep's `pattern` (+ `repo`,
+                // `path`) instead failed the harness's schema check
+                &[],
             ),
             tool(
                 "semantic_search",
@@ -1819,7 +1924,15 @@ fn path_filter(engine: &Engine, repo: Option<&str>, path: Option<&str>) -> (Opti
 fn file_target(engine: &Engine, args: &Value, current: Option<&str>) -> Result<(String, String), (i64, String)> {
     let path = req_str(args, "path")?;
     if let Some(repo) = args.get("repo").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        return Ok((repo.to_string(), strip_repo_prefix(repo, path).to_string()));
+        let path = strip_repo_prefix(repo, path);
+        // `Swarmio_cloud/deploy/deploy.sh` in repo Swarmio_cloud: the path
+        // from the folder above the checkout
+        if let Some(rest) = path.strip_prefix(repo).and_then(|r| r.strip_prefix('/')) {
+            if engine.file_version(repo, path).is_none() && engine.file_version(repo, rest).is_some() {
+                return Ok((repo.to_string(), rest.to_string()));
+            }
+        }
+        return Ok((repo.to_string(), path.to_string()));
     }
     let data_dir = engine.data_dir();
     if let (Some((head, rest)), Some(d)) = (path.split_once(':'), data_dir) {
@@ -1842,10 +1955,35 @@ fn file_target(engine: &Engine, args: &Value, current: Option<&str>) -> Result<(
             }
         }
     }
+    if let Some(cur) = current.filter(|cur| engine.file_version(cur, path).is_some()) {
+        return Ok((cur.to_string(), path.to_string()));
+    }
+    // not the session's file (or no session repo: 17 failed calls in two
+    // weeks came from unregistered folders): the one repo that holds it
+    let mut holders = engine.visible_repos().into_iter().filter(|r| engine.file_version(r, path).is_some());
+    if let (Some(only), None) = (holders.next(), holders.next()) {
+        return Ok((only, path.to_string()));
+    }
     match current {
         Some(cur) => Ok((cur.to_string(), path.to_string())),
         None => Err(invalid("missing or invalid 'repo' parameter (this session is not in a registered repo)")),
     }
+}
+
+/// `repo` / `path` as separate arguments, the way Grep takes them (agents
+/// send them; they used to be ignored), appended to a query as filters;
+/// also returns the (repo, path) filters those arguments resolved to.
+fn with_filters(engine: &Engine, args: &Value, query: &str) -> (String, Option<String>, Option<String>) {
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).filter(|v| !v.is_empty() && !v.contains(char::is_whitespace));
+    let (repo_arg, path_arg) = path_filter(engine, arg("repo"), arg("path"));
+    let mut query = query.to_string();
+    if let Some(r) = &repo_arg {
+        query.push_str(&format!(" repo:{r}"));
+    }
+    if let Some(p) = &path_arg {
+        query.push_str(&format!(" path:{p}"));
+    }
+    (query, repo_arg, path_arg)
 }
 
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
@@ -1897,7 +2035,7 @@ fn stats_payload(engine: &Engine) -> Value {
             .map(|name| match indexio_ingest::repo_state(dir, name) {
                 Ok(st) => json!({
                     "name": name, "path": st.path.display().to_string(),
-                    "commit": st.last_commit, "indexed_at": st.indexed_at, "plain": st.plain,
+                    "commit": st.last_commit, "indexed_at": st.indexed_at, "plain": st.is_plain(),
                 }),
                 Err(_) => json!({ "name": name }),
             })
@@ -1945,7 +2083,7 @@ fn stats_text(engine: &Engine) -> String {
                     st.path.display().to_string(),
                     st.last_commit.clone().unwrap_or_default(),
                     st.indexed_at.clone(),
-                    st.plain,
+                    st.is_plain(),
                 ));
             }
         }
@@ -1974,7 +2112,8 @@ fn call_tool(
     let fetch = |limit: usize| if current.is_some() { limit.saturating_mul(8).max(400) } else { limit };
     match name {
         "code_search" => {
-            let q = req_str(args, "query")?;
+            let (q, ..) = with_filters(engine, args, req_str(args, "query").or_else(|_| req_str(args, "pattern"))?);
+            let q = q.as_str();
             let limit = opt_limit(args)?;
             let mode = match args.get("mode") {
                 None | Some(Value::Null) => SearchMode::Lexical,
@@ -2008,8 +2147,9 @@ fn call_tool(
             let lines = opt_usize(args, "lines", 1)?.clamp(1, MAX_LINES_PER_FILE);
             match mode {
                 SearchMode::Lexical => {
-                    let query =
-                        indexio_query::parse(q).map_err(|e| invalid(format!("invalid query: {e}")))?;
+                    let query = indexio_query::parse(q)
+                        .map(|query| without_transcripts(query, q))
+                        .map_err(|e| invalid(format!("invalid query: {e}")))?;
                     let mut res = engine.search_lines(&query, fetch(limit), lines);
                     // SPEC-P10 §27: `a|b|c`, `width: 3[5-9]` — a grep-style
                     // pattern handed to lexical mode as if it were code_grep;
@@ -2176,18 +2316,7 @@ fn call_tool(
             ))
         }
         "code_grep" => {
-            let pattern = req_str(args, "pattern")?;
-            // `repo` / `path` as separate arguments, the way Grep takes them
-            // (agents send them; they used to be ignored): trailing filters
-            let arg = |k: &str| args.get(k).and_then(Value::as_str).filter(|v| !v.is_empty() && !v.contains(char::is_whitespace));
-            let (repo_arg, path_arg) = path_filter(engine, arg("repo"), arg("path"));
-            let mut pattern = pattern.to_string();
-            if let Some(r) = &repo_arg {
-                pattern.push_str(&format!(" repo:{r}"));
-            }
-            if let Some(p) = &path_arg {
-                pattern.push_str(&format!(" path:{p}"));
-            }
+            let (pattern, repo_arg, path_arg) = with_filters(engine, args, req_str(args, "pattern")?);
             let pattern = pattern.as_str();
             let limit = opt_limit(args)?;
             // Grep's `head_limit` (agents send it) caps the lines per file too
@@ -2198,15 +2327,20 @@ fn call_tool(
             let lines = opt_usize(args, "lines", default_lines)?.clamp(1, MAX_LINES_PER_FILE);
             // an unbalanced parenthesis (`):.*=>` meaning a literal `)`) is
             // escaped and retried instead of failing the call (SPEC-P10 §33)
+            // a lookaround (unsupported by the regex engine; 4 failed calls in
+            // two weeks) is dropped: the answer is a superset, and says so
             let (query, note) = match grep_query(pattern) {
                 Ok(q) => (q, None),
-                Err(e) => match escape_unbalanced_parens(pattern) {
-                    Some(fixed) => match grep_query(&fixed) {
-                        Ok(q) => (q, Some("unbalanced parenthesis treated as literal:\n")),
-                        Err(_) => return Err(invalid(format!("invalid pattern: {e}"))),
-                    },
-                    None => return Err(invalid(format!("invalid pattern: {e}"))),
-                },
+                Err(e) => {
+                    let retry = [
+                        (escape_unbalanced_parens(pattern), "unbalanced parenthesis treated as literal:\n"),
+                        (strip_lookarounds(pattern), "lookaround is unsupported and was dropped, so lines it would exclude are listed too:\n"),
+                    ];
+                    match retry.into_iter().find_map(|(fixed, note)| Some((grep_query(&fixed?).ok()?, Some(note)))) {
+                        Some(found) => found,
+                        None => return Err(invalid(format!("invalid pattern: {e}"))),
+                    }
+                }
             };
             let mut res = engine.search_lines(&query, fetch(limit), lines);
             let mut note: Option<String> = note.map(str::to_string);
@@ -2367,18 +2501,24 @@ fn call_tool(
             // whatever survived in a 60-deep fused list; the command-output
             // source (SPEC-P10 §31) is searched the same way and merged
             let n = limit.saturating_mul(3).max(24);
-            let has_runs = engine.stats().repos.iter().any(|r| r == crate::runs::REPO);
-            // the two legs are independent: run them side by side
-            let (sessions, runs) = std::thread::scope(|s| {
+            let repos = engine.stats().repos;
+            let has_runs = repos.iter().any(|r| r == crate::runs::REPO);
+            // the memory notes are decisions written down: recalled with the
+            // transcripts they came from
+            let has_memory = repos.iter().any(|r| r == crate::sessions::MEMORY_REPO);
+            // the legs are independent: run them side by side
+            let (sessions, runs, memory) = std::thread::scope(|s| {
                 let runs = has_runs.then(|| s.spawn(|| engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::runs::REPO))));
+                let memory = has_memory
+                    .then(|| s.spawn(|| engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::sessions::MEMORY_REPO))));
                 let sessions = engine.search_hybrid_in(q, n, embedder, FusionAlgo::Rrf, Some(crate::sessions::REPO));
-                (sessions, runs.and_then(|h| h.join().ok()))
+                (sessions, runs.and_then(|h| h.join().ok()), memory.and_then(|h| h.join().ok()))
             });
             let mut fused = sessions.map_err(|e| internal(format!("recall failed: {e}")))?;
-            if let Some(Ok(runs)) = runs {
-                fused.extend(runs);
-                fused.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
+            for more in [runs, memory].into_iter().flatten().flatten() {
+                fused.extend(more);
             }
+            fused.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
             let slug = std::env::current_dir().ok().map(|d| crate::sessions::project_slug(&d));
             let mut hits: Vec<indexio_types::SearchHit> = fused
                 .into_iter()
@@ -2390,7 +2530,8 @@ fn call_tool(
                 .collect();
             // this project's sessions and runs first (stable), then the others
             let mine = |h: &indexio_types::SearchHit| {
-                (h.repo == crate::sessions::REPO && slug.as_ref().is_some_and(|s| h.path.starts_with(&format!("{s}/"))))
+                ([crate::sessions::REPO, crate::sessions::MEMORY_REPO].contains(&h.repo.as_str())
+                    && slug.as_ref().is_some_and(|s| h.path.starts_with(&format!("{s}/"))))
                     || (h.repo == crate::runs::REPO && current.is_some_and(|c| h.path.starts_with(&format!("{c}/"))))
             };
             let (mut here, rest): (Vec<_>, Vec<_>) = hits.into_iter().partition(mine);
@@ -2731,7 +2872,17 @@ fn grep_query(pattern: &str) -> Result<indexio_query::Query, String> {
         }
     }
     let q = format!("/{}/{filters}", pattern.replace('/', "\\/"));
-    indexio_query::parse(&q).map_err(|e| e.to_string())
+    indexio_query::parse(&q).map(|q| without_transcripts(q, &filters)).map_err(|e| e.to_string())
+}
+
+/// `q` with the `sessions` transcripts left out unless `text` asks for them
+/// (`repo:sessions`): code lookups drop their hits anyway, and verifying
+/// them was half of a global grep (9 of 18 ms) and took candidate slots.
+fn without_transcripts(mut q: indexio_query::Query, text: &str) -> indexio_query::Query {
+    if !wants_sessions(text) {
+        q.filters.skip_repos.push(crate::sessions::REPO.to_string());
+    }
+    q
 }
 
 /// The pattern with every parenthesis that has no partner escaped, or
@@ -2772,6 +2923,59 @@ fn escape_unbalanced_parens(pattern: &str) -> Option<String> {
         out.push(*c);
     }
     Some(out)
+}
+
+/// The pattern without its lookaround groups (`(?=…)`, `(?!…)`, `(?<=…)`,
+/// `(?<!…)`), or `None` when it has none. Escapes and character classes
+/// are respected; an unclosed group is left for the regex error.
+fn strip_lookarounds(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut stripped = false;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let rest: String = chars[i..chars.len().min(i + 4)].iter().collect();
+        if !in_class && ["(?=", "(?!", "(?<=", "(?<!"].iter().any(|p| rest.starts_with(p)) {
+            // the group's closing parenthesis
+            let (mut depth, mut j, mut cls) = (0usize, i, false);
+            let end = loop {
+                match chars.get(j) {
+                    None => return None,
+                    Some('\\') => j += 1,
+                    Some('[') if !cls => cls = true,
+                    Some(']') if cls => cls = false,
+                    Some('(') if !cls => depth += 1,
+                    Some(')') if !cls => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break j;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            };
+            i = end + 1;
+            stripped = true;
+            continue;
+        }
+        out.push(c);
+        match c {
+            '\\' => {
+                if let Some(n) = chars.get(i + 1) {
+                    out.push(*n);
+                }
+                i += 1;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    stripped.then_some(out)
 }
 
 /// Whether a lexical query reads as a grep pattern rather than words: an
@@ -2958,6 +3162,61 @@ pub fn resolve_current_repo(data_dir: &std::path::Path, explicit: Option<&str>) 
     repo_containing(data_dir, &cwd)
 }
 
+/// One auto-add attempt per server process.
+static AUTO_ADD_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Registered siblings a new checkout needs before it is added on its own.
+const AUTO_ADD_SIBLINGS: usize = 3;
+
+/// Tracked files above which a checkout is left for an explicit `indexio add`.
+const AUTO_ADD_MAX_FILES: usize = 20_000;
+
+/// The git checkout holding `cwd`, when it is not registered but sits in a
+/// folder with at least [`AUTO_ADD_SIBLINGS`] registered repos: a project
+/// cloned next to the others (three unregistered siblings drew 1,460
+/// shell and Read calls in two weeks that the index could have answered).
+/// `INDEXIO_NO_AUTO_ADD` turns it off; a name in `<data_dir>/auto-add-skip`
+/// (one per line) leaves that checkout out; so does a very large one.
+fn auto_add_candidate(data_dir: &std::path::Path, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    if std::env::var_os("INDEXIO_NO_AUTO_ADD").is_some() {
+        return None;
+    }
+    // canonical, without Windows' verbatim `\\?\` prefix (a source spec
+    // with it discovers nothing)
+    let norm = |p: &std::path::Path| p.canonicalize().map_or_else(|_| p.to_path_buf(), |c| std::path::PathBuf::from(c.to_string_lossy().trim_start_matches(r"\\?\")));
+    let cwd = norm(cwd);
+    let roots: Vec<std::path::PathBuf> = indexio_ingest::sources::registered_repo_names(data_dir)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| indexio_ingest::repo_state(data_dir, n).ok())
+        .map(|st| norm(&st.path))
+        .collect();
+    let siblings = |d: &std::path::Path| roots.iter().filter(|r| r.parent() == d.parent()).count();
+    // the checkout holding cwd, else (a project folder without git) the
+    // folder that sits among registered repos
+    let git = cwd.ancestors().take(8).find(|d| indexio_ingest::is_git_checkout(d));
+    let root = git.or_else(|| cwd.ancestors().take(8).find(|d| siblings(d) >= AUTO_ADD_SIBLINGS))?.to_path_buf();
+    // never a folder that holds registered repos (the parent of them all)
+    if siblings(&root) < AUTO_ADD_SIBLINGS || roots.iter().any(|r| r.starts_with(&root)) {
+        return None;
+    }
+    let name = root.file_name()?.to_string_lossy().into_owned();
+    let skip = std::fs::read_to_string(data_dir.join("auto-add-skip")).unwrap_or_default();
+    if skip.lines().any(|l| l.trim().eq_ignore_ascii_case(&name)) {
+        return None;
+    }
+    let files = if git.is_some() {
+        let out = std::process::Command::new("git").arg("-C").arg(&root).args(["ls-files", "-z", "-co", "--exclude-standard"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        out.stdout.split(|&b| b == 0).count()
+    } else {
+        indexio_ingest::walk_plain_tree(&root).ok()?.len()
+    };
+    (files <= AUTO_ADD_MAX_FILES).then_some(root)
+}
+
 /// The deepest registered repo whose folder contains `dir` (junctions and
 /// symlinks resolved on both sides), if any.
 pub fn repo_containing(data_dir: &std::path::Path, dir: &std::path::Path) -> Option<String> {
@@ -3141,8 +3400,12 @@ mod tests {
             assert!(t["description"].is_string());
         }
         // required params
+        // the hot tools skip Claude Code's ToolSearch, the rest stay deferred
+        let loaded: Vec<&str> = tools.iter().filter(|t| t["_meta"]["anthropic/alwaysLoad"] == true).map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(loaded, ["code_search", "code_grep", "list_files", "recall", "file_outline", "read_span"]);
         let cs = tools.iter().find(|t| t["name"] == "code_search").unwrap();
-        assert_eq!(cs["inputSchema"]["required"], json!(["query"]));
+        // `query` or code_grep's `pattern`: neither is schema-required
+        assert_eq!(cs["inputSchema"]["required"], json!([]));
         // code_search gained the optional mode enum
         assert_eq!(
             cs["inputSchema"]["properties"]["mode"]["enum"],
@@ -3260,6 +3523,89 @@ mod tests {
         let whole2 = crate::usage::read_bytes(&e2.file_content("alpha", "src/foo.rs").unwrap());
         assert_eq!(span(&e2, &seen), Some(whole2), "changed file: read again");
         assert_eq!(span(&e2, &seen), Some(0));
+    }
+
+    #[test]
+    fn a_repeated_read_span_is_answered_with_a_line_once() {
+        let (_tmp, e) = fixture_engine();
+        let dir = e.data_dir().unwrap().to_path_buf();
+        let long: String = (0..40).map(|i| format!("fn foo_bar_{i}() -> u32 {{ {i} }}\n")).collect();
+        write_shard(&dir.join("shards"), &[("src/long.rs", long.as_str(), vec![], vec![])], &["alpha".to_string()]);
+        let server = McpServer::with_format(Engine::open(&dir).unwrap(), Arc::new(hash_emb()), Arc::new(rr()), OutputFormat::Text);
+        let span = |s: &McpServer| {
+            let r = s.handle(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"src/long.rs","start":1,"end":30}}}"#);
+            parse_resp(&r.unwrap())["result"]["content"][0]["text"].as_str().unwrap().to_string()
+        };
+        let first = span(&server);
+        assert!(first.contains("foo_bar_12()"), "{first}");
+        let again = span(&server);
+        assert!(again.contains("unchanged since this session read it") && !again.contains("foo_bar_12()"), "{again}");
+        // sent once more: the text, and that counts as a fresh read
+        assert_eq!(span(&server), first);
+        assert!(span(&server).contains("unchanged"));
+        // a compaction anywhere: nothing earlier is in view
+        assert_eq!(span(&server), first);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let marker = crate::hook::compacted_marker(&dir);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "s").unwrap();
+        assert_eq!(span(&server), first);
+        // another range of the same file is its own read
+        let r = server.handle(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"src/long.rs","start":1,"end":29}}}"#);
+        assert!(!parse_resp(&r.unwrap())["result"]["content"][0]["text"].as_str().unwrap().contains("unchanged"));
+    }
+
+    #[test]
+    fn a_new_checkout_beside_registered_repos_is_an_auto_add_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let parent = tmp.path().join("code");
+        let cas = indexio_ingest::Cas::open(&data.join("cas")).unwrap();
+        for n in ["a", "b"] {
+            std::fs::create_dir_all(parent.join(n)).unwrap();
+            std::fs::write(parent.join(n).join("x.md"), "# x\n").unwrap();
+            indexio_ingest::index_dir(&parent.join(n), n, &data, &cas).unwrap();
+        }
+        let new = parent.join("new");
+        std::fs::create_dir_all(new.join("src")).unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(&new).arg("init").arg("-q").status().unwrap().success());
+        // two siblings: not yet
+        assert_eq!(auto_add_candidate(&data, &new.join("src")), None);
+        std::fs::create_dir_all(parent.join("c")).unwrap();
+        std::fs::write(parent.join("c").join("x.md"), "# x\n").unwrap();
+        indexio_ingest::index_dir(&parent.join("c"), "c", &data, &cas).unwrap();
+        let root = std::path::PathBuf::from(new.canonicalize().unwrap().to_string_lossy().trim_start_matches(r"\\?\"));
+        assert_eq!(auto_add_candidate(&data, &new.join("src")), Some(root));
+        // the folder of them all is never one; a plain project folder among them is
+        assert_eq!(auto_add_candidate(&data, &tmp.path().join("code")), None);
+        std::fs::create_dir_all(parent.join("plain").join("docs")).unwrap();
+        let plain = std::path::PathBuf::from(parent.join("plain").canonicalize().unwrap().to_string_lossy().trim_start_matches(r"\\?\"));
+        assert_eq!(auto_add_candidate(&data, &parent.join("plain").join("docs")), Some(plain));
+        // the skip list
+        std::fs::write(data.join("auto-add-skip"), "new\n").unwrap();
+        assert_eq!(auto_add_candidate(&data, &new), None);
+    }
+
+    /// A file tool without `repo`: the session's repo when it holds the
+    /// path, else the one repo that does.
+    #[test]
+    fn file_tools_find_the_repo_that_holds_the_path() {
+        let (tmp, _e) = fixture_engine();
+        write_shard(&tmp.path().join("shards"), &[("copy/f0.rs", "fn other() {}\n", vec![], vec![])], &["beta".to_string()]);
+        let e = Engine::open(tmp.path()).unwrap();
+        let target = |path: &str, current: Option<&str>| file_target(&e, &json!({"path": path}), current);
+        assert_eq!(target("copy/f0.rs", Some("alpha")).unwrap(), ("beta".to_string(), "copy/f0.rs".to_string()));
+        assert_eq!(target("copy/f0.rs", None).unwrap().0, "beta");
+        assert_eq!(target("src/foo.rs", None).unwrap().0, "alpha");
+        assert_eq!(target("src/foo.rs", Some("beta")).unwrap().0, "alpha");
+        // nobody holds it: the session's repo (whose error names lookalikes), or the old error
+        assert_eq!(target("nope.rs", Some("alpha")).unwrap().0, "alpha");
+        assert!(target("nope.rs", None).is_err());
+        // the repo's own folder name in front of the path
+        let with_repo = |path: &str| file_target(&e, &json!({"repo": "beta", "path": path}), None).unwrap().1;
+        assert_eq!(with_repo("beta/copy/f0.rs"), "copy/f0.rs");
+        assert_eq!(with_repo("beta:copy/f0.rs"), "copy/f0.rs");
+        assert_eq!(with_repo("beta/nope.rs"), "beta/nope.rs", "left alone when the rest is not indexed either");
     }
 
     /// SPEC-P10 §35: once the session's repo has hits, other repos get a
@@ -3391,6 +3737,11 @@ mod tests {
         let v = parse_resp(&handle_text(&e, req).unwrap());
         let t = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(t.contains("src/foo.rs"), "{t}");
+        // code_grep's argument names: `pattern`, `repo`, `path`
+        let req = r#"{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"code_search","arguments":{"pattern":"foo_bar_123","repo":"alpha","path":"src/caller.rs"}}}"#;
+        let v = parse_resp(&handle_text(&e, req).unwrap());
+        let t = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(t.contains("src/caller.rs") && !t.contains("src/foo.rs"), "{t}");
         // plain words are not regexes
         assert!(!looks_like_regex("storage_state_set session_save"));
         assert!(!looks_like_regex("/a|b/"));
@@ -3533,8 +3884,8 @@ mod tests {
             cs["inputSchema"]["properties"]["rerank"]["description"],
             "hybrid only (default false); needs a configured rerank endpoint, otherwise no effect"
         );
-        // still optional: only query is required
-        assert_eq!(cs["inputSchema"]["required"], json!(["query"]));
+        // still optional
+        assert_eq!(cs["inputSchema"]["required"], json!([]));
     }
 
     // ------------------------------------------------------------------
@@ -3641,6 +3992,11 @@ mod tests {
         assert_eq!(escape_unbalanced_parens("export function x|return async|):.*=>").as_deref(), Some("export function x|return async|\\):.*=>"));
         assert_eq!(escape_unbalanced_parens("(foo|bar").as_deref(), Some("\\(foo|bar"));
         assert_eq!(escape_unbalanced_parens("(a)|[)]|\\)"), None, "balanced, class and escaped are fine");
+        assert_eq!(strip_lookarounds(r"supabase\.(?!auth)\w+|from '@/lib'").as_deref(), Some(r"supabase\.\w+|from '@/lib'"));
+        assert_eq!(strip_lookarounds(r"bg-(card|muted)\b(?!/)").as_deref(), Some(r"bg-(card|muted)\b"));
+        assert_eq!(strip_lookarounds(r"(?<=a(b))c(?<![x)])d").as_deref(), Some("cd"));
+        assert_eq!(strip_lookarounds(r"\(?!x|[(?!]"), None, "escaped and in a class: not lookarounds");
+        assert_eq!(strip_lookarounds("a(?!b"), None);
         let (_t, e) = fixture_engine();
         let req = r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"helper\\(x|):"}}}"#;
         let v = parse_resp(&handle_text(&e, req).unwrap());
@@ -3820,6 +4176,7 @@ mod tests {
                 worktree: false,
                 skip: Vec::new(),
                 pdf_text: false,
+                within: Vec::new(),
             })
             .unwrap(),
         )

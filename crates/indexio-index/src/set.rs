@@ -18,6 +18,10 @@ use crate::{invalid, Shard, ShardWriter};
 /// Extension merged-but-still-mapped shards are parked under (see `merge`).
 const STALE_EXT: &str = "stale";
 
+/// Tombstoned share of all docs above which a merge takes the oldest run
+/// (dropping the dead docs) instead of the cheapest one.
+const MERGE_DEAD_SHARE: f64 = 0.3;
+
 /// A temp file untouched for an hour: its writer is gone.
 pub fn is_abandoned(path: &Path) -> bool {
     fs::metadata(path)
@@ -606,8 +610,32 @@ impl ShardSet {
         out
     }
 
-    /// If shard_count > max_shards, merge the OLDEST shards (all but the
-    /// newest `max_shards - 1`) into one compound shard. Applies tombstones
+    /// The shards to merge, `lo..hi` in newest-first order: a run of
+    /// adjacent ages (so the compound shard, dated by its newest input,
+    /// orders exactly where they did) just long enough to leave
+    /// `max_shards`, the one with the fewest bytes. Delta shards from
+    /// refreshes and hooks are the small young ones; always merging the
+    /// oldest run rewrote the big base shards with them (a 200 MB index:
+    /// ~30 s and ~2.4 GB per compaction, once a minute while other
+    /// sessions write). Once tombstoned docs are over [`MERGE_DEAD_SHARE`]
+    /// of all docs, the oldest run is merged as before, which drops them.
+    fn merge_window(&self, max_shards: usize) -> (usize, usize) {
+        let n = self.shards.len();
+        let len = n - max_shards + 1;
+        let oldest = (n - len, n);
+        let docs: u64 = self.shards.iter().map(|s| s.doc_count()).sum();
+        let dead: u64 = self.shards.iter().map(|s| s.tombstones().len()).sum();
+        if docs > 0 && dead as f64 / docs as f64 > MERGE_DEAD_SHARE {
+            return oldest;
+        }
+        let bytes: Vec<u64> = self.shards.iter().map(|s| fs::metadata(s.path()).map_or(u64::MAX / 64, |m| m.len())).collect();
+        (0..=n - len)
+            .min_by_key(|&lo| (bytes[lo..lo + len].iter().sum::<u64>(), std::cmp::Reverse(lo)))
+            .map_or(oldest, |lo| (lo, lo + len))
+    }
+
+    /// If shard_count > max_shards, merge a run of adjacent shards (see
+    /// [`merge_window`](Self::merge_window)) into one compound shard. Applies tombstones
     /// (deleted docs are dropped) and newest-wins dedup within the merged
     /// group. Atomic swap: the compound shard is fully written (its own
     /// atomic rename) before the merged files are removed; the set is then
@@ -620,9 +648,10 @@ impl ShardSet {
             return Ok(());
         }
         self.invalidate();
-        let keep_n = max_shards - 1;
-        let merged: Vec<usize> = (keep_n..self.shards.len()).collect();
-        info!(merged = merged.len(), kept = keep_n, "merging shards");
+        let (lo, hi) = self.merge_window(max_shards);
+        let keep_n = self.shards.len() - (hi - lo);
+        let merged: Vec<usize> = (lo..hi).collect();
+        info!(merged = merged.len(), kept = keep_n, from = lo, "merging shards");
 
         // Union repo string tables (oldest shard first), remap repo_ids.
         let mut repos: Vec<String> = Vec::new();
@@ -781,8 +810,12 @@ impl ShardSet {
         // some other process still has mapped cannot be unlinked on
         // Windows; park it under STALE_EXT (renaming a mapped file is
         // allowed), where `open_dir` ignores it and reaps it later.
-        let kept: Vec<Shard> = self.shards.drain(..keep_n).collect();
-        self.shards.clear();
+        let kept: Vec<Shard> = std::mem::take(&mut self.shards)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !(lo..hi).contains(i))
+            .map(|(_, s)| s)
+            .collect();
         for p in &merged_paths {
             if let Err(e) = fs::remove_file(p) {
                 let parked = p.with_extension(STALE_EXT);

@@ -241,7 +241,7 @@ pub fn remote_map(data_dir: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for name in crate::sources::registered_repo_names(data_dir).unwrap_or_default() {
         let Ok(st) = load_state(data_dir, &name) else { continue };
-        if st.plain {
+        if st.is_plain() {
             continue;
         }
         let Ok(repo) = gix::open(&st.path) else { continue };
@@ -432,7 +432,7 @@ pub fn apply_worktree_patch(
         return Err(OverlayError::Invalid(format!("patch over {MAX_PATCH_BYTES} bytes")).into());
     }
     let state = load_state(data_dir, repo).map_err(|_| OverlayError::UnknownRepo(repo.to_string()))?;
-    if state.plain {
+    if state.is_plain() {
         return Err(OverlayError::Invalid(format!("'{repo}' is a plain folder, not a git repo")).into());
     }
     let base = base.to_ascii_lowercase();

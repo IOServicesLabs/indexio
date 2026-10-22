@@ -19,11 +19,13 @@ use serde_json::{json, Value};
 
 use indexio_query::Engine;
 
+#[path = "hook_ps.rs"]
+mod ps;
+
 /// Escape hint, appended only when the SAME command is denied a second
 /// time in a session (SPEC-P10): shown on every deny, the model learned it
 /// from the first reason and wrote `# raw` on its next shell read instead
 /// of the indexio call.
-const RAW: &str = " (You already saw this: if the shell is really needed, add `# raw` to the command.)";
 
 /// Registered repos as (name, root as registered). [`locate`] matches
 /// against these first and canonicalizes them only when that fails:
@@ -51,6 +53,31 @@ fn plain(p: &Path) -> PathBuf {
     }
 }
 
+/// The path whose indexed contents a read of `abs` (at `rel` in `repo`)
+/// gets: `rel` itself, or for a file in a Claude Code agent worktree
+/// (`<repo>/.claude/worktrees/<name>/<path>`, a second checkout the index
+/// does not hold) `<path>` when the file there is byte for byte the indexed
+/// one (823 worktree Reads, 7.2M chars, went past the hooks in two weeks;
+/// an edited file stays the agent's own and is left to the Read tool).
+pub(crate) fn indexed_rel(engine: &Engine, repo: &str, rel: &str, abs: &Path) -> Option<String> {
+    if contents_indexed(engine, repo, rel) {
+        return Some(rel.to_string());
+    }
+    let (_, twin) = rel.strip_prefix(".claude/worktrees/")?.split_once('/')?;
+    let indexed = engine.file_content(repo, twin)?;
+    let disk = std::fs::read(abs).ok()?;
+    let lf = |b: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(b.len());
+        for (i, &c) in b.iter().enumerate() {
+            if !(c == b'\r' && b.get(i + 1) == Some(&b'\n')) {
+                out.push(c);
+            }
+        }
+        out
+    };
+    (lf(&disk) == lf(&indexed) && contents_indexed(engine, repo, twin)).then(|| twin.to_string())
+}
+
 /// Whether the index holds `rel`'s CONTENTS as the file itself: a name-only
 /// entry (a document, a text file over the cap) and a PDF's extracted text
 /// layer stand in for the file, and the file itself is what a Read or a
@@ -70,6 +97,51 @@ fn contents_indexed(engine: &Engine, repo: &str, rel: &str) -> bool {
     let first = content.split(|&b| b == b'\n').next().unwrap_or_default();
     let first = String::from_utf8_lossy(first.strip_suffix(b"\r").unwrap_or(first));
     !(first.contains(indexio_ingest::NAME_ONLY_MARKER) || first.contains(indexio_ingest::PDF_TEXT_MARKER))
+}
+
+/// The last `n` lines of an indexed file as a 1-based range (the index has
+/// the line count), so `tail -n 12 f` / `Get-Content f -Tail 12` is
+/// redirected to the exact `read_span` instead of an outline.
+fn tail_range(engine: &Engine, repo: &str, rel: &str, n: u64) -> Option<(u64, u64)> {
+    let set = engine.shard_set();
+    let one: std::collections::HashSet<String> = [rel.to_string()].into_iter().collect();
+    let (si, docid, _) = set.visible_at(repo, &one).into_iter().next()?;
+    let content = set.content(si, docid).ok()?;
+    let mut lines = content.iter().filter(|&&b| b == b'\n').count() as u64;
+    if content.last().is_some_and(|&b| b != b'\n') {
+        lines += 1;
+    }
+    (lines > 0).then(|| (lines.saturating_sub(n.max(1)) + 1, lines))
+}
+
+/// Whether an indexed file is short enough to read whole: a deny and the
+/// outline + span calls it asks for cost more than its lines (whole Reads
+/// of 1-2 KB memory notes were denied).
+pub(crate) fn is_small_file(engine: &Engine, repo: &str, rel: &str) -> bool {
+    tail_range(engine, repo, rel, 1).is_some_and(|(_, lines)| lines <= SMALL_READ_LINES)
+}
+
+/// `tail -n N` / `tail -N` / `tail -nN`: N (`-n +K`, from line K, is not a
+/// count and returns `None`).
+fn tail_count(args: &[String]) -> Option<u64> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let v = if a == "-n" || a == "--lines" {
+            it.next().map(String::as_str)
+        } else if let Some(v) = a.strip_prefix("--lines=") {
+            Some(v)
+        } else if let Some(v) = a.strip_prefix("-n") {
+            Some(v)
+        } else {
+            a.strip_prefix('-').filter(|v| v.chars().all(|c| c.is_ascii_digit()))
+        };
+        if let Some(v) = v {
+            // `+K` (from line K on) parses as a u64, but is not a tail count
+            return v.strip_prefix('+').map_or_else(|| v.parse().ok(), |_| None);
+        }
+    }
+    // plain `tail f` is the last 10 lines
+    Some(10)
 }
 
 /// (repo, repo-relative path with '/') for an absolute path inside a repo.
@@ -241,30 +313,67 @@ fn has_redirect(stage: &str) -> bool {
 }
 
 /// A pipeline stage that only views or filters text (so the pipeline is
-/// still a read, not a program consuming the file).
+/// still a read, not a program consuming the file). Counting (`wc`,
+/// `uniq -c`) and byte views (`cat -A`) are not: their answer is a number
+/// or the invisible characters, which no indexio call returns — denying
+/// `grep -n x f | cat -A` made the model send it again.
 fn is_viewer(stage: &str) -> bool {
     let w = words(stage);
+    let Some(cmd) = w.first().map(String::as_str) else { return false };
     matches!(
-        w.first().map(String::as_str),
-        Some("head" | "tail" | "grep" | "rg" | "egrep" | "fgrep" | "sed" | "awk" | "cut" | "sort" | "uniq" | "wc" | "less" | "more" | "tr" | "nl" | "cat" | "column" | "tee")
+        cmd,
+        "head" | "tail" | "grep" | "rg" | "egrep" | "fgrep" | "sed" | "awk" | "cut" | "sort" | "uniq" | "less" | "more" | "tr" | "nl" | "cat" | "column" | "tee"
     ) && !w.iter().any(|a| a == "-i")
+        && !shows_bytes(cmd, &w[1..])
+        && !(cmd == "uniq" && w[1..].iter().any(|a| a == "-c" || a == "--count"))
 }
 
-/// A `sed -n 'A,Bp'` / `sed -n Ap` range.
-fn sed_range(args: &[String]) -> Option<(u32, u32)> {
+/// Short flags of one bundle (`-rnA` -> `rnA`); empty for a long option or
+/// an operand.
+fn short_flags(a: &str) -> &str {
+    match a.strip_prefix('-') {
+        Some(f) if !f.starts_with('-') => f,
+        _ => "",
+    }
+}
+
+/// `cat -A` / `-v` / `-e` / `-t`, `head -c`, `tail -c` / `-f`: output the
+/// index does not have (control characters, bytes, a growing file).
+fn shows_bytes(cmd: &str, args: &[String]) -> bool {
+    match cmd {
+        "cat" => args.iter().any(|a| short_flags(a).contains(['A', 'v', 'e', 'E', 't', 'T']) || a.starts_with("--show")),
+        "head" => args.iter().any(|a| short_flags(a).starts_with('c') || a.starts_with("--bytes")),
+        "tail" => args.iter().any(|a| {
+            let f = short_flags(a);
+            f.starts_with('c') || f.contains(['f', 'F']) || a.starts_with("--bytes") || a.starts_with("--follow")
+        }),
+        _ => false,
+    }
+}
+
+/// The ranges of a `sed -n 'A,Bp'` / `sed -n Ap` script, several when it
+/// prints more than one (`'A,Bp;C,Dp'`, `-e 'A,Bp' -e 'C,Dp'`); empty when
+/// any command in it is something else.
+fn sed_ranges(args: &[String]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
     for a in args {
         let a = a.trim_matches(|c| c == '\'' || c == '"');
-        if let Some(body) = a.strip_suffix('p') {
-            if let Some((s, e)) = body.split_once(',') {
-                if let (Ok(s), Ok(e)) = (s.parse::<u32>(), e.parse::<u32>()) {
-                    return Some((s, e));
-                }
-            } else if let Ok(s) = body.parse::<u32>() {
-                return Some((s, s));
+        if a.starts_with('-') || !a.ends_with('p') {
+            continue;
+        }
+        for cmd in a.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            let Some(body) = cmd.strip_suffix('p') else { return Vec::new() };
+            let range = match body.split_once(',') {
+                Some((s, e)) => s.parse::<u32>().ok().zip(e.parse::<u32>().ok()),
+                None => body.parse::<u32>().ok().map(|s| (s, s)),
+            };
+            match range {
+                Some(r) => out.push(r),
+                None => return Vec::new(),
             }
         }
     }
-    None
+    out
 }
 
 /// Positional (non-flag) arguments.
@@ -279,6 +388,10 @@ struct GrepArgs {
     paths: Vec<String>,
     after: Option<u32>,
     ere: bool,
+    /// `-c`, `-l`, `-L`, `-q`, `-o`: a count, file names, a status or the
+    /// matched parts only — all smaller than the lines an indexio call
+    /// returns, so the grep is the cheaper answer.
+    not_lines: bool,
 }
 
 /// grep/rg options that take a value (so the value is not a path).
@@ -295,6 +408,7 @@ fn grep_args(cmd: &str, args: &[String]) -> GrepArgs {
         paths: Vec::new(),
         after: None,
         ere: matches!(cmd, "rg" | "egrep" | "ag" | "ack"),
+        not_lines: false,
     };
     let mut i = 0;
     let mut only_operands = false;
@@ -316,6 +430,22 @@ fn grep_args(cmd: &str, args: &[String]) -> GrepArgs {
         }
         if a == "-E" || a == "-P" || a == "--extended-regexp" || a == "--perl-regexp" {
             g.ere = true;
+        }
+        if matches!(
+            a.split('=').next().unwrap_or(""),
+            "--count" | "--files-with-matches" | "--files-without-match" | "--quiet" | "--only-matching" | "--count-matches"
+        ) {
+            g.not_lines = true;
+        }
+        // a bundle's flags up to the first one that takes a value
+        // (`-rlc`, `-rho`; in `-A3c` the `3c` is a value)
+        for c in short_flags(a).chars() {
+            if matches!(c, 'c' | 'l' | 'L' | 'q' | 'o') {
+                g.not_lines = true;
+            }
+            if matches!(c, 'A' | 'B' | 'C' | 'm' | 'e' | 'f' | 'g' | 't' | 'T' | 'd' | 'D' | 'j') {
+                break;
+            }
         }
         // `--opt=value`, `-A3`, `-e pat`, `-A 3`
         if let Some((k, v)) = a.split_once('=') {
@@ -425,24 +555,64 @@ fn is_outline_pattern(ere: &str) -> bool {
         })
 }
 
-/// Bring `repo`'s working tree into the index before a redirected lookup
-/// runs (the session that issued the shell read may not be the one that
-/// auto-refreshes this repo). Lexical only; with the repo's saved worktree
-/// cache it is a stat pass when nothing changed (without one, every hook
-/// call re-read and re-hashed the whole tree). Errors are ignored.
-fn freshen(data_dir: &Path, repo: &str) {
-    freshen_paths(data_dir, repo, None);
+/// Bring `repo`'s working tree (or just `rel`) into the index before the
+/// redirected lookup runs, in a detached `hook freshen` process: the deny
+/// is printed at once and the model's next call comes seconds later. Done
+/// inline, the pass sat on the hook's clock — an old binary without the
+/// saved worktree cache re-hashed the whole repo on every deny and hit
+/// Claude Code's 10 s hook timeout 33 times in a week, so the read ran
+/// anyway after a 10 s stall. The session's own repo is skipped: its MCP
+/// server refreshes it before every call.
+fn freshen_later(data_dir: &Path, own: Option<&str>, repo: &str, rel: Option<&str>) {
+    // (in unit tests current_exe is the test runner)
+    if own == Some(repo) || cfg!(test) {
+        return;
+    }
+    if std::env::var_os("INDEXIO_HOOK_INLINE_FRESHEN").is_some() {
+        freshen_paths(data_dir, repo, rel);
+        return;
+    }
+    // never inline as a fallback: the watchdog may end this process, and
+    // a writer killed under its repo lock blocks other writers for minutes
+    let _ = spawn_detached(data_dir, repo, rel);
 }
 
-/// [`freshen`] for a read of known files: only those are stat'ed (and
-/// re-indexed when they changed), with the whole-tree pass as the fallback
-/// for a file the saved cache does not list. The denied read is what the
-/// suggested call will ask for; the session's own repo is refreshed by its
-/// server before every call anyway. A whole-repo pass cost 25-45 ms a deny.
-fn freshen_file(data_dir: &Path, repo: &str, rel: &str) {
-    freshen_paths(data_dir, repo, Some(rel));
+/// `indexio --data-dir D hook freshen --repo R [--path P]`, cut loose from
+/// the hook: no inherited stdio (Claude Code waits for its pipes to close),
+/// its own process group, out of the hook's job where that is allowed.
+fn spawn_detached(data_dir: &Path, repo: &str, rel: Option<&str>) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut c = Command::new(std::env::current_exe()?);
+    c.arg("--data-dir").arg(data_dir).args(["hook", "freshen", "--repo", repo]);
+    if let Some(rel) = rel {
+        c.args(["--path", rel]);
+    }
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        if c.spawn().is_ok() {
+            return Ok(());
+        }
+        // the job does not allow breakaway
+        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    c.spawn().map(|_| ())
 }
 
+/// Entry point for `hook freshen` (spawned by [`freshen_later`]).
+pub fn run_freshen(data_dir: &Path, repo: &str, rel: Option<&str>) {
+    freshen_paths(data_dir, repo, rel);
+}
+
+/// Lexical only; with the repo's saved worktree cache a whole-repo pass is
+/// a stat pass when nothing changed. A known file is stat'ed alone (and
+/// re-indexed when it changed), with the whole-tree pass as the fallback
+/// for a file the saved cache does not list. Errors are ignored.
 fn freshen_paths(data_dir: &Path, repo: &str, rel: Option<&str>) {
     let t0 = std::time::Instant::now();
     if let (Some(rel), Ok(cas)) = (rel, indexio_ingest::Cas::open(&data_dir.join("cas"))) {
@@ -546,7 +716,11 @@ fn script_read(stage: &str) -> Option<(String, Option<String>)> {
         "subprocess", "os.system", "mkdir", "rmtree", "unlinkSync", "renameSync", "child_process", "'w'", "\"w\"",
         "'a'", "\"a\"", "'w+'", "\"w+\"", "'r+'", "\"r+\"", "'wb'", "\"wb\"",
     ];
-    if WRITES.iter().any(|m| code.contains(m)) {
+    // byte-level questions (line endings, counts, escapes): the answer is
+    // not the file's text, and the index holds text with CRLF folded —
+    // `b.count(b'\r\n')` was denied twice in a row
+    const ANALYSES: &[&str] = &["'rb'", "\"rb\"", ".count(", "repr(", "ascii("];
+    if WRITES.iter().chain(ANALYSES).any(|m| code.contains(m)) {
         return None;
     }
     let path = ["open(", "readFileSync(", "readFile(", "Path(", "read_text("]
@@ -619,12 +793,22 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
     if repos.is_empty() {
         return None;
     }
+    // the session's repo: its MCP server refreshes it, the hook need not
+    let own = locate(&repos, cwd).map(|(r, _)| r);
+    // opened on the first file that needs it
     let mut engine: Option<Engine> = None;
-    let mut indexed = |repo: &str, rel: &str| -> bool {
+    let indexed = |engine: &mut Option<Engine>, repo: &str, rel: &str| -> bool {
         if engine.is_none() {
-            engine = Engine::open(data_dir).ok();
+            *engine = Engine::open(data_dir).ok();
         }
         engine.as_ref().is_some_and(|e| contents_indexed(e, repo, rel))
+    };
+    // the same for a file read: the path to point at (see `indexed_rel`)
+    let indexed_as = |engine: &mut Option<Engine>, repo: &str, rel: &str, abs: &Path| -> Option<String> {
+        if engine.is_none() {
+            *engine = Engine::open(data_dir).ok();
+        }
+        indexed_rel(engine.as_ref()?, repo, rel, abs)
     };
     let mut cwd = cwd.to_path_buf();
     for pipeline in split(command) {
@@ -661,6 +845,9 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                 if cmd == "sed" && args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
                     continue; // an edit
                 }
+                if shows_bytes(cmd, args) {
+                    continue;
+                }
                 let files: Vec<(String, String, PathBuf)> = positional(args)
                     .into_iter()
                     .filter(|a| !(cmd == "sed" && a.ends_with('p')))
@@ -681,17 +868,17 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                     if debug {
                         eprintln!("hook: located ({} us)", t0.elapsed().as_micros());
                     }
-                    if !indexed(&repo, &rel) {
+                    let Some(rel) = indexed_as(&mut engine, &repo, &rel, &abs) else {
                         if debug {
                             eprintln!("hook: {repo}:{rel} not indexed");
                         }
                         continue;
-                    }
+                    };
                     if debug {
                         eprintln!("hook: indexed checked ({} us)", t0.elapsed().as_micros());
                     }
-                    let range = if cmd == "sed" {
-                        sed_range(args)
+                    let ranges: Vec<(u32, u32)> = if cmd == "sed" {
+                        sed_ranges(args)
                     } else if cmd == "head" {
                         args.iter()
                             .position(|x| x == "-n")
@@ -699,18 +886,37 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                             .and_then(|n| n.parse::<u32>().ok())
                             .or_else(|| args.iter().find_map(|x| x.strip_prefix("-n").and_then(|n| n.parse().ok())))
                             .map(|n| (1, n))
+                            .or(Some((1, 10))) // plain `head f`
+                            .into_iter()
+                            .collect()
+                    } else if cmd == "tail" {
+                        let e = engine.as_ref();
+                        tail_count(args)
+                            .and_then(|n| tail_range(e?, &repo, &rel, n))
+                            .map(|(s, e)| (s as u32, e as u32))
+                            .into_iter()
+                            .collect()
                     } else {
-                        None
+                        Vec::new()
                     };
-                    let call = match range {
-                        Some((s, e)) => format!(
-                            "mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{s}, end:{e}}}"
-                        ),
-                        None => format!(
-                            "mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need"
-                        ),
+                    // a few lines are cheaper read than denied (as for Read)
+                    let lines: u64 = ranges.iter().map(|&(s, e)| u64::from(e.saturating_sub(s)) + 1).sum();
+                    if !ranges.is_empty() && lines <= SMALL_READ_LINES {
+                        continue;
+                    }
+                    if ranges.is_empty() && engine.as_ref().is_some_and(|e| is_small_file(e, &repo, &rel)) {
+                        continue;
+                    }
+                    let call = if ranges.is_empty() {
+                        format!("mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need")
+                    } else {
+                        ranges
+                            .iter()
+                            .map(|(s, e)| format!("mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{s}, end:{e}}}"))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
                     };
-                    freshen_file(data_dir, &repo, &rel);
+                    freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
                     return Some(format!("{a} is indexed: use {call} instead (numbered, fresh)"));
                 }
             }
@@ -719,6 +925,9 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                 // is a filesystem search: pattern = first positional, paths =
                 // the rest (none = cwd)
                 let g = grep_args(cmd, args);
+                if g.not_lines {
+                    continue;
+                }
                 let Some(pattern) = g.pattern.as_deref() else { continue };
                 let paths: Vec<PathBuf> = if !g.paths.is_empty() {
                     g.paths.iter().map(|p| resolve(&cwd, p)).collect()
@@ -729,7 +938,7 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                 for p in &paths {
                     match locate(&repos, p) {
                         // a file must itself be indexed (a .log inside the repo is not)
-                        Some((repo, rel)) if p.is_file() && !indexed(&repo, &rel) => return None,
+                        Some((repo, rel)) if p.is_file() && !indexed(&mut engine, &repo, &rel) => return None,
                         Some(t) => targets.push(t),
                         None => return None, // something outside the index: allow
                     }
@@ -752,8 +961,10 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                         format!(" path:{}", rels.join("|"))
                     }
                 };
-                for (repo, _) in &targets {
-                    freshen(data_dir, repo);
+                let mut fresh: Vec<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
+                fresh.dedup();
+                for repo in fresh {
+                    freshen_later(data_dir, own.as_deref(), repo, None);
                 }
                 let fixed = args.iter().any(|a| a == "-F" || a == "--fixed-strings");
                 let ere = if g.ere { pattern.to_string() } else { bre_to_ere(pattern) };
@@ -807,10 +1018,8 @@ fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
                     continue;
                 }
                 let Some((repo, rel)) = locate(&repos, &abs) else { continue };
-                if !indexed(&repo, &rel) {
-                    continue;
-                }
-                freshen_file(data_dir, &repo, &rel);
+                let Some(rel) = indexed_as(&mut engine, &repo, &rel, &abs) else { continue };
+                freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
                 let call = match needle {
                     Some(n) => format!(
                         "mcp__indexio__code_grep {{pattern:\"{}\", repo:\"{repo}\", path:\"{rel}\"}} then read_span {{repo, path, start:line, end:line+60}}",
@@ -860,8 +1069,9 @@ pub fn hook_command(exe: &Path, args: &str) -> String {
 }
 
 /// The hooks this binary provides: (event, tool matcher, args, timeout s).
-const HOOKS: [(&str, Option<&str>, &str, u64); 4] = [
+const HOOKS: [(&str, Option<&str>, &str, u64); 5] = [
     ("PreToolUse", Some("Bash"), "hook bash", 10),
+    ("PreToolUse", Some("PowerShell"), "hook powershell", 10),
     ("PreToolUse", Some("Read"), "hook read", 10),
     ("PreCompact", None, "sessions --quiet", 120),
     ("SessionStart", None, "hook session-start", 10),
@@ -985,8 +1195,13 @@ fn raw_is_retry(data_dir: &Path, session: &str, command: &str) -> bool {
 /// (2,000 lines by default). `offset`/`limit` (1-based line, count) map to
 /// a `read_span` range; without them the outline comes first. Files the
 /// index does not have (images, logs, task outputs, unindexed folders) are
-/// allowed untouched.
-pub fn read_verdict(data_dir: &Path, file_path: &str, offset: Option<u64>, limit: Option<u64>) -> Option<String> {
+/// allowed untouched, and so is a Read of at most [`SMALL_READ_LINES`]
+/// lines: `read_span` saves ~1.5 tokens a line there, the deny and the
+/// second call cost ~110.
+pub fn read_verdict(data_dir: &Path, cwd: Option<&Path>, file_path: &str, offset: Option<u64>, limit: Option<u64>) -> Option<String> {
+    if limit.is_some_and(|n| n <= SMALL_READ_LINES) {
+        return None;
+    }
     let abs = PathBuf::from(file_path);
     if !abs.is_file() {
         return None;
@@ -994,11 +1209,17 @@ pub fn read_verdict(data_dir: &Path, file_path: &str, offset: Option<u64>, limit
     let repos = repos(data_dir);
     let (repo, rel) = locate(&repos, &abs)?;
     let engine = Engine::open(data_dir).ok()?;
-    if !contents_indexed(&engine, &repo, &rel) {
+    let asked = rel;
+    let rel = indexed_rel(&engine, &repo, &asked, &abs)?;
+    if limit.is_none() && is_small_file(&engine, &repo, &rel) {
         return None;
     }
-    freshen_file(data_dir, &repo, &rel);
-    let name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
+    let own = cwd.and_then(|c| locate(&repos, c)).map(|(r, _)| r);
+    freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
+    let mut name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
+    if rel != asked {
+        name.push_str(" (this worktree's copy is byte-identical to the repo's)");
+    }
     Some(match (offset, limit) {
         (Some(start), Some(n)) if n > 0 => format!(
             "{name} is indexed: use mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{start}, end:{}}} instead (numbered, fresh)",
@@ -1014,6 +1235,27 @@ pub fn read_verdict(data_dir: &Path, file_path: &str, offset: Option<u64>, limit
     })
 }
 
+/// Reads of this many lines or fewer are left to the Read tool.
+pub const SMALL_READ_LINES: u64 = 60;
+
+/// How long a hook may think before it lets the call through
+/// (`INDEXIO_HOOK_BUDGET_MS`, default 3000). Claude Code waits up to the
+/// hook's timeout (10 s) and then runs the call anyway, so a slow verdict
+/// only ever cost time. The verdict is read-only (the freshen runs in its
+/// own process), so ending it mid-way is safe.
+fn within_budget<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let ms = std::env::var("INDEXIO_HOOK_BUDGET_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000u64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    let out = rx.recv_timeout(std::time::Duration::from_millis(ms)).ok();
+    if out.is_none() && std::env::var_os("INDEXIO_HOOK_DEBUG").is_some() {
+        eprintln!("hook: over the {ms} ms budget, allowing");
+    }
+    out
+}
+
 /// Entry point for `hook read`: hook JSON on stdin, decision JSON on stdout.
 pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
     let mut input = String::new();
@@ -1022,10 +1264,19 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
     if v["tool_name"].as_str() != Some("Read") {
         return Ok(());
     }
-    let Some(file_path) = v["tool_input"]["file_path"].as_str() else { return Ok(()) };
+    let Some(file_path) = v["tool_input"]["file_path"].as_str().map(str::to_string) else { return Ok(()) };
     let offset = v["tool_input"]["offset"].as_u64();
     let limit = v["tool_input"]["limit"].as_u64();
-    if let Some(reason) = read_verdict(data_dir, file_path, offset, limit) {
+    let cwd = v["cwd"].as_str().map(PathBuf::from);
+    let session = v["session_id"].as_str().unwrap_or("nosession").to_string();
+    let data_dir = data_dir.to_path_buf();
+    let verdict = within_budget(move || {
+        let reason = read_verdict(&data_dir, cwd.as_deref(), &file_path, offset, limit)?;
+        let key = format!("Read {file_path} {offset:?} {limit:?}");
+        (!repeated_denial(&data_dir, &session, &key)).then_some(reason)
+    })
+    .flatten();
+    if let Some(reason) = verdict {
         println!(
             "{}",
             json!({
@@ -1040,10 +1291,15 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Touched when a session's context is compacted or cleared.
+pub(crate) fn compacted_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("hook").join("compacted")
+}
+
 /// Entry point for `hook session-start` (SessionStart): hook JSON on stdin,
 /// a few lines of past context as `additionalContext` on stdout
 /// (sessions::session_start_context). Prints nothing when there is none.
-pub fn run_session_start_hook(claude_dir: &Path) -> anyhow::Result<()> {
+pub fn run_session_start_hook(claude_dir: &Path, data_dir: &Path) -> anyhow::Result<()> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
@@ -1051,6 +1307,15 @@ pub fn run_session_start_hook(claude_dir: &Path) -> anyhow::Result<()> {
     let session = v["session_id"].as_str().unwrap_or("");
     let transcript = v["transcript_path"].as_str().map(PathBuf::from);
     let source = v["source"].as_str().unwrap_or("startup");
+    // the context was rebuilt: the MCP servers stop treating earlier
+    // read_span answers as still in view
+    if matches!(source, "compact" | "clear") {
+        let marker = compacted_marker(data_dir);
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, session);
+    }
     if let Some(ctx) = crate::sessions::session_start_context(claude_dir, &cwd, session, transcript.as_deref(), source) {
         println!(
             "{}",
@@ -1065,13 +1330,18 @@ pub fn run_session_start_hook(claude_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether this exact command was the last one denied in `session`; records
-/// it either way.
+/// Whether this exact call was the last one denied in `session`: a model
+/// that re-sends a denied call unchanged has read the reason and still
+/// wants it, and a second deny only cost it another round trip (25 such
+/// re-sends in a week). The record is cleared then, so the next deny of it
+/// starts over; otherwise this call is recorded as the last denied.
 fn repeated_denial(data_dir: &Path, session: &str, command: &str) -> bool {
     let path = last_denied_path(data_dir, session);
     let hash = indexio_types::BlobId::from_content(without_raw(command).as_bytes()).hex();
     let same = std::fs::read_to_string(&path).is_ok_and(|prev| prev.trim() == hash);
-    if !same {
+    if same {
+        let _ = std::fs::remove_file(&path);
+    } else {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -1134,6 +1404,42 @@ pub fn runner_rewrite(exe: &Path, command: &str) -> Option<String> {
     Some(format!("{prefix}{} run -- {quoted}", hook_command(exe, "").trim_end()))
 }
 
+/// Entry point for `hook powershell`: the PowerShell tool's commands judged
+/// by [`ps::verdict`] (no runner rewrite: `indexio run` is a POSIX-shell
+/// wrapper).
+pub fn run_powershell_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    if v["tool_name"].as_str() != Some("PowerShell") {
+        return Ok(());
+    }
+    let command = v["tool_input"]["command"].as_str().unwrap_or("").to_string();
+    let cwd = v["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+    let session = v["session_id"].as_str().unwrap_or("nosession").to_string();
+    if raw_is_retry(data_dir, &session, &command) {
+        return Ok(());
+    }
+    let dd = data_dir.to_path_buf();
+    let decided = within_budget(move || {
+        let reason = ps::verdict(&dd, &cwd, &without_raw(&command))?;
+        (!repeated_denial(&dd, &session, &command)).then_some(reason)
+    });
+    if let Some(Some(reason)) = decided {
+        println!(
+            "{}",
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+        );
+    }
+    Ok(())
+}
+
 /// Entry point: hook JSON on stdin, decision JSON on stdout, exit 0.
 pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
     let mut input = String::new();
@@ -1171,10 +1477,12 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
     }
     // judge the command as the shell will run it: the marker is a comment
     let judged = without_raw(command);
-    if let Some(mut reason) = verdict(data_dir, &cwd, &judged) {
-        if repeated_denial(data_dir, session, command) {
-            reason.push_str(RAW);
-        }
+    let (dd, cmd, sess) = (data_dir.to_path_buf(), command.to_string(), session.to_string());
+    let decided = within_budget(move || {
+        let reason = verdict(&dd, &cwd, &judged)?;
+        (!repeated_denial(&dd, &sess, &cmd)).then_some(reason)
+    });
+    if let Some(Some(reason)) = decided {
         println!(
             "{}",
             json!({
@@ -1228,6 +1536,41 @@ mod tests {
         assert!(script_read("python patch.py").is_none());
         assert!(!is_other_work(&["python -c \"print(open('a.rs').read())\"".to_string()]));
         assert!(is_other_work(&["python patch.py".to_string()]));
+        // byte questions are not reads: the shell answers them
+        assert!(script_read("python -c \"b=open('src/a.rs','rb').read(); print(b.count(b'\\r\\n'))\"").is_none());
+        assert!(script_read("python -c \"print(repr(open('a.rs').read()[:80]))\"").is_none());
+    }
+
+    #[test]
+    fn tail_counts() {
+        let s = |x: &str| x.split(' ').filter(|w| !w.is_empty()).map(String::from).collect::<Vec<_>>();
+        assert_eq!(tail_count(&s("-n 20 a.rs")), Some(20));
+        assert_eq!(tail_count(&s("-20 a.rs")), Some(20));
+        assert_eq!(tail_count(&s("-n5 a.rs")), Some(5));
+        assert_eq!(tail_count(&s("--lines=7 a.rs")), Some(7));
+        assert_eq!(tail_count(&s("a.rs")), Some(10));
+        assert_eq!(tail_count(&s("-n +40 a.rs")), None);
+    }
+
+    #[test]
+    fn counts_and_byte_views_are_not_line_reads() {
+        let s = |x: &str| x.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(shows_bytes("cat", &s("-A a.rs")));
+        assert!(shows_bytes("cat", &s("-vet a.rs")));
+        assert!(!shows_bytes("cat", &s("-n a.rs")));
+        assert!(shows_bytes("tail", &s("-f run.log")));
+        assert!(shows_bytes("head", &s("-c 200 a.bin")));
+        assert!(!shows_bytes("head", &s("-n 20 a.rs")));
+        assert!(!is_viewer("cat -A"));
+        assert!(!is_viewer("wc -l"));
+        assert!(!is_viewer("uniq -c"));
+        assert!(is_viewer("head -20"));
+        for (cmd, args) in [("grep", "-c foo a.rs"), ("grep", "-rl foo src"), ("rg", "-o foo"), ("grep", "-rhoE x src"), ("grep", "--count foo a")] {
+            assert!(grep_args(cmd, &s(args)).not_lines, "{cmd} {args}");
+        }
+        for (cmd, args) in [("grep", "-n foo a.rs"), ("grep", "-rn -A3 foo src"), ("rg", "-n foo")] {
+            assert!(!grep_args(cmd, &s(args)).not_lines, "{cmd} {args}");
+        }
     }
 
     #[test]
@@ -1247,10 +1590,14 @@ mod tests {
     }
 
     #[test]
-    fn sed_ranges() {
-        assert_eq!(sed_range(&["-n".into(), "10,20p".into()]), Some((10, 20)));
-        assert_eq!(sed_range(&["-n".into(), "'7p'".into()]), Some((7, 7)));
-        assert_eq!(sed_range(&["-n".into(), "s/a/b/p".into()]), None);
+    fn sed_scripts() {
+        let a = |x: &str| x.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(sed_ranges(&a("-n 10,20p")), vec![(10, 20)]);
+        assert_eq!(sed_ranges(&a("-n '7p'")), vec![(7, 7)]);
+        assert_eq!(sed_ranges(&a("-n s/a/b/p")), vec![]);
+        assert_eq!(sed_ranges(&a("-n '3160,3163p;3574,3577p' f.rs")), vec![(3160, 3163), (3574, 3577)]);
+        assert_eq!(sed_ranges(&a("-n -e 5,9p -e 20,30p f.rs")), vec![(5, 9), (20, 30)]);
+        assert_eq!(sed_ranges(&a("-n 5,9p;/x/p f.rs")), vec![]);
     }
 
     #[test]
@@ -1329,15 +1676,43 @@ mod tests {
         let data = tmp.path().join("data");
         let root = tmp.path().join("folder");
         std::fs::create_dir_all(root.join("wt")).unwrap();
-        std::fs::write(root.join("notes.md"), b"# Notes\nsome text\n").unwrap();
+        std::fs::write(root.join("notes.md"), format!("# Notes\n{}", "some text\n".repeat(100))).unwrap();
+        std::fs::write(root.join("short.md"), b"# Short\nsome text\n").unwrap();
         std::fs::write(root.join("spec.pdf"), b"%PDF\0binary").unwrap();
         std::fs::write(root.join("wt/.git"), b"gitdir: elsewhere\n").unwrap();
         std::fs::write(root.join("wt/lib.rs"), b"fn x() {}\n").unwrap();
         let cas = indexio_ingest::Cas::open(&data.join("cas")).unwrap();
         let r = indexio_ingest::index_dir(&root, "folder", &data, &cas).unwrap();
-        assert_eq!(r.docs_added, 2, "notes.md + spec.pdf by name; the worktree is skipped");
-        assert!(read_verdict(&data, &root.join("notes.md").to_string_lossy(), None, None).is_some());
-        assert_eq!(read_verdict(&data, &root.join("spec.pdf").to_string_lossy(), None, None), None);
+        assert_eq!(r.docs_added, 3, "notes.md, short.md + spec.pdf by name; the worktree is skipped");
+        assert_eq!(read_verdict(&data, None, &root.join("short.md").to_string_lossy(), None, None), None, "a short file read whole");
+        assert!(read_verdict(&data, None, &root.join("notes.md").to_string_lossy(), None, None).is_some());
+        assert_eq!(read_verdict(&data, None, &root.join("spec.pdf").to_string_lossy(), None, None), None);
+        // a short read is cheaper as it is than through a deny
+        assert_eq!(read_verdict(&data, None, &root.join("notes.md").to_string_lossy(), Some(1), Some(40)), None);
+        assert!(read_verdict(&data, None, &root.join("notes.md").to_string_lossy(), Some(1), Some(200)).is_some());
+    }
+
+    #[test]
+    fn a_worktree_copy_identical_to_the_indexed_file_is_redirected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("folder");
+        let body = format!("# Notes\n{}", "some text\n".repeat(100));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/notes.md"), &body).unwrap();
+        for (wt, text) in [("agent-1", body.replace('\n', "\r\n")), ("agent-2", format!("{body}edited\n"))] {
+            let dir = root.join(".claude/worktrees").join(wt);
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            std::fs::write(dir.join(".git"), b"gitdir: elsewhere\n").unwrap();
+            std::fs::write(dir.join("docs/notes.md"), text).unwrap();
+        }
+        let cas = indexio_ingest::Cas::open(&data.join("cas")).unwrap();
+        let r = indexio_ingest::index_dir(&root, "folder", &data, &cas).unwrap();
+        assert_eq!(r.docs_added, 1, "the worktrees are not indexed");
+        let at = |wt: &str| root.join(".claude/worktrees").join(wt).join("docs/notes.md").to_string_lossy().into_owned();
+        let same = read_verdict(&data, None, &at("agent-1"), None, None).expect("same bytes (CRLF aside): denied");
+        assert!(same.contains("path:\"docs/notes.md\"") && same.contains("byte-identical"), "{same}");
+        assert_eq!(read_verdict(&data, None, &at("agent-2"), None, None), None, "the agent's edit is its own");
     }
 
     #[test]
@@ -1352,13 +1727,15 @@ mod tests {
             ]}
         });
         let changes = install_settings(&mut s, exe);
-        assert_eq!(changes.len(), 4, "{changes:?}");
+        assert_eq!(changes.len(), 5, "{changes:?}");
         let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 3);
+        assert_eq!(pre.len(), 4);
         assert_eq!(pre[0]["hooks"][0]["command"], "rtk hook claude");
         assert_eq!(pre[1]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook bash");
-        assert_eq!(pre[2]["matcher"], "Read");
-        assert_eq!(pre[2]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook read");
+        assert_eq!(pre[2]["matcher"], "PowerShell");
+        assert_eq!(pre[2]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook powershell");
+        assert_eq!(pre[3]["matcher"], "Read");
+        assert_eq!(pre[3]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook read");
         assert_eq!(s["hooks"]["PreCompact"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe sessions --quiet");
         assert!(s["hooks"]["PreCompact"][0].get("matcher").is_none());
         assert_eq!(s["hooks"]["SessionStart"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook session-start");
@@ -1376,14 +1753,17 @@ mod tests {
         let cmd = "sed -n 1,5p src/lib.rs";
         // a fresh `# raw` on a never-denied command is not a retry
         assert!(!raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs # raw"));
-        // first denial records the command; the second identical one repeats
+        // first denial records the command
         assert!(!repeated_denial(d, "s1", cmd));
-        assert!(repeated_denial(d, "s1", cmd));
         // now the marker on that command is a retry, on another it is not
         assert!(raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs # raw"));
         assert!(raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs  # raw"));
         assert!(!raw_is_retry(d, "s1", "sed -n 1,9p src/lib.rs # raw"));
         assert!(!raw_is_retry(d, "s2", "sed -n 1,5p src/lib.rs # raw"), "per session");
+        // the identical re-send repeats (and goes through); the one after starts over
+        assert!(repeated_denial(d, "s1", cmd));
+        assert!(!repeated_denial(d, "s1", cmd));
+        assert!(repeated_denial(d, "s1", cmd));
         assert_eq!(without_raw("grep -n foo a.rs | head # raw"), "grep -n foo a.rs | head");
     }
 

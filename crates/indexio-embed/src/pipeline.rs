@@ -274,6 +274,10 @@ pub const MAX_SEGMENTS: usize = 8;
 /// Tombstoned row fraction above which every segment is merged.
 pub const MAX_DEAD_FRACTION: f64 = 0.3;
 
+/// A segment under 1/this of the largest one's rows is folded into the
+/// others on a compaction; bigger ones are left as they are.
+const SMALL_SEGMENT_RATIO: usize = 8;
+
 /// Age past which half of a segment pair is an orphan (its writer died
 /// between the two files) rather than a write in flight.
 pub const ORPHAN_AGE: Duration = Duration::from_secs(10 * 60);
@@ -768,7 +772,17 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
         let largest = (0..n)
             .max_by_key(|&i| vset.segments()[i].raw_len())
             .expect("n > 0");
-        (0..n).filter(|&i| i != largest).collect()
+        // the small segments (refresh deltas) alone when folding them is
+        // enough: every big one is carried as it is instead of re-encoded
+        // (13 → 3 segments wrote 0.4 MB, where all-but-the-largest rewrote a
+        // 535 MB segment: 11 s and 2.8 GB of memory per compaction)
+        let big = vset.segments()[largest].raw_len();
+        let small: Vec<usize> = (0..n).filter(|&i| vset.segments()[i].raw_len() * SMALL_SEGMENT_RATIO < big).collect();
+        if small.len() >= 2 && n - small.len() < MAX_SEGMENTS {
+            small
+        } else {
+            (0..n).filter(|&i| i != largest).collect()
+        }
     } else {
         return Ok(false);
     };
@@ -1281,6 +1295,36 @@ mod tests {
         assert_eq!(top.repo, "r1");
         assert!(top.path.contains("new.rs"), "top hit: {top:?}");
         assert!(dot(&q, &q) > 0.99);
+    }
+
+    #[test]
+    fn compaction_folds_small_segments_and_carries_the_big_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut repos: Vec<String> = vec!["big".into()];
+        repos.extend((0..9).map(|k| format!("s{k}")));
+        let names: Vec<&str> = repos.iter().map(String::as_str).collect();
+        let bodies: Vec<(usize, String, Vec<u8>)> = (0..40)
+            .map(|i| (0, format!("src/f{i}.rs"), format!("fn big_function_{i}() {{ {i} }}\n").into_bytes()))
+            .chain((0..9).map(|k| (k + 1, "src/x.rs".to_string(), format!("fn small_{k}() {{}}\n").into_bytes())))
+            .collect();
+        let docs: Vec<(u32, &str, &[u8])> = bodies.iter().map(|(r, p, b)| (*r as u32, p.as_str(), b.as_slice())).collect();
+        let shards = build_shardset(tmp.path(), &names, &docs);
+        let e = HashEmbedder::new(64);
+        for r in &names {
+            embed_repo(&shards, tmp.path(), r, &e).unwrap();
+        }
+        let before = VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap();
+        assert_eq!(before.segments().len(), 10);
+        let big_path = before.segments().iter().max_by_key(|s| s.raw_len()).unwrap().path().to_path_buf();
+        let live = (0..before.raw_len() as u32).filter(|&r| !before.is_deleted(r)).count();
+        drop(before);
+        assert!(compact_vectors(tmp.path(), "hash-v1").unwrap());
+        let after = VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap();
+        assert_eq!(after.segments().len(), 2, "the nine small ones folded into one");
+        assert!(big_path.exists(), "the big segment is carried as it is");
+        assert_eq!((0..after.raw_len() as u32).filter(|&r| !after.is_deleted(r)).count(), live);
+        let q = e.embed(&["fn small_4".to_string()]).unwrap().remove(0);
+        assert_eq!(after.row_meta(after.search(&q, 1)[0].0).repo, "s4");
     }
 
     /// Row slots via public API (live rows + tombstoned, what the aligned

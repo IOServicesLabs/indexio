@@ -314,13 +314,17 @@ pub mod verify {
         out
     }
 
+    /// Most literals [`required_literals`] returns; more means no constraint.
+    pub const MAX_LITERALS: usize = 64;
+
     /// RE2-style required literals from a regex; None if no usable literal.
     ///
     /// Strategy: parse the pattern with `regex-syntax` (bytes semantics) and
     /// compute, per alternation branch, the longest literal byte string that
     /// is guaranteed to *prefix* every match of that branch; concatenated
     /// literal runs are merged (e.g. `(foo|foobar)baz` yields `foobaz` and
-    /// `foobarbaz`). Returns the best 1–4 literals, longest first.
+    /// `foobarbaz`). Returns every branch's literal, longest first (at most
+    /// [`MAX_LITERALS`]).
     ///
     /// Returns `None` when there is no guaranteed literal: the pattern can
     /// match the empty string, starts with something non-literal such as
@@ -343,10 +347,32 @@ pub mod verify {
         }
         lits.sort();
         lits.dedup();
-        // Longest first; keep the best 1-4.
+        // The list is disjunctive (every match starts with ONE of them), so
+        // all of it is needed: keeping only the longest 4 dropped the short
+        // branches of `a|b|c|d|e` and every file that matched only those.
+        // Past MAX_LITERALS the union of gram lookups is not worth it; the
+        // caller scans instead.
+        if lits.len() > MAX_LITERALS {
+            return None;
+        }
         lits.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        lits.truncate(4);
         Some(lits)
+    }
+
+    /// [`required_literals`], plus a leading `(?i)`: `(literals, true)` when
+    /// the pattern is case-insensitive as a whole, to be looked up through
+    /// each trigram's ASCII case variants. Every match of `(?i)P` is a match
+    /// of `P` up to ASCII case, so `P`'s literals bound it — ASCII literals
+    /// only (Unicode folding maps `K` to the Kelvin sign and back).
+    pub fn prefilter_literals(pattern: &str) -> Option<(Vec<Vec<u8>>, bool)> {
+        if let Some(rest) = pattern.strip_prefix("(?i)") {
+            if rest.contains("(?") {
+                return None;
+            }
+            let lits = required_literals(rest)?;
+            return lits.iter().all(|l| l.is_ascii()).then_some((lits, true));
+        }
+        required_literals(pattern).map(|l| (l, false))
     }
 
     /// Guaranteed literal prefixes of `hir`: `Some(list)` means every match
@@ -499,7 +525,7 @@ pub mod verify {
 #[cfg(test)]
 mod tests {
     use super::grams::{extract, grams_of, CommonGrams, MAX_DOC_BYTES, MAX_GRAM_LEN};
-    use super::verify::{find_literal, find_regex, line_col, required_literals};
+    use super::verify::{find_literal, find_regex, line_col, required_literals, MAX_LITERALS};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -858,10 +884,23 @@ fn main() {
         assert_eq!(required_literals("(foo|.*)"), None);
         // repetition min>=1 still guarantees prefix
         assert_eq!(required_literals("ab+c"), Some(vec![b"ab".to_vec()]));
-        // capped at 4, longest first
+        // every branch kept (the list is disjunctive), longest first
         let lits = required_literals("(aaaa|bbb|cc|d|eeeeee)(fff)").unwrap();
-        assert!(lits.len() <= 4);
+        assert_eq!(lits.len(), 5);
+        assert!(lits.contains(&b"dfff".to_vec()));
         assert!(lits.windows(2).all(|w| w[0].len() >= w[1].len()));
+        let five = required_literals("localStorage|deviceOk|kokoroWorks|prefer|function pickEngine").unwrap();
+        assert!(five.contains(&b"prefer".to_vec()), "{five:?}");
+        // a leading (?i) keeps the literals, flagged case-insensitive
+        let (ci, flag) = super::verify::prefilter_literals("(?i)(business|working)_?hours|workday").unwrap();
+        assert!(flag);
+        assert!(ci.contains(&b"workday".to_vec()) && ci.contains(&b"business".to_vec()), "{ci:?}");
+        assert_eq!(super::verify::prefilter_literals("foo(?i)bar"), None);
+        assert_eq!(super::verify::prefilter_literals("(?i)a(?-i)b"), None);
+        assert_eq!(super::verify::prefilter_literals("fn main").map(|x| x.1), Some(false));
+        // too many branches: no constraint rather than a partial one
+        let many: Vec<String> = (0..MAX_LITERALS + 1).map(|i| format!("w{i:03}x")).collect();
+        assert_eq!(required_literals(&many.join("|")), None);
     }
 
     #[test]

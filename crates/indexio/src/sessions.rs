@@ -96,6 +96,28 @@ pub fn index_sessions(
     indexio_ingest::reindex_worktree_cached(REPO, data_dir, cas, cache)
 }
 
+/// Name of the plain-folder source over Claude Code's memory folders.
+pub const MEMORY_REPO: &str = "memory";
+
+/// Register `<claude_dir>/projects` as the `memory` source (once): only the
+/// `*/memory/**` notes, not the transcripts and tool output beside them,
+/// and delta re-index it by content. Agents read these notes whole and
+/// often (one 112 KB note 42 times, 1.25M chars, in two weeks); indexed,
+/// they get an outline, read_span and grep like any repo file.
+pub fn index_memory(
+    claude_dir: &Path,
+    data_dir: &Path,
+    cas: &indexio_ingest::Cas,
+    cache: Option<&mut indexio_ingest::WorktreeCache>,
+) -> anyhow::Result<indexio_ingest::IndexReport> {
+    let projects = claude_dir.join("projects");
+    anyhow::ensure!(projects.is_dir(), "no {}", projects.display());
+    if indexio_ingest::repo_state(data_dir, MEMORY_REPO).is_err() {
+        return indexio_ingest::index_dir_within(&projects, MEMORY_REPO, data_dir, cas, vec!["memory".to_string()]);
+    }
+    indexio_ingest::reindex_worktree_cached(MEMORY_REPO, data_dir, cas, cache)
+}
+
 /// Remove every rendered part of one session.
 fn remove_parts(dir: &Path, session_id: &str) {
     if let Ok(old) = fs::read_dir(dir) {

@@ -107,6 +107,10 @@ pub struct Filters {
     pub repo: Option<String>,
     pub lang: Option<Lang>,
     pub path: Option<String>,
+    /// Repos left out by name (exact, any case): a surface that drops a
+    /// repo's hits anyway (code_grep and the `sessions` transcripts) skips
+    /// verifying them, and they no longer take candidate-cap slots.
+    pub skip_repos: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1076,6 +1080,16 @@ impl Engine {
     }
 
     fn filters_pass(&self, q: &Query, si: usize, dm: &DocMeta) -> bool {
+        if !q.filters.skip_repos.is_empty() {
+            let skipped = self
+                .set
+                .shard(si)
+                .and_then(|s| s.meta().repos.get(dm.repo_id as usize))
+                .is_some_and(|r| q.filters.skip_repos.iter().any(|x| x.eq_ignore_ascii_case(r)));
+            if skipped {
+                return false;
+            }
+        }
         if let Some(repo_sub) = &q.filters.repo {
             let repo = self.repo_name(si, dm);
             if !repo
@@ -1196,7 +1210,7 @@ impl Engine {
         let mut regex_dfs: Vec<usize> = Vec::with_capacity(q.regexes.len());
         for pat in &q.regexes {
             let mut regex_cands: Option<Vec<DocRef>> = None;
-            if let Some(lits) = verify::required_literals(pat) {
+            if let Some((lits, ci)) = verify::prefilter_literals(pat) {
                 // `lits` is DISJUNCTIVE (one guaranteed prefix per
                 // alternation branch: every match starts with at least one
                 // of them), so the candidate set is the UNION of the
@@ -1206,7 +1220,7 @@ impl Engine {
                 let mut union: Vec<DocRef> = Vec::new();
                 let mut constrained = true;
                 for rl in &lits {
-                    match self.gram_candidates(rl, false) {
+                    match self.gram_candidates(rl, ci) {
                         Some(cands) => union.extend(cands),
                         None => {
                             constrained = false;
@@ -2552,6 +2566,15 @@ mod tests {
 
         let res = e.search(&parse("hello repo:beta path:hello").unwrap(), 10);
         assert_eq!(paths(&res), vec!["src/hello_world.py"]);
+
+        // a skipped repo is left out by exact name, any case
+        let mut q = parse("hello").unwrap();
+        q.filters.skip_repos = vec!["BETA".into()];
+        let res = e.search(&q, 10);
+        assert_eq!(res.hits.len(), 2);
+        assert!(res.hits.iter().all(|h| h.repo == "alpha"));
+        q.filters.skip_repos = vec!["bet".into()];
+        assert_eq!(e.search(&q, 10).hits.len(), 4, "not a substring match");
     }
 
     // ---- smart case --------------------------------------------------------

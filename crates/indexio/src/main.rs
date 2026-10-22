@@ -237,6 +237,12 @@ enum Commands {
         /// install: show the changes without writing settings.json.
         #[arg(long)]
         print_only: bool,
+        /// freshen (spawned by a deny): the repo to bring up to date.
+        #[arg(long, hide = true)]
+        repo: Option<String>,
+        /// freshen: only this repo-relative file.
+        #[arg(long, hide = true)]
+        path: Option<String>,
     },
     /// Import Claude Code session transcripts into the `sessions` source
     /// (SPEC-P9 recall): `<claude dir>/projects/*/*.jsonl` become compact
@@ -608,7 +614,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         "  {:<28} {}{}  (indexed {})",
                         n,
                         st.path.display(),
-                        if st.plain { "  [plain folder]" } else { "" },
+                        if st.is_plain() { "  [plain folder]" } else { "" },
                         st.indexed_at
                     ),
                     Err(_) => println!("  {n}"),
@@ -886,7 +892,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Usage { days, json } => {
             print_usage(&data_dir, days, json)?;
         }
-        Commands::Hook { which, claude_dir, print_only } => match which.as_str() {
+        Commands::Hook { which, claude_dir, print_only, repo, path } => match which.as_str() {
+            "freshen" => {
+                if let Some(repo) = repo {
+                    hook::run_freshen(&data_dir, &repo, path.as_deref());
+                }
+            }
             "bash" => {
                 // never fail the tool call: any error means "allow"
                 if let Err(e) = hook::run_bash_hook(&data_dir) {
@@ -898,10 +909,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     tracing::debug!(error = %e, "hook read: allowing");
                 }
             }
+            "powershell" => {
+                if let Err(e) = hook::run_powershell_hook(&data_dir) {
+                    tracing::debug!(error = %e, "hook powershell: allowing");
+                }
+            }
             "session-start" => {
                 // never fail the session start: any error means "no context"
                 if let Some(claude) = claude_dir.clone().or_else(sessions::default_claude_dir) {
-                    if let Err(e) = hook::run_session_start_hook(&claude) {
+                    if let Err(e) = hook::run_session_start_hook(&claude, &data_dir) {
                         tracing::debug!(error = %e, "hook session-start: no context");
                     }
                 }
@@ -955,6 +971,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let r = sessions::index_sessions(&data_dir, &cas, Some(&mut cache))?;
                 if !quiet {
                     println!("indexed: +{} -{} ={} docs", r.docs_added, r.docs_deleted, r.docs_unchanged);
+                }
+            }
+            if !no_index {
+                let cas = Cas::open(&data_dir.join("cas"))?;
+                let mut cache = indexio_ingest::WorktreeCache::default();
+                match sessions::index_memory(&claude, &data_dir, &cas, Some(&mut cache)) {
+                    Ok(r) if !quiet => println!("memory: +{} -{} ={} docs", r.docs_added, r.docs_deleted, r.docs_unchanged),
+                    Ok(_) => {}
+                    Err(e) if !quiet => println!("memory: not indexed ({e})"),
+                    Err(_) => {}
                 }
             }
         }

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.11
 
 Shell reads are answered from the index in place instead of being denied.
 A deny showed up as a hook error, cost a round trip, and stranded sessions
@@ -11,7 +11,7 @@ two weeks of Claude Code sessions.
 
 ### A/B results
 
-| Case | 0.1.10 | Unreleased |
+| Case | 0.1.10 | 0.1.11 |
 |---|---|---|
 | Denied shell commands (570 replayed) | 302 still denied | 0 denied: 225 answered from the index, the rest run as typed |
 | Output of the 217 answered commands that could be re-run | 218.7k tokens | 137.4k tokens (-37%) |

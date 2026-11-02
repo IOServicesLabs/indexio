@@ -1597,7 +1597,35 @@ pub fn install_settings(settings: &mut Value, exe: &Path) -> Vec<String> {
             changes.push(format!("{event}: added `{want}`"));
         }
     }
+    if let Some(t) = then.as_deref().filter(|t| is_rtk_hook(t)) {
+        if let Some(c) = keep_rtk_marker(hooks, t) {
+            changes.push(c);
+        }
+    }
     changes
+}
+
+/// Matcher of the group that only shows rtk its hook: it names no tool, so
+/// Claude Code never runs it.
+const RTK_MARKER: &str = "rtk-runs-inside-indexio";
+
+/// rtk counts itself installed only when a hook's command is exactly its own
+/// (`rtk hook claude`); chained inside indexio's it prints "No hook installed"
+/// on every command, and `rtk init -g` would add the competing hook back. A
+/// group whose matcher is no tool's name keeps the command in settings.json
+/// without it ever running.
+fn keep_rtk_marker(hooks: &mut Value, rtk: &str) -> Option<String> {
+    let groups = hooks.get_mut("PreToolUse")?.as_array_mut()?;
+    let has = groups.iter().any(|g| {
+        g["matcher"] == RTK_MARKER
+            && g["hooks"].as_array().is_some_and(|l| l.iter().any(|h| h["command"] == rtk))
+    });
+    if has {
+        return None;
+    }
+    groups.retain(|g| g["matcher"] != RTK_MARKER);
+    groups.push(json!({ "matcher": RTK_MARKER, "hooks": [{ "type": "command", "command": rtk }] }));
+    Some(format!("PreToolUse: kept `{rtk}` under matcher `{RTK_MARKER}` (never runs) so rtk sees its hook"))
 }
 
 /// Another PreToolUse Bash hook that rewrites commands (rtk's `rtk hook
@@ -2340,10 +2368,13 @@ mod tests {
             ]}
         });
         let changes = install_settings(&mut s, exe);
-        assert_eq!(changes.len(), 6, "{changes:?}");
+        assert_eq!(changes.len(), 7, "{changes:?}");
         let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
         // rtk's rewriting hook runs inside indexio's: one rewrite per call
-        assert_eq!(pre.len(), 3);
+        assert_eq!(pre.len(), 4);
+        // ...and stays visible to rtk under a matcher that never fires
+        assert_eq!(pre[3]["matcher"], RTK_MARKER);
+        assert_eq!(pre[3]["hooks"][0]["command"], "rtk hook claude");
         assert_eq!(pre[0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook bash --then 'rtk hook claude'");
         assert_eq!(chained_command(pre[0]["hooks"][0]["command"].as_str().unwrap()).as_deref(), Some("rtk hook claude"));
         assert_eq!(pre[1]["matcher"], "PowerShell");
@@ -2359,7 +2390,7 @@ mod tests {
         // `rtk init` again: its entry joins the chain once more, not twice
         s["hooks"]["PreToolUse"].as_array_mut().unwrap().push(json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}));
         assert_eq!(install_settings(&mut s, exe).len(), 1);
-        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 4);
         assert!(install_settings(&mut s, exe).is_empty());
         assert!(is_rtk_hook("C:/tools/rtk.exe hook claude") && !is_rtk_hook("rtk proxy grep x"));
         // spaces are quoted

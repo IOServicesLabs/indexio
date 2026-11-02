@@ -1553,8 +1553,15 @@ pub fn install_settings(settings: &mut Value, exe: &Path) -> Vec<String> {
     if !hooks.is_object() {
         *hooks = json!({});
     }
+    let (then, moved) = take_rewriting_bash_hook(hooks);
+    if let (Some(t), true) = (&then, moved) {
+        changes.push(format!("PreToolUse: `{t}` now runs inside indexio's Bash hook (one rewrite per call)"));
+    }
     for (event, matcher, args, timeout) in HOOKS {
-        let want = hook_command(exe, args);
+        let want = match (args, &then) {
+            ("hook bash", Some(t)) => hook_command(exe, &format!("hook bash --then '{}'", t.replace('\'', "'\\''"))),
+            _ => hook_command(exe, args),
+        };
         let groups = hooks
             .as_object_mut()
             .unwrap()
@@ -1591,6 +1598,76 @@ pub fn install_settings(settings: &mut Value, exe: &Path) -> Vec<String> {
         }
     }
     changes
+}
+
+/// Another PreToolUse Bash hook that rewrites commands (rtk's `rtk hook
+/// claude`), taken out of `hooks` so indexio's Bash hook runs it instead:
+/// when two hooks both answer with an `updatedInput`, Claude Code applies
+/// one of them (rtk's, in practice), so a read indexio answers from the
+/// index ran as `rtk grep` instead. Chained, indexio answers what it can and
+/// hands every other command to the chained hook unchanged. Also returns
+/// the command an earlier install already chained (`hook bash --then '…'`).
+fn take_rewriting_bash_hook(hooks: &mut Value) -> (Option<String>, bool) {
+    let Some(groups) = hooks.get_mut("PreToolUse").and_then(Value::as_array_mut) else { return (None, false) };
+    let mut found: Option<String> = None;
+    let mut moved = false;
+    for group in groups.iter_mut() {
+        let bash = group["matcher"].as_str().is_some_and(|m| m.split('|').any(|x| x.trim() == "Bash"));
+        let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) else { continue };
+        list.retain(|h| {
+            let cmd = h["command"].as_str().unwrap_or("");
+            if cmd.contains("indexio") {
+                if let Some(t) = chained_command(cmd) {
+                    found.get_or_insert(t);
+                }
+                return true;
+            }
+            if bash && is_rtk_hook(cmd) {
+                found.get_or_insert_with(|| cmd.to_string());
+                moved = true;
+                return false;
+            }
+            true
+        });
+    }
+    groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|l| !l.is_empty()));
+    (found, moved)
+}
+
+/// `rtk hook claude` (any path to rtk), the rewriting hook `rtk init`
+/// installs.
+fn is_rtk_hook(cmd: &str) -> bool {
+    let w = words(cmd);
+    w.len() >= 2
+        && w[0].trim_end_matches(".exe").rsplit(['/', '\\']).next() == Some("rtk")
+        && w[1] == "hook"
+}
+
+/// The `--then` command of an installed `indexio … hook bash --then '…'`.
+fn chained_command(cmd: &str) -> Option<String> {
+    let w = words(cmd);
+    let at = w.iter().position(|a| a == "--then")?;
+    w.get(at + 1).filter(|t| !t.is_empty()).cloned()
+}
+
+/// Run the chained hook with the same hook JSON and pass its answer on;
+/// nothing (the call as typed) when it fails or is slow.
+fn run_chained(then: &str, input: &str) {
+    use std::io::Write as _;
+    let w = words(then);
+    let Some((prog, args)) = w.split_first() else { return };
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let Ok(mut child) = cmd.spawn() else { return };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(input.as_bytes());
+    }
+    let out = within_budget(move || child.wait_with_output());
+    if let Some(Ok(o)) = out {
+        let mut so = std::io::stdout().lock();
+        let _ = so.write_all(&o.stdout);
+        let _ = so.flush();
+    }
 }
 
 /// `indexio hook install`: write the hooks into `<claude dir>/settings.json`.
@@ -1955,12 +2032,24 @@ pub fn run_powershell_hook(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Entry point: hook JSON on stdin, decision JSON on stdout, exit 0.
-pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
+/// `then`: a chained hook (`--then 'rtk hook claude'`, see
+/// [`take_rewriting_bash_hook`]) that answers every call indexio leaves alone.
+pub fn run_bash_hook(data_dir: &Path, then: Option<&str>) -> anyhow::Result<()> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-    let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    if !bash_hook_answered(data_dir, &input)? {
+        if let Some(t) = then {
+            run_chained(t, &input);
+        }
+    }
+    Ok(())
+}
+
+/// indexio's own answer to a Bash call, printed; `false` when it has none.
+fn bash_hook_answered(data_dir: &Path, input: &str) -> anyhow::Result<bool> {
+    let v: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     if v["tool_name"].as_str() != Some("Bash") {
-        return Ok(());
+        return Ok(false);
     }
     let command = v["tool_input"]["command"].as_str().unwrap_or("");
     let cwd = v["cwd"]
@@ -1968,7 +2057,7 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    let Ok(exe) = std::env::current_exe() else { return Ok(()) };
+    let Ok(exe) = std::env::current_exe() else { return Ok(false) };
     // SPEC-P10 §31: a script or build runs through `indexio run`, which
     // keeps a long output in the runs source and returns a digest
     if let Some(rewritten) = runner_rewrite(&exe, command) {
@@ -1982,21 +2071,22 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
                 }
             })
         );
-        return Ok(());
+        return Ok(true);
     }
     // SPEC-P11: a read the index answers runs as `indexio tool` in place
     let (dd, cmd) = (data_dir.to_path_buf(), command.to_string());
     let decided = within_budget(move || rewrite_bash(&dd, &cwd, &cmd, &exe));
     if let Some(Some(rewritten)) = decided {
         print_served(&rewritten);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
-/// The hook answer that runs `rewritten` instead of the call. `allow` is
-/// what lets it win over another hook's rewrite of the same call (rtk turns
-/// `cat`/`grep` into `rtk read`/`rtk grep`; Claude Code applies the
-/// `updatedInput` of the hook that also decided).
+/// The hook answer that runs `rewritten` instead of the call. Another hook
+/// rewriting the same call (rtk: `cat`/`grep` → `rtk read`/`rtk grep`) can
+/// still win, whatever the decision says: `hook install` chains such a hook
+/// behind this one instead ([`take_rewriting_bash_hook`]).
 fn print_served(rewritten: &str) {
     println!(
         "{}",
@@ -2250,21 +2340,28 @@ mod tests {
             ]}
         });
         let changes = install_settings(&mut s, exe);
-        assert_eq!(changes.len(), 5, "{changes:?}");
+        assert_eq!(changes.len(), 6, "{changes:?}");
         let pre = s["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 4);
-        assert_eq!(pre[0]["hooks"][0]["command"], "rtk hook claude");
-        assert_eq!(pre[1]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook bash");
-        assert_eq!(pre[2]["matcher"], "PowerShell");
-        assert_eq!(pre[2]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook powershell");
-        assert_eq!(pre[3]["matcher"], "Read");
-        assert_eq!(pre[3]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook read");
+        // rtk's rewriting hook runs inside indexio's: one rewrite per call
+        assert_eq!(pre.len(), 3);
+        assert_eq!(pre[0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook bash --then 'rtk hook claude'");
+        assert_eq!(chained_command(pre[0]["hooks"][0]["command"].as_str().unwrap()).as_deref(), Some("rtk hook claude"));
+        assert_eq!(pre[1]["matcher"], "PowerShell");
+        assert_eq!(pre[1]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook powershell");
+        assert_eq!(pre[2]["matcher"], "Read");
+        assert_eq!(pre[2]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook read");
         assert_eq!(s["hooks"]["PreCompact"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe sessions --quiet");
         assert!(s["hooks"]["PreCompact"][0].get("matcher").is_none());
         assert_eq!(s["hooks"]["SessionStart"][0]["hooks"][0]["command"], "C:/Users/x/.cargo/bin/indexio.exe hook session-start");
         assert_eq!(s["permissions"]["allow"][0], "mcp__indexio");
         // idempotent
         assert!(install_settings(&mut s, exe).is_empty());
+        // `rtk init` again: its entry joins the chain once more, not twice
+        s["hooks"]["PreToolUse"].as_array_mut().unwrap().push(json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}));
+        assert_eq!(install_settings(&mut s, exe).len(), 1);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+        assert!(install_settings(&mut s, exe).is_empty());
+        assert!(is_rtk_hook("C:/tools/rtk.exe hook claude") && !is_rtk_hook("rtk proxy grep x"));
         // spaces are quoted
         assert_eq!(hook_command(Path::new("C:\\Program Files\\indexio.exe"), "hook bash"), "\"C:/Program Files/indexio.exe\" hook bash");
     }

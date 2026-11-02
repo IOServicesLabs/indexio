@@ -243,6 +243,11 @@ enum Commands {
         /// freshen: only this repo-relative file.
         #[arg(long, hide = true)]
         path: Option<String>,
+        /// bash: a hook to run for every call indexio leaves alone (`hook
+        /// install` moves rtk's `rtk hook claude` here, so the two hooks'
+        /// rewrites never compete).
+        #[arg(long)]
+        then: Option<String>,
     },
     /// Import Claude Code session transcripts into the `sessions` source
     /// (SPEC-P9 recall): `<claude dir>/projects/*/*.jsonl` become compact
@@ -913,7 +918,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
         }
-        Commands::Hook { which, claude_dir, print_only, repo, path } => match which.as_str() {
+        Commands::Hook { which, claude_dir, print_only, repo, path, then } => match which.as_str() {
             "freshen" => {
                 if let Some(repo) = repo {
                     hook::run_freshen(&data_dir, &repo, path.as_deref());
@@ -921,7 +926,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             "bash" => {
                 // never fail the tool call: any error means "allow"
-                if let Err(e) = hook::run_bash_hook(&data_dir) {
+                if let Err(e) = hook::run_bash_hook(&data_dir, then.as_deref()) {
                     tracing::debug!(error = %e, "hook bash: allowing");
                 }
             }

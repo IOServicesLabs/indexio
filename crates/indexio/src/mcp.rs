@@ -2924,6 +2924,10 @@ fn grep_query(pattern: &str) -> Result<indexio_query::Query, String> {
             break;
         }
     }
+    // `case:` applies to literals; the pattern is one regex, so `case:no`
+    // is its `(?i)` (without it, `case:no` was silently case-sensitive)
+    let insensitive = filters.split_whitespace().any(|f| f == "case:no") && !pattern.starts_with("(?i)");
+    let pattern = if insensitive { format!("(?i){pattern}") } else { pattern.to_string() };
     let q = format!("/{}/{filters}", pattern.replace('/', "\\/"));
     indexio_query::parse(&q).map(|q| without_transcripts(q, &filters)).map_err(|e| e.to_string())
 }
@@ -4090,6 +4094,13 @@ mod tests {
             *per_file.entry(h["path"].as_str().unwrap().to_string()).or_insert(0) += 1;
         }
         assert!(per_file.values().all(|&n| n == 1), "{v}");
+        // `case:no` makes the pattern case-insensitive, `case:yes` keeps it exact
+        let req = r#"{"jsonrpc":"2.0","id":68,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"FOO_BAR case:no"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert!(!payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
+        let req = r#"{"jsonrpc":"2.0","id":69,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"FOO_BAR case:yes"}}}"#;
+        let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
+        assert!(payload_of(&v)["hits"].as_array().unwrap().is_empty(), "{v}");
     }
 
     #[test]

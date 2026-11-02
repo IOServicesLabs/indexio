@@ -1442,13 +1442,9 @@ impl Engine {
         let mut found: Vec<(f64, Vec<(u32, u32)>)> =
             Vec::with_capacity(c.q.literals.len() + c.regexes.len());
         let mut lit_matches: Vec<Vec<(u32, u32)>> = vec![Vec::new(); c.q.literals.len()];
-        // a listing of `per_doc` lines needs that many matches at least (a
-        // line can hold several); the score still counts the first
-        // MAX_HITS_PER_DOC, so the ranking is the same at any `per_doc`
-        let cap = MAX_HITS_PER_DOC.max(per_doc.saturating_mul(4));
         for &i in c.lit_order {
             let lit = &c.q.literals[i];
-            let m = verify::find_literal(&content, &lit.text, lit.case_insensitive, cap);
+            let m = verify::find_literal(&content, &lit.text, lit.case_insensitive, MAX_HITS_PER_DOC);
             if m.is_empty() {
                 return None;
             }
@@ -1456,16 +1452,16 @@ impl Engine {
         }
         for (i, m) in lit_matches.into_iter().enumerate() {
             let df = c.lit_df[i].unwrap_or(1).max(1) as f64;
-            score += bm25(c.n, df, m.len().min(MAX_HITS_PER_DOC) as f64, dm.raw_len as f64, c.avgdl);
+            score += bm25(c.n, df, m.len() as f64, dm.raw_len as f64, c.avgdl);
             found.push((df, m));
         }
         for (j, re) in c.regexes.iter().enumerate() {
-            let m = verify::find_regex_with(&content, re, cap);
+            let m = verify::find_regex_with(&content, re, MAX_HITS_PER_DOC);
             if m.is_empty() {
                 return None;
             }
             let df = c.regex_dfs[j].max(1) as f64;
-            score += bm25(c.n, df, m.len().min(MAX_HITS_PER_DOC) as f64, dm.raw_len as f64, c.avgdl);
+            score += bm25(c.n, df, m.len() as f64, dm.raw_len as f64, c.avgdl);
             found.push((df, m));
         }
         let first_match = snippet_position(&found);

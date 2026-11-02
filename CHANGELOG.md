@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+Shell reads are answered from the index in place instead of being denied.
+A deny showed up as a hook error, cost a round trip, and stranded sessions
+that could not call the indexio tools (MCP server disconnected, tools deferred
+or missing in a subagent). A/B tested against 0.1.10 on a copy of the real
+index by replaying the 570 Bash and PowerShell commands the hooks denied over
+two weeks of Claude Code sessions.
+
+### A/B results
+
+| Case | 0.1.10 | Unreleased |
+|---|---|---|
+| Denied shell commands (570 replayed) | 302 still denied | 0 denied: 225 answered from the index, the rest run as typed |
+| Output of the 217 answered commands that could be re-run | 218.7k tokens | 137.4k tokens (-37%) |
+| Exit status differing from the typed command | — | 0 of 217 |
+| `grep -n` answers missing a line the typed grep prints | — | 0 of 126 |
+| Hook time, median | 37 ms | 14 ms |
+
+### Hooks
+
+- The Bash and PowerShell hooks rewrite a read or search the index answers
+  exactly to `{ indexio tool <name> <args> || <typed pipeline>; }` and allow
+  it. The typed command runs if the index cannot answer (tool error, a grep
+  with no matches, a grep longer than the index lists).
+- Only exact equivalents are served: grep flag bundles (`-nE`, `-rniw`),
+  `-F/-w/-x/-i/-m/-A` are modelled; `-v/-c/-l/-B`, `--include`, several
+  patterns, `sed` transforms, a filter after a read, comments and command
+  substitutions run as typed. `grep -E` patterns are no longer mangled as
+  basic regexes, and `\s`/`[^…]` never match across lines.
+- PowerShell: `| Select-Object -First/-Last N` after `Select-String` is kept;
+  `| ForEach-Object`/`Where-Object` and filtered `Get-ChildItem` run as typed.
+- The Read hook still refuses whole-file reads of long indexed files, but lets
+  them through when the caller cannot call indexio: its transcript shows
+  `No such tool available: mcp__indexio__…`, or it is an agent whose `tools:`
+  exclude indexio.
+- New `indexio tool <name> [json|base64url]` runs one MCP tool from the shell.
+
+### Search
+
+- `code_grep` with `case:no` is case-insensitive (it was ignored: the pattern
+  is a regex and `case:` only reached literals).
+- `path:` filters take anchors: `path:^Cargo.toml$` is that one file,
+  `path:^src/` a folder; a bare `path:x` is still a substring.
+
 ## 0.1.10
 
 Hooks that follow how agents actually read files, a PowerShell hook, Claude Code

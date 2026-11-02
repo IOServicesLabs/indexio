@@ -1285,13 +1285,14 @@ mod tests {
     #[test]
     fn lazy_flush_defers_the_save_to_persist() {
         let tmp = tempfile::tempdir().unwrap();
-        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(3600));
+        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(5));
         e.observe(&["lazyterm otherterm".to_string()]).unwrap();
         assert!(e.dirty.load(std::sync::atomic::Ordering::Acquire));
         e.flush().unwrap();
         assert!(e.dirty.load(std::sync::atomic::Ordering::Acquire), "flush must not save inline in lazy mode");
         assert!(!e.save_due(), "the interval has not passed");
-        *e.last_save.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(4000);
+        // (an Instant cannot go back further than the boot: keep it short)
+        *e.last_save.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(6);
         assert!(e.save_due());
         e.persist().unwrap();
         assert!(!e.dirty.load(std::sync::atomic::Ordering::Acquire));

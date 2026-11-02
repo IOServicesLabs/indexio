@@ -1068,12 +1068,20 @@ pub(crate) fn serve_search(ctx: &mut Ctx, targets: &[PathBuf], g: &GrepArgs, lin
     let path_filter = if whole_repo { String::new() } else { format!(" path:{}", anchors.join("|")) };
     let case = if g.icase { "no" } else { "yes" };
     let mut args = json!({ "pattern": format!("{re} case:{case} repo:{repo}{path_filter}") });
-    // `code_grep` shows at most 100 lines a file: a longer cut is the shell's
-    if let Some(n) = g.max.or(lines) {
-        if n > 100 {
-            return None;
-        }
-        args["lines"] = json!(n.max(1));
+    // `code_grep` shows at most 100 lines a file: a longer cut is the shell's.
+    // Without a cut every matching line is wanted: `_exact` makes `indexio
+    // tool` fall back to the typed grep when a file reaches the line cap or
+    // the answer reaches `limit` (lines in all), rather than show fewer.
+    let cut = g.max.or(lines);
+    let per_file = match cut {
+        Some(n) if n > 100 => return None,
+        Some(n) => n.max(1),
+        None => 100,
+    };
+    args["lines"] = json!(per_file);
+    args["limit"] = json!(GREP_LIMIT);
+    if cut.is_none() {
+        args["_exact"] = json!(true);
     }
     Some(Serve { calls: vec![("code_grep", args)], fresh, note: None })
 }
@@ -1415,6 +1423,30 @@ pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Most lines a served grep lists in all; more is the typed grep's to print.
+const GREP_LIMIT: u32 = 1000;
+
+/// A `code_grep` answer cut short by its caps: a file listing `lines`
+/// matching lines, or `limit` lines in all — the typed grep would print more.
+fn grep_hit_a_cap(text: &str, args: &Value) -> bool {
+    let per_file = args["lines"].as_u64().unwrap_or(20) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let (mut total, mut here) = (0usize, 0usize);
+    for line in text.lines() {
+        let row = line.strip_prefix("  ").is_some_and(|r| r.split_once(": ").is_some_and(|(n, _)| n.trim().parse::<u64>().is_ok()));
+        if row {
+            total += 1;
+            here += 1;
+            if here >= per_file {
+                return true;
+            }
+        } else {
+            here = 0;
+        }
+    }
+    total >= limit
+}
+
 /// Entry point for `indexio tool NAME [ARGS]`: freshen what the call reads,
 /// run it, print the answer (and the hook's note). Returns the exit status:
 /// 0, or 1 when the tool failed (its message on stderr, nothing on stdout,
@@ -1433,6 +1465,7 @@ pub fn run_tool(data_dir: &Path, name: &str, args: Option<&str>, current: Option
     let cur = obj.remove("_current").and_then(|v| v.as_str().map(str::to_string)).or(current.map(str::to_string));
     let note = obj.remove("_note").and_then(|v| v.as_str().map(str::to_string));
     let fresh: Vec<(String, String)> = obj.remove("_fresh").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let exact = obj.remove("_exact").and_then(|v| v.as_bool()).unwrap_or(false);
     let current = crate::mcp::resolve_current_repo(data_dir, cur.as_deref());
     // the index must be current with the files on disk: the MCP server
     // refreshes before each call, and this call has no server
@@ -1454,6 +1487,7 @@ pub fn run_tool(data_dir: &Path, name: &str, args: Option<&str>, current: Option
             // a grep that finds nothing exits 1 (`grep x f || echo none`):
             // the typed grep runs instead, prints nothing and exits 1
             Ok(text) if n == "code_grep" && calls.len() == 1 && text.trim_start().starts_with("no matches") => return 1,
+            Ok(text) if exact && n == "code_grep" && grep_hit_a_cap(&text, a) => return 1,
             Ok(text) => {
                 out.push_str(&text);
                 if !text.ends_with('\n') {
@@ -2313,6 +2347,36 @@ mod tests {
     }
 
     #[test]
+    fn a_capped_grep_falls_back() {
+        let args = json!({"lines": 3, "limit": 5});
+        let text = "r:a.rs
+  1: x
+  2: x
+r:b.rs
+  7: x
+-- 3 matches in 2 files
+";
+        assert!(!grep_hit_a_cap(text, &args));
+        let text = "r:a.rs
+  1: x
+  2: x
+  3: x
+-- 3 matches in 1 file
+";
+        assert!(grep_hit_a_cap(text, &args), "a file at the line cap");
+        let text = "r:a.rs
+  1: x
+  2: x
+r:b.rs
+  1: x
+  2: x
+r:c.rs
+  9: x
+";
+        assert!(grep_hit_a_cap(text, &args), "the answer at the limit");
+    }
+
+    #[test]
     fn base64url_round_trips() {
         for s in ["", "a", "ab", "abc", "{\"repo\":\"x y\",\"pattern\":\"a|b'c\\\"\"}", "é→\u{1F600}"] {
             let e = b64url_encode(s.as_bytes());
@@ -2388,9 +2452,9 @@ mod tests {
         // a grep: case-sensitive like grep, `-i` not, cut by `| head`
         assert_eq!(
             s("grep -n Needle3 src/code.rs | head -5"),
-            vec![r#"0: code_grep {"lines":5,"pattern":"Needle3 case:yes repo:folder path:^src/code.rs$"}"#]
+            vec![r#"0: code_grep {"limit":1000,"lines":5,"pattern":"Needle3 case:yes repo:folder path:^src/code.rs$"}"#]
         );
-        assert_eq!(s("grep -rni needle src"), vec![r#"0: code_grep {"pattern":"needle case:no repo:folder path:^src/"}"#]);
+        assert_eq!(s("grep -rni needle src"), vec![r#"0: code_grep {"_exact":true,"limit":1000,"lines":100,"pattern":"needle case:no repo:folder path:^src/"}"#]);
         // a definition with its body
         assert_eq!(s("grep -n 'fn f2' -A 40 src/code.rs"), vec![r#"0: read_span {"end":45,"path":"src/code.rs","repo":"folder","start":31}"#]);
         // several pipelines: each answered in place, the rest left as typed
@@ -2398,7 +2462,7 @@ mod tests {
             s("cd src && sed -n 1,80p code.rs; echo ---; grep -n Needle1 code.rs"),
             vec![
                 r#"1: read_span {"end":80,"path":"src/code.rs","repo":"folder","start":1}"#.to_string(),
-                r#"3: code_grep {"pattern":"Needle1 case:yes repo:folder path:^src/code.rs$"}"#.to_string(),
+                r#"3: code_grep {"_exact":true,"limit":1000,"lines":100,"pattern":"Needle1 case:yes repo:folder path:^src/code.rs$"}"#.to_string(),
             ]
         );
         // what the index cannot answer as asked stays the shell's

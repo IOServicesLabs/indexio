@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.12
+
+0.1.11's in-place answers lost to rtk: with both hooks installed, a `grep`,
+`cat`, `head` or `tail` that indexio answered was also rewritten by rtk's
+Bash hook (`rtk grep`, `rtk read`), and Claude Code ran rtk's version. That
+was 204 of the 224 commands 0.1.11 answers in the A/B replay.
+
+- `indexio hook install` moves rtk's `rtk hook claude` entry into indexio's
+  Bash hook (`hook bash --then 'rtk hook claude'`): indexio answers what the
+  index can, and every other command goes to rtk unchanged, so each call gets
+  one rewrite. Run `indexio hook install` again after `rtk init`.
+- `indexio hook bash --then '<hook command>'` chains any hook the same way.
+
 ## 0.1.11
 
 Shell reads are answered from the index in place instead of being denied.

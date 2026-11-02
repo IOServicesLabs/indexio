@@ -6,12 +6,16 @@
 //! through Bash against files the index already held — the sessions had
 //! stopped using the built-in Grep/Read tools but shelled out instead,
 //! which bypasses both the guidance and the index. This hook reads the
-//! harness's hook JSON on stdin, and when the command is a plain read or
-//! search of something indexio can serve, answers with a `deny` whose
-//! reason spells out the equivalent indexio call. Anything else — writes,
-//! `sed -i`, greps on a pipeline, files the index does not have, commands
-//! carrying `# raw` — is allowed untouched. Never fails the call: any
-//! error means "allow".
+//! harness's hook JSON on stdin, and when a pipeline of the command is a
+//! plain read or search the index answers exactly, rewrites that pipeline
+//! to `indexio tool …` (`{ indexio tool … || <typed pipeline>; }`) and
+//! allows the call: the answer arrives in the same round trip, and when
+//! the index cannot answer the typed command runs. A deny would cost a
+//! round trip and strand callers that cannot call the indexio tools (MCP
+//! server down, deferred or missing in a subagent). Anything else — writes,
+//! `sed -i`, filters the index cannot reproduce, files the index does not
+//! have, commands carrying `# raw` — is left untouched. Never fails the
+//! call: any error means "allow".
 
 use std::path::{Path, PathBuf};
 
@@ -21,11 +25,6 @@ use indexio_query::Engine;
 
 #[path = "hook_ps.rs"]
 mod ps;
-
-/// Escape hint, appended only when the SAME command is denied a second
-/// time in a session (SPEC-P10): shown on every deny, the model learned it
-/// from the first reason and wrote `# raw` on its next shell read instead
-/// of the indexio call.
 
 /// Registered repos as (name, root as registered). [`locate`] matches
 /// against these first and canonicalizes them only when that fails:
@@ -175,11 +174,19 @@ fn locate(repos: &[(String, PathBuf)], abs: &Path) -> Option<(String, String)> {
 /// Split a command line into pipelines on `&&`, `||`, `;`, then each
 /// pipeline into `|` stages; quotes are respected, everything is trimmed.
 fn split(cmd: &str) -> Vec<Vec<String>> {
-    let mut pipelines: Vec<Vec<String>> = Vec::new();
+    split_spans(cmd).into_iter().map(|(_, p)| p).collect()
+}
+
+/// [`split`] with each pipeline's byte range in `cmd` (first to last
+/// non-blank character), so a pipeline can be replaced in place.
+fn split_spans(cmd: &str) -> Vec<(std::ops::Range<usize>, Vec<String>)> {
+    let mut pipelines: Vec<(std::ops::Range<usize>, Vec<String>)> = Vec::new();
     let mut stages: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    let chars: Vec<char> = cmd.chars().collect();
+    let chars: Vec<(usize, char)> = cmd.char_indices().collect();
+    let mut start: Option<usize> = None;
+    let mut end = 0usize;
     let mut i = 0;
     let flush_stage = |cur: &mut String, stages: &mut Vec<String>| {
         let t = cur.trim().to_string();
@@ -188,52 +195,73 @@ fn split(cmd: &str) -> Vec<Vec<String>> {
         }
         cur.clear();
     };
+    let mut close = |stages: &mut Vec<String>, start: &mut Option<usize>, end: usize| {
+        let s = std::mem::take(stages);
+        if let (false, Some(b)) = (s.is_empty(), start.take()) {
+            pipelines.push((b..end, s));
+        }
+        *start = None;
+    };
     while i < chars.len() {
-        let c = chars[i];
+        let (at, c) = chars[i];
+        // the text this char belongs to (not a separator)
+        let mark = |upto: usize, start: &mut Option<usize>, end: &mut usize| {
+            if start.is_none() {
+                *start = Some(at);
+            }
+            *end = upto;
+        };
+        let after = |k: usize| chars.get(k + 1).map_or(cmd.len(), |&(b, _)| b);
         match quote {
             // a backslash escapes the next char outside quotes and inside
             // double quotes (`"\"..."`), never inside single quotes
             Some('"') | None if c == '\\' && i + 1 < chars.len() => {
                 cur.push(c);
-                cur.push(chars[i + 1]);
+                cur.push(chars[i + 1].1);
                 i += 1;
+                mark(after(i), &mut start, &mut end);
             }
             Some(q) => {
                 cur.push(c);
                 if c == q {
                     quote = None;
                 }
+                mark(after(i), &mut start, &mut end);
             }
             None => match c {
                 '"' | '\'' => {
                     quote = Some(c);
                     cur.push(c);
+                    mark(after(i), &mut start, &mut end);
                 }
-                '&' if chars.get(i + 1) == Some(&'&') => {
+                '&' if chars.get(i + 1).map(|x| x.1) == Some('&') => {
                     flush_stage(&mut cur, &mut stages);
-                    pipelines.push(std::mem::take(&mut stages));
+                    close(&mut stages, &mut start, end);
                     i += 1;
                 }
-                '|' if chars.get(i + 1) == Some(&'|') => {
+                '|' if chars.get(i + 1).map(|x| x.1) == Some('|') => {
                     flush_stage(&mut cur, &mut stages);
-                    pipelines.push(std::mem::take(&mut stages));
+                    close(&mut stages, &mut start, end);
                     i += 1;
                 }
                 ';' | '\n' => {
                     flush_stage(&mut cur, &mut stages);
-                    pipelines.push(std::mem::take(&mut stages));
+                    close(&mut stages, &mut start, end);
                 }
                 '|' => flush_stage(&mut cur, &mut stages),
-                _ => cur.push(c),
+                _ => {
+                    cur.push(c);
+                    if !c.is_whitespace() {
+                        mark(after(i), &mut start, &mut end);
+                    }
+                }
             },
         }
         i += 1;
     }
     flush_stage(&mut cur, &mut stages);
-    if !stages.is_empty() {
-        pipelines.push(stages);
-    }
-    pipelines.into_iter().filter(|p| !p.is_empty()).collect()
+    close(&mut stages, &mut start, end);
+    pipelines
 }
 
 /// Shell words of one stage (quotes stripped, no globbing).
@@ -312,22 +340,6 @@ fn has_redirect(stage: &str) -> bool {
     false
 }
 
-/// A pipeline stage that only views or filters text (so the pipeline is
-/// still a read, not a program consuming the file). Counting (`wc`,
-/// `uniq -c`) and byte views (`cat -A`) are not: their answer is a number
-/// or the invisible characters, which no indexio call returns — denying
-/// `grep -n x f | cat -A` made the model send it again.
-fn is_viewer(stage: &str) -> bool {
-    let w = words(stage);
-    let Some(cmd) = w.first().map(String::as_str) else { return false };
-    matches!(
-        cmd,
-        "head" | "tail" | "grep" | "rg" | "egrep" | "fgrep" | "sed" | "awk" | "cut" | "sort" | "uniq" | "less" | "more" | "tr" | "nl" | "cat" | "column" | "tee"
-    ) && !w.iter().any(|a| a == "-i")
-        && !shows_bytes(cmd, &w[1..])
-        && !(cmd == "uniq" && w[1..].iter().any(|a| a == "-c" || a == "--count"))
-}
-
 /// Short flags of one bundle (`-rnA` -> `rnA`); empty for a long option or
 /// an operand.
 fn short_flags(a: &str) -> &str {
@@ -381,118 +393,214 @@ fn positional(args: &[String]) -> Vec<String> {
     args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
 }
 
-/// A parsed grep/rg command line: the pattern, the path operands, the
-/// `-A` context and whether the pattern is already extended syntax.
-struct GrepArgs {
-    pattern: Option<String>,
+/// A grep/rg command line the index answers exactly: one pattern over
+/// files or folders, printing the matching lines. [`parse_grep`] returns
+/// `None` for anything else — an inverted match, counts, file lists,
+/// context before a match, include/type filters, several patterns, an
+/// unknown flag — and the shell runs it as typed.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct GrepArgs {
+    pattern: String,
     paths: Vec<String>,
+    /// `-A n` / `-C n`: only a definition lookup is answered with it
     after: Option<u32>,
     ere: bool,
-    /// `-c`, `-l`, `-L`, `-q`, `-o`: a count, file names, a status or the
-    /// matched parts only — all smaller than the lines an indexio call
-    /// returns, so the grep is the cheaper answer.
-    not_lines: bool,
+    fixed: bool,
+    icase: bool,
+    word: bool,
+    whole_line: bool,
+    max: Option<u32>,
+    recursive: bool,
 }
 
-/// grep/rg options that take a value (so the value is not a path).
-const GREP_VALUE_OPTS: &[&str] = &[
-    "-A", "-B", "-C", "-m", "-e", "-f", "-g", "-t", "-T", "-d", "-D", "--include", "--exclude",
-    "--exclude-dir", "--glob", "--iglob", "--type", "--type-not", "--max-count", "--context",
-    "--after-context", "--before-context", "--regexp", "--file", "--max-depth", "--color",
-    "--colour", "--threads", "-j",
-];
-
-fn grep_args(cmd: &str, args: &[String]) -> GrepArgs {
+fn parse_grep(cmd: &str, args: &[String]) -> Option<GrepArgs> {
+    let rg = cmd == "rg";
     let mut g = GrepArgs {
-        pattern: None,
-        paths: Vec::new(),
-        after: None,
         ere: matches!(cmd, "rg" | "egrep" | "ag" | "ack"),
-        not_lines: false,
+        fixed: cmd == "fgrep",
+        recursive: matches!(cmd, "rg" | "ag" | "ack"),
+        ..Default::default()
     };
-    let mut i = 0;
+    let mut pattern: Option<String> = None;
+    let mut operands: Vec<String> = Vec::new();
     let mut only_operands = false;
+    let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        i += 1;
         if only_operands || !a.starts_with('-') || a == "-" {
-            if g.pattern.is_none() {
-                g.pattern = Some(a.clone());
-            } else {
-                g.paths.push(a.clone());
-            }
-            i += 1;
+            operands.push(a.clone());
             continue;
         }
         if a == "--" {
             only_operands = true;
-            i += 1;
             continue;
         }
-        if a == "-E" || a == "-P" || a == "--extended-regexp" || a == "--perl-regexp" {
-            g.ere = true;
-        }
-        if matches!(
-            a.split('=').next().unwrap_or(""),
-            "--count" | "--files-with-matches" | "--files-without-match" | "--quiet" | "--only-matching" | "--count-matches"
-        ) {
-            g.not_lines = true;
-        }
-        // a bundle's flags up to the first one that takes a value
-        // (`-rlc`, `-rho`; in `-A3c` the `3c` is a value)
-        for c in short_flags(a).chars() {
-            if matches!(c, 'c' | 'l' | 'L' | 'q' | 'o') {
-                g.not_lines = true;
-            }
-            if matches!(c, 'A' | 'B' | 'C' | 'm' | 'e' | 'f' | 'g' | 't' | 'T' | 'd' | 'D' | 'j') {
-                break;
-            }
-        }
-        // `--opt=value`, `-A3`, `-e pat`, `-A 3`
-        if let Some((k, v)) = a.split_once('=') {
-            if k == "--regexp" {
-                g.pattern.get_or_insert(v.to_string());
-            } else if k == "--after-context" || k == "--context" {
-                g.after = v.parse().ok();
-            }
-            i += 1;
-            continue;
-        }
-        if a.len() > 2 && !a.starts_with("--") {
-            let (k, v) = a.split_at(2);
-            if k == "-e" {
-                g.pattern.get_or_insert(v.to_string());
-                i += 1;
-                continue;
-            }
-            if k == "-A" || k == "-C" {
-                g.after = v.parse().ok();
-                i += 1;
-                continue;
-            }
-            if GREP_VALUE_OPTS.contains(&k) {
-                i += 1;
-                continue;
-            }
-            // bundled flags like `-rn`; `-rne pat` is not handled (rare)
-            i += 1;
-            continue;
-        }
-        if GREP_VALUE_OPTS.contains(&a.as_str()) {
-            if let Some(v) = args.get(i + 1) {
-                match a.as_str() {
-                    "-e" | "--regexp" => {
-                        g.pattern.get_or_insert(v.clone());
+        if let Some(long) = a.strip_prefix("--") {
+            let (k, inline) = match long.split_once('=') {
+                Some((k, v)) => (k, Some(v.to_string())),
+                None => (long, None),
+            };
+            let mut value = || -> Option<String> {
+                inline.clone().or_else(|| {
+                    let v = args.get(i).cloned();
+                    i += 1;
+                    v
+                })
+            };
+            match k {
+                "line-number" | "with-filename" | "no-filename" | "no-messages" | "color" | "colour" | "smart-case"
+                | "heading" | "no-heading" => {}
+                "recursive" | "dereference-recursive" if !rg => g.recursive = true,
+                "ignore-case" => g.icase = true,
+                "extended-regexp" | "perl-regexp" => g.ere = true,
+                "fixed-strings" => g.fixed = true,
+                "word-regexp" => g.word = true,
+                "line-regexp" => g.whole_line = true,
+                "binary-files" if inline.as_deref() == Some("without-match") => {}
+                "max-count" => g.max = Some(value()?.parse().ok()?),
+                "after-context" | "context" => g.after = Some(value()?.parse().ok()?),
+                "regexp" => {
+                    if pattern.replace(value()?).is_some() {
+                        return None;
                     }
-                    "-A" | "-C" | "--after-context" | "--context" => g.after = v.parse().ok(),
-                    _ => {}
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        // a bundle of short flags; a value flag takes the rest of the
+        // bundle (`-A3`, `-efoo`) or the next word
+        let flags: Vec<char> = a[1..].chars().collect();
+        let mut j = 0;
+        while j < flags.len() {
+            let c = flags[j];
+            j += 1;
+            match c {
+                'n' | 'H' | 'h' | 's' | 'I' => {}
+                // `rg -r` is a replacement, not a recursion
+                'r' | 'R' if !rg => g.recursive = true,
+                'S' if rg => {}
+                'i' => g.icase = true,
+                'E' | 'P' => g.ere = true,
+                'F' => g.fixed = true,
+                'w' => g.word = true,
+                'x' => g.whole_line = true,
+                'A' | 'C' | 'm' | 'e' => {
+                    let rest: String = flags[j..].iter().collect();
+                    j = flags.len();
+                    let v = if rest.is_empty() {
+                        let v = args.get(i).cloned();
+                        i += 1;
+                        v?
+                    } else {
+                        rest
+                    };
+                    match c {
+                        'A' | 'C' => g.after = Some(v.parse().ok()?),
+                        'm' => g.max = Some(v.parse().ok()?),
+                        _ => {
+                            if pattern.replace(v).is_some() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    let mut ops = operands.into_iter();
+    g.pattern = match pattern {
+        Some(p) => p,
+        None => ops.next()?,
+    };
+    g.paths = ops.collect();
+    // `grep x` with no file reads stdin
+    if g.pattern.is_empty() || (g.paths.is_empty() && !g.recursive) {
+        return None;
+    }
+    Some(g)
+}
+
+/// `re` with every class that could match a newline kept to one line:
+/// grep matches line by line, the index over the whole file, where
+/// `^\s*mod` would match from the blank line before `mod`. `\s` becomes
+/// `[^\S\n]`, `\W` `[^\w\n]`, `\D` `[^\d\n]`, and a negated bracket
+/// `[^…]` excludes `\n` too.
+fn line_local(re: &str) -> String {
+    let c: Vec<char> = re.chars().collect();
+    let mut out = String::with_capacity(re.len() + 8);
+    let mut in_class = false;
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '\\' && i + 1 < c.len() {
+            let e = c[i + 1];
+            i += 2;
+            match (e, in_class) {
+                ('s', false) => out.push_str(r"[^\S\n]"),
+                ('W', false) => out.push_str(r"[^\w\n]"),
+                ('D', false) => out.push_str(r"[^\d\n]"),
+                // inside a class: `[\s,]` → `[ \t\r\f\v,]`
+                ('s', true) => out.push_str(r" \t\r\f\v"),
+                _ => {
+                    out.push('\\');
+                    out.push(e);
                 }
             }
-            i += 2;
             continue;
         }
+        if !in_class && ch == '[' {
+            in_class = true;
+            out.push('[');
+            i += 1;
+            if c.get(i) == Some(&'^') {
+                out.push_str(r"^\n");
+                i += 1;
+            }
+            // a `]` first in the class is a literal
+            if c.get(i) == Some(&']') {
+                out.push(']');
+                i += 1;
+            }
+            continue;
+        }
+        if in_class && ch == ']' {
+            in_class = false;
+        }
+        // `[[:space:]]` and friends: the bracket inside is not a new class
+        if in_class && ch == '[' && c.get(i + 1) == Some(&':') {
+            if let Some(end) = (i + 2..c.len().saturating_sub(1)).find(|&k| c[k] == ':' && c[k + 1] == ']') {
+                let name: String = c[i..end + 2].iter().collect();
+                out.push_str(if name == "[:space:]" { r" \t\r\f\v" } else { &name });
+                i = end + 2;
+                continue;
+            }
+        }
+        out.push(ch);
         i += 1;
     }
-    g
+    out
+}
+
+/// The grep's pattern as the extended regex `code_grep` takes.
+fn grep_regex(g: &GrepArgs) -> String {
+    let mut re = if g.fixed {
+        grep_literal(&g.pattern)
+    } else if g.ere {
+        g.pattern.clone()
+    } else {
+        bre_to_ere(&g.pattern)
+    };
+    re = line_local(&re);
+    if g.word {
+        re = format!(r"\b(?:{re})\b");
+    }
+    if g.whole_line {
+        re = format!("^(?:{re})$");
+    }
+    re
 }
 
 /// POSIX basic regex (plain `grep`) to the extended syntax indexio's
@@ -535,24 +643,6 @@ fn definition_name(pattern: &str) -> Option<String> {
         return None;
     }
     Some(name)
-}
-
-/// `^class \|^def \|^async def ` (every alternative anchored at a
-/// definition keyword or decorator) is a hand-rolled outline of a file:
-/// `file_outline` is the exact answer.
-fn is_outline_pattern(ere: &str) -> bool {
-    let alts: Vec<&str> = ere.split('|').map(str::trim).filter(|a| !a.is_empty()).collect();
-    !alts.is_empty()
-        && alts.iter().all(|a| {
-            let Some(rest) = a.strip_prefix('^') else { return false };
-            let rest = rest.trim_start_matches("\\s*").trim_start_matches("\\s+").trim();
-            let word: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '@' || *c == '_').collect();
-            matches!(
-                word.as_str(),
-                "def" | "async" | "class" | "fn" | "pub" | "struct" | "enum" | "impl" | "trait" | "function"
-                    | "export" | "interface" | "type" | "func" | "mod"
-            ) || word.starts_with('@')
-        })
 }
 
 /// Bring `repo`'s working tree (or just `rel`) into the index before the
@@ -637,20 +727,6 @@ fn freshen_paths(data_dir: &Path, repo: &str, rel: Option<&str>) {
     }
 }
 
-/// The verdict for one Bash command: `Some(reason)` = deny.
-pub fn verdict(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
-    let mut reason = judge(data_dir, cwd, command)?;
-    // the model bundles several reads per call (`sed -n … ; grep -n … | head`):
-    // the deny is for the servable one, the rest is fine to rerun alone
-    let others = split(command)
-        .iter()
-        .filter(|p| p.first().is_some_and(|s| !s.starts_with("cd ") && s != "cd"))
-        .count();
-    if others > 1 {
-        reason.push_str(" The rest of this call is fine to run on its own.");
-    }
-    Some(reason)
-}
 
 /// Commands the hook can serve from the index, and the harmless helpers
 /// that surround them in one call. A pipeline starting with anything else
@@ -776,281 +852,629 @@ fn is_other_work(pipeline: &[String]) -> bool {
     !cmd.is_empty() && !LOOKUP_OR_HARMLESS.contains(&cmd)
 }
 
-fn judge(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
-    if command.contains("INDEXIO_RAW") {
-        return None;
-    }
-    // the shell is needed anyway: let the whole call through
-    if split(command).iter().any(|p| is_other_work(p)) {
-        return None;
-    }
-    let t0 = std::time::Instant::now();
-    let repos = repos(data_dir);
-    let debug = std::env::var_os("INDEXIO_HOOK_DEBUG").is_some();
-    if debug {
-        eprintln!("hook: cwd={} repos={} cmd={command:?} ({} us)", cwd.display(), repos.len(), t0.elapsed().as_micros());
-    }
-    if repos.is_empty() {
-        return None;
-    }
-    // the session's repo: its MCP server refreshes it, the hook need not
-    let own = locate(&repos, cwd).map(|(r, _)| r);
-    // opened on the first file that needs it
-    let mut engine: Option<Engine> = None;
-    let indexed = |engine: &mut Option<Engine>, repo: &str, rel: &str| -> bool {
-        if engine.is_none() {
-            *engine = Engine::open(data_dir).ok();
+/// What the index answers for one shell pipeline (Bash) or statement
+/// (PowerShell): tool calls made in order by `indexio tool`, which brings
+/// the files they read up to date first. The shell hooks rewrite the
+/// command to run that call instead of denying it (a deny shows as a hook
+/// error, costs a second round trip, and is a dead end for a caller that
+/// cannot reach the indexio MCP tools).
+#[derive(Debug)]
+pub(crate) struct Serve {
+    calls: Vec<(&'static str, Value)>,
+    /// (repo, path) to freshen first; an empty path = the whole repo
+    fresh: Vec<(String, String)>,
+    /// a line printed after the answer
+    note: Option<String>,
+}
+
+impl Serve {
+    /// `(tool name, base64url JSON arguments)` for `indexio tool`.
+    fn payload(&self, current: Option<&str>) -> (String, String) {
+        let (name, mut args) = if self.calls.len() == 1 {
+            (self.calls[0].0.to_string(), self.calls[0].1.clone())
+        } else {
+            let calls: Vec<Value> = self.calls.iter().map(|(n, a)| json!({"name": n, "args": a})).collect();
+            ("batch".to_string(), json!({ "calls": calls }))
+        };
+        if let Some(c) = current {
+            args["_current"] = json!(c);
         }
-        engine.as_ref().is_some_and(|e| contents_indexed(e, repo, rel))
-    };
-    // the same for a file read: the path to point at (see `indexed_rel`)
-    let indexed_as = |engine: &mut Option<Engine>, repo: &str, rel: &str, abs: &Path| -> Option<String> {
-        if engine.is_none() {
-            *engine = Engine::open(data_dir).ok();
+        if !self.fresh.is_empty() {
+            args["_fresh"] = json!(self.fresh);
         }
-        indexed_rel(engine.as_ref()?, repo, rel, abs)
+        if let Some(n) = &self.note {
+            args["_note"] = json!(n);
+        }
+        (name, b64url_encode(args.to_string().as_bytes()))
+    }
+}
+
+/// The most lines one `read_span` returns.
+const MAX_SPAN: u64 = 400;
+
+/// What a read of one file asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Want {
+    /// lines first..=last (1-based)
+    Range(u64, u64),
+    /// the last n lines
+    Tail(u64),
+    /// the whole file
+    Whole,
+}
+
+/// Registered repos and the index, opened on first use.
+pub(crate) struct Ctx<'a> {
+    pub(crate) data_dir: &'a Path,
+    pub(crate) repos: Vec<(String, PathBuf)>,
+    engine: Option<Option<Engine>>,
+}
+
+impl<'a> Ctx<'a> {
+    pub(crate) fn new(data_dir: &'a Path) -> Self {
+        Ctx { data_dir, repos: repos(data_dir), engine: None }
+    }
+    pub(crate) fn engine(&mut self) -> Option<&Engine> {
+        if self.engine.is_none() {
+            self.engine = Some(Engine::open(self.data_dir).ok());
+        }
+        self.engine.as_ref()?.as_ref()
+    }
+    /// (repo, path the index holds) for an existing file it can answer for.
+    fn indexed_file(&mut self, abs: &Path) -> Option<(String, String)> {
+        if !abs.is_file() {
+            return None;
+        }
+        let (repo, rel) = locate(&self.repos, abs)?;
+        let rel = indexed_rel(self.engine()?, &repo, &rel, abs)?;
+        Some((repo, rel))
+    }
+}
+
+/// Calls answering `wants` of one indexed file, the note to print after
+/// them, and how many lines they return (a whole read of a structured file
+/// counts as large: its outline is the answer).
+fn file_calls(engine: &Engine, repo: &str, rel: &str, wants: &[Want]) -> Option<(Vec<(&'static str, Value)>, Option<String>, u64)> {
+    let total = tail_range(engine, repo, rel, 1).map(|(_, e)| e)?;
+    let span = |s: u64, e: u64| ("read_span", json!({"repo": repo, "path": rel, "start": s, "end": e}));
+    let mut calls = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut lines = 0;
+    for &w in wants {
+        let (s, e) = match w {
+            Want::Range(s, e) => (s.max(1), e.min(total)),
+            Want::Tail(n) => tail_range(engine, repo, rel, n)?,
+            Want::Whole if total <= SMALL_READ_LINES => (1, total),
+            Want::Whole => {
+                // a file with a few definitions or more: the outline first, as
+                // the deny used to ask for; otherwise its lines
+                if engine.outline(repo, rel).is_some_and(|o| o.len() >= 3) {
+                    calls.push(("file_outline", json!({"repo": repo, "path": rel})));
+                    notes.push(format!(
+                        "({rel}: {total} lines, outline above; read_span or `sed -n A,Bp` for the lines you need)"
+                    ));
+                    lines += SMALL_READ_LINES + 1;
+                    continue;
+                }
+                (1, total)
+            }
+        };
+        if s > e {
+            continue;
+        }
+        let end = e.min(s + MAX_SPAN - 1);
+        if end < e {
+            notes.push(format!("({rel}: lines {s}-{end} of {s}-{e}; `sed -n {},{e}p` for the rest)", end + 1));
+        }
+        calls.push(span(s, end));
+        lines += end - s + 1;
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some((calls, (!notes.is_empty()).then(|| notes.join("\n")), lines))
+}
+
+/// The answer to reading `files`, each with `wants`; `None` when a file is
+/// not one the index answers for, or when the read is small enough that
+/// the shell's own output is as cheap.
+pub(crate) fn serve_files(ctx: &mut Ctx, files: &[PathBuf], wants: &[Want]) -> Option<Serve> {
+    let mut serve = Serve { calls: Vec::new(), fresh: Vec::new(), note: None };
+    let mut notes = Vec::new();
+    let mut lines = 0;
+    for abs in files {
+        let (repo, rel) = ctx.indexed_file(abs)?;
+        let (calls, note, n) = file_calls(ctx.engine()?, &repo, &rel, wants)?;
+        serve.calls.extend(calls);
+        notes.extend(note);
+        lines += n;
+        serve.fresh.push((repo, rel));
+    }
+    if serve.calls.is_empty() || lines <= SMALL_READ_LINES {
+        return None;
+    }
+    serve.note = (!notes.is_empty()).then(|| notes.join("\n"));
+    Some(serve)
+}
+
+/// The answer to a search of `targets` (files or folders, all in one repo)
+/// with grep semantics: `code_grep` (case-sensitive unless `icase`), a
+/// definition's lines for `grep "fn x" -A n`, or the outline for a grep of
+/// definition keywords in one file. `lines` = the matching lines per file
+/// the caller wants at most.
+pub(crate) fn serve_search(ctx: &mut Ctx, targets: &[PathBuf], g: &GrepArgs, lines: Option<u32>) -> Option<Serve> {
+    let mut repo: Option<String> = None;
+    let mut rels: Vec<String> = Vec::new();
+    let mut whole_repo = false;
+    let mut anchors: Vec<String> = Vec::new();
+    for p in targets {
+        let (r, rel) = if p.is_file() {
+            ctx.indexed_file(p)?
+        } else if p.is_dir() {
+            locate(&ctx.repos, p)?
+        } else {
+            return None;
+        };
+        if repo.as_ref().is_some_and(|x| *x != r) {
+            return None; // two repos: the shell's
+        }
+        repo = Some(r);
+        if rel.is_empty() {
+            whole_repo = true;
+        }
+        // anchored: `path:Cargo.toml` alone would take every crate's Cargo.toml
+        anchors.push(if p.is_file() { format!("^{rel}$") } else { format!("^{rel}/") });
+        rels.push(rel);
+    }
+    let repo = repo?;
+    rels.sort();
+    rels.dedup();
+    anchors.sort();
+    anchors.dedup();
+    let all_files = targets.iter().all(|p| p.is_file());
+    let fresh: Vec<(String, String)> = if all_files {
+        rels.iter().map(|r| (repo.clone(), r.clone())).collect()
+    } else {
+        vec![(repo.clone(), String::new())]
     };
+    // `grep -n "fn foo" -A 40 f`: the definition's lines
+    if let Some(n) = g.after {
+        let name = definition_name(&g.pattern)?;
+        if !all_files {
+            return None;
+        }
+        let engine = ctx.engine()?;
+        let mut hits = Vec::new();
+        for rel in &rels {
+            for item in engine.outline(&repo, rel).unwrap_or_default() {
+                if item.name == name {
+                    hits.push((rel.clone(), item.start_line, item.end_line));
+                }
+            }
+        }
+        let [(rel, s, e)] = hits.as_slice() else { return None };
+        let end = (*e).min(s + n).min(s + MAX_SPAN as u32 - 1);
+        return Some(Serve {
+            calls: vec![("read_span", json!({"repo": repo, "path": rel, "start": s, "end": end}))],
+            fresh,
+            note: None,
+        });
+    }
+    let re = grep_regex(g);
+    // the query language splits on whitespace: such a path is the shell's
+    if rels.iter().any(|r| r.contains(char::is_whitespace) || r.contains('|')) {
+        return None;
+    }
+    let path_filter = if whole_repo { String::new() } else { format!(" path:{}", anchors.join("|")) };
+    let case = if g.icase { "no" } else { "yes" };
+    let mut args = json!({ "pattern": format!("{re} case:{case} repo:{repo}{path_filter}") });
+    // `code_grep` shows at most 100 lines a file: a longer cut is the shell's
+    if let Some(n) = g.max.or(lines) {
+        if n > 100 {
+            return None;
+        }
+        args["lines"] = json!(n.max(1));
+    }
+    Some(Serve { calls: vec![("code_grep", args)], fresh, note: None })
+}
+
+/// `head` / `head -N` / `head -n N` / `tail …` after a lookup: the count of
+/// lines kept, which an answer can be cut to. `None` for anything else.
+fn line_cut(stage: &str) -> Option<(bool, u64)> {
+    let w = words(stage);
+    let head = match w.first()?.as_str() {
+        "head" => true,
+        "tail" => false,
+        _ => return None,
+    };
+    if shows_bytes(&w[0], &w[1..]) {
+        return None;
+    }
+    let n = if head { head_count(&w[1..])? } else { tail_count(&w[1..])? };
+    // `head -5 f`: a file operand makes it a read, not a cut
+    if !operands(&w[1..]).is_empty() {
+        return None;
+    }
+    Some((head, n))
+}
+
+/// `head` line count: `-n N`, `-nN`, `-N`, `--lines=N`, else 10; `None`
+/// for `-n -K` (all but the last K).
+fn head_count(args: &[String]) -> Option<u64> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let v = if a == "-n" || a == "--lines" {
+            it.next().map(String::as_str)
+        } else if let Some(v) = a.strip_prefix("--lines=") {
+            Some(v)
+        } else if let Some(v) = a.strip_prefix("-n") {
+            Some(v)
+        } else {
+            a.strip_prefix('-').filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()))
+        };
+        if let Some(v) = v {
+            return v.parse().ok();
+        }
+    }
+    Some(10)
+}
+
+/// The file operands of `head`/`tail` (the value after `-n` is not one).
+fn operands(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-n" || a == "--lines" {
+            it.next();
+        } else if !a.starts_with('-') || a == "-" {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// `sed -n` with line-range scripts only: (ranges, file operands).
+fn sed_args(args: &[String]) -> Option<(Vec<(u32, u32)>, Vec<String>)> {
+    let mut quiet = false;
+    let mut scripts = Vec::new();
+    let mut ops = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "-e" | "--expression" => scripts.push(it.next()?.clone()),
+            "-E" | "-r" | "-s" | "-u" | "--posix" => {}
+            s if s.starts_with('-') && s.len() > 1 => return None,
+            _ => ops.push(a.clone()),
+        }
+    }
+    if !quiet {
+        return None;
+    }
+    if scripts.is_empty() {
+        if ops.is_empty() {
+            return None;
+        }
+        scripts.push(ops.remove(0));
+    }
+    let ranges = sed_ranges(&scripts);
+    (!ranges.is_empty()).then_some((ranges, ops))
+}
+
+/// Unquoted `#` (a comment), `$(`, `` ` `` or `<(`: text the splitter does
+/// not model, so nothing in the command is rewritten.
+fn has_unmodelled_syntax(cmd: &str) -> bool {
+    let cs: Vec<char> = cmd.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        match quote {
+            Some('\'') if c == '\'' => quote = None,
+            Some('\'') => {}
+            Some(_) if c == '\\' => i += 1,
+            Some(_) if c == '"' => quote = None,
+            Some(_) if c == '`' || (c == '$' && cs.get(i + 1) == Some(&'(')) => return true,
+            Some(_) => {}
+            None if c == '\\' => i += 1,
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '`' => return true,
+            None if (c == '$' || c == '<') && cs.get(i + 1) == Some(&'(') => return true,
+            None if c == '#' && (i == 0 || cs[i - 1].is_whitespace()) => return true,
+            None => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// One pipeline the index answers: the answer, and the stages kept after
+/// it (`| head -30` on a search) — `None` when the answer replaces the
+/// whole pipeline.
+type Served = (Serve, Option<String>);
+
+/// The answer for one pipeline, or `None` (the shell runs it as typed).
+fn serve_pipeline(ctx: &mut Ctx, cwd: &Path, pipeline: &[String]) -> Option<Served> {
+    let first = pipeline.first()?;
+    let w = words(first);
+    let (mut cmd, mut args): (&str, &[String]) = (w.first()?.as_str(), &w[1..]);
+    if cmd == "rtk" && args.first().map(String::as_str) == Some("proxy") {
+        cmd = args.get(1)?.as_str();
+        args = &args[2..];
+    }
+    let rest = &pipeline[1..];
+    match cmd {
+        "cat" | "less" | "more" | "head" | "tail" | "sed" => {
+            if shows_bytes(cmd, args) {
+                return None;
+            }
+            let (files, mut wants): (Vec<String>, Vec<Want>) = match cmd {
+                "head" => (operands(args), vec![Want::Range(1, head_count(args)?.max(1))]),
+                "tail" => {
+                    if args.iter().any(|a| a.starts_with('+')) {
+                        return None;
+                    }
+                    (operands(args), vec![Want::Tail(tail_count(args)?)])
+                }
+                "sed" => {
+                    let (ranges, files) = sed_args(args)?;
+                    (files, ranges.into_iter().map(|(s, e)| Want::Range(u64::from(s), u64::from(e))).collect())
+                }
+                _ => {
+                    if args.iter().any(|a| a.starts_with('-') && a != "-n") {
+                        return None;
+                    }
+                    (positional(args), vec![Want::Whole])
+                }
+            };
+            // `cat f | head -150` is the first 150 lines; any other stage
+            // after a read is the shell's
+            match rest {
+                [] => {}
+                [cut] if wants == [Want::Whole] => {
+                    let (head, n) = line_cut(cut)?;
+                    wants = vec![if head { Want::Range(1, n.max(1)) } else { Want::Tail(n) }];
+                }
+                _ => return None,
+            }
+            if files.is_empty() {
+                return None;
+            }
+            let abs: Vec<PathBuf> = files.iter().map(|f| resolve(cwd, f)).collect();
+            Some((serve_files(ctx, &abs, &wants)?, None))
+        }
+        "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" => {
+            let g = parse_grep(cmd, args)?;
+            let mut cut = None;
+            for st in rest {
+                let (head, n) = line_cut(st)?;
+                if head {
+                    cut = Some(cut.map_or(n, |c: u64| c.min(n)));
+                }
+            }
+            let targets: Vec<PathBuf> =
+                if g.paths.is_empty() { vec![cwd.to_path_buf()] } else { g.paths.iter().map(|p| resolve(cwd, p)).collect() };
+            let lines = cut.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+            let serve = serve_search(ctx, &targets, &g, lines)?;
+            // one file: `lines` is the whole cut. Several: the answer adds a
+            // `repo:path` line per file, so `head -N` becomes `head -(2N+1)`
+            // (every match in its own file, and the count line) and never
+            // drops a line the typed cut would show.
+            let one_file = g.paths.len() == 1 && targets[0].is_file();
+            let keep: Vec<String> = rest
+                .iter()
+                .filter_map(|st| {
+                    let (head, n) = line_cut(st)?;
+                    (!(one_file && head)).then(|| format!("{} -n {}", if head { "head" } else { "tail" }, 2 * n + 1))
+                })
+                .collect();
+            Some((serve, (!keep.is_empty()).then(|| keep.join(" | "))))
+        }
+        "find" => {
+            for st in rest {
+                line_cut(st)?;
+            }
+            let mut dir: Option<&String> = None;
+            let mut name = "*".to_string();
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-name" | "-iname" => name = it.next()?.clone(),
+                    "-type" if it.next()? == "f" => {}
+                    s if s.starts_with('-') => return None,
+                    _ if dir.is_none() => dir = Some(a),
+                    _ => return None,
+                }
+            }
+            if name.contains('/') {
+                return None;
+            }
+            let d = dir.map(|d| resolve(cwd, d)).unwrap_or_else(|| cwd.to_path_buf());
+            if !d.is_dir() {
+                return None;
+            }
+            let (repo, rel) = locate(&ctx.repos, &d)?;
+            let pattern = if rel.is_empty() { format!("**/{name}") } else { format!("{rel}/**/{name}") };
+            let serve = Serve {
+                calls: vec![("list_files", json!({"pattern": pattern, "repo": repo}))],
+                fresh: vec![(repo, String::new())],
+                note: None,
+            };
+            Some((serve, (!rest.is_empty()).then(|| rest.join(" | "))))
+        }
+        _ => None,
+    }
+}
+
+/// The pipelines of `command` the index answers: (pipeline index in
+/// [`split_spans`], answer). Empty when the call does other work too (a
+/// build, a write, a script: the shell is needed anyway, and a re-run
+/// of half of it is worse than its reads) or when its syntax goes beyond
+/// what the splitter models.
+fn plan(data_dir: &Path, cwd: &Path, command: &str) -> Vec<(usize, Served)> {
+    if command.contains("INDEXIO_RAW") || command.contains("# raw") || has_unmodelled_syntax(command) {
+        return Vec::new();
+    }
+    let pipelines = split_spans(command);
+    if pipelines.iter().any(|(_, p)| is_other_work(p)) {
+        return Vec::new();
+    }
+    let mut ctx = Ctx::new(data_dir);
+    if ctx.repos.is_empty() {
+        return Vec::new();
+    }
     let mut cwd = cwd.to_path_buf();
-    for pipeline in split(command) {
-        let Some(first) = pipeline.first() else { continue };
-        // A redirection or heredoc makes it a write (`cat > f <<EOF`), and a
-        // read whose output feeds a program (`cat f | python -`) is not a
-        // lookup: only reads that end in the terminal or in viewers/filters
-        // are the index's business.
-        if pipeline.iter().any(|st| has_redirect(st)) {
+    let mut out = Vec::new();
+    for (i, (_, pipeline)) in pipelines.iter().enumerate() {
+        if has_redirect_any(pipeline) {
             continue;
         }
-        if pipeline[1..].iter().any(|st| !is_viewer(st)) {
+        let w = pipeline.first().map(|s| words(s)).unwrap_or_default();
+        if w.first().map(String::as_str) == Some("cd") && pipeline.len() == 1 {
+            if let Some(dir) = w.get(1) {
+                cwd = resolve(&cwd, dir);
+            }
             continue;
         }
-        let w = words(first);
-        let Some(cmd0) = w.first() else { continue };
-        let mut cmd = cmd0.as_str();
-        let mut args: &[String] = &w[1..];
-        if cmd == "rtk" && args.first().map(String::as_str) == Some("proxy") {
-            // `rtk proxy <cmd>`: judge the wrapped command
-            if let Some(c) = args.get(1) {
-                cmd = c.as_str();
-                args = &args[2..];
-            }
-        }
-        match cmd {
-            "cd" => {
-                if let Some(dir) = args.first() {
-                    cwd = resolve(&cwd, dir);
-                }
-                continue;
-            }
-            "cat" | "head" | "tail" | "sed" | "less" | "more" => {
-                if cmd == "sed" && args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
-                    continue; // an edit
-                }
-                if shows_bytes(cmd, args) {
-                    continue;
-                }
-                let files: Vec<(String, String, PathBuf)> = positional(args)
-                    .into_iter()
-                    .filter(|a| !(cmd == "sed" && a.ends_with('p')))
-                    .map(|a| (a.clone(), a, PathBuf::new()))
-                    .map(|(a, _, _)| {
-                        let abs = resolve(&cwd, &a);
-                        (a, String::new(), abs)
-                    })
-                    .collect();
-                for (a, _, abs) in files {
-                    if debug {
-                        eprintln!("hook: read candidate {a} -> {} file={} located={:?}", abs.display(), abs.is_file(), locate(&repos, &abs));
-                    }
-                    if !abs.is_file() {
-                        continue;
-                    }
-                    let Some((repo, rel)) = locate(&repos, &abs) else { continue };
-                    if debug {
-                        eprintln!("hook: located ({} us)", t0.elapsed().as_micros());
-                    }
-                    let Some(rel) = indexed_as(&mut engine, &repo, &rel, &abs) else {
-                        if debug {
-                            eprintln!("hook: {repo}:{rel} not indexed");
-                        }
-                        continue;
-                    };
-                    if debug {
-                        eprintln!("hook: indexed checked ({} us)", t0.elapsed().as_micros());
-                    }
-                    let ranges: Vec<(u32, u32)> = if cmd == "sed" {
-                        sed_ranges(args)
-                    } else if cmd == "head" {
-                        args.iter()
-                            .position(|x| x == "-n")
-                            .and_then(|i| args.get(i + 1))
-                            .and_then(|n| n.parse::<u32>().ok())
-                            .or_else(|| args.iter().find_map(|x| x.strip_prefix("-n").and_then(|n| n.parse().ok())))
-                            .map(|n| (1, n))
-                            .or(Some((1, 10))) // plain `head f`
-                            .into_iter()
-                            .collect()
-                    } else if cmd == "tail" {
-                        let e = engine.as_ref();
-                        tail_count(args)
-                            .and_then(|n| tail_range(e?, &repo, &rel, n))
-                            .map(|(s, e)| (s as u32, e as u32))
-                            .into_iter()
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    // a few lines are cheaper read than denied (as for Read)
-                    let lines: u64 = ranges.iter().map(|&(s, e)| u64::from(e.saturating_sub(s)) + 1).sum();
-                    if !ranges.is_empty() && lines <= SMALL_READ_LINES {
-                        continue;
-                    }
-                    if ranges.is_empty() && engine.as_ref().is_some_and(|e| is_small_file(e, &repo, &rel)) {
-                        continue;
-                    }
-                    let call = if ranges.is_empty() {
-                        format!("mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need")
-                    } else {
-                        ranges
-                            .iter()
-                            .map(|(s, e)| format!("mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{s}, end:{e}}}"))
-                            .collect::<Vec<_>>()
-                            .join(" + ")
-                    };
-                    freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
-                    return Some(format!("{a} is indexed: use {call} instead (numbered, fresh)"));
-                }
-            }
-            "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" => {
-                // a grep on a pipeline (`x | grep`) is never first here; this
-                // is a filesystem search: pattern = first positional, paths =
-                // the rest (none = cwd)
-                let g = grep_args(cmd, args);
-                if g.not_lines {
-                    continue;
-                }
-                let Some(pattern) = g.pattern.as_deref() else { continue };
-                let paths: Vec<PathBuf> = if !g.paths.is_empty() {
-                    g.paths.iter().map(|p| resolve(&cwd, p)).collect()
-                } else {
-                    vec![cwd.clone()]
-                };
-                let mut targets: Vec<(String, String)> = Vec::new();
-                for p in &paths {
-                    match locate(&repos, p) {
-                        // a file must itself be indexed (a .log inside the repo is not)
-                        Some((repo, rel)) if p.is_file() && !indexed(&mut engine, &repo, &rel) => return None,
-                        Some(t) => targets.push(t),
-                        None => return None, // something outside the index: allow
-                    }
-                }
-                let repo_filter = {
-                    let mut names: Vec<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
-                    names.sort();
-                    names.dedup();
-                    if names.len() == 1 { format!(" repo:{}", names[0]) } else { String::new() }
-                };
-                // files/dirs → `path:a|b|c` (any-of substrings); a whole
-                // repo → no path filter
-                let path_filter = {
-                    let mut rels: Vec<&str> = targets.iter().map(|(_, r)| r.as_str()).filter(|r| !r.is_empty()).collect();
-                    rels.sort();
-                    rels.dedup();
-                    if rels.is_empty() || rels.len() < targets.len() {
-                        String::new()
-                    } else {
-                        format!(" path:{}", rels.join("|"))
-                    }
-                };
-                let mut fresh: Vec<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
-                fresh.dedup();
-                for repo in fresh {
-                    freshen_later(data_dir, own.as_deref(), repo, None);
-                }
-                let fixed = args.iter().any(|a| a == "-F" || a == "--fixed-strings");
-                let ere = if g.ere { pattern.to_string() } else { bre_to_ere(pattern) };
-                let is_regex = !fixed && ere.chars().any(|c| "\\^$.*+?()[]{}|".contains(c));
-                // `grep "def foo" -A 12` is a definition lookup: find_symbol
-                // gives the definition's line range in one call
-                if let Some(name) = definition_name(pattern) {
-                    let body = match g.after {
-                        Some(n) => format!(", then read_span {{repo, path, start, end:start+{n}}} for the body"),
-                        None => " (rows carry start-end lines; read_span reads the body)".to_string(),
-                    };
-                    return Some(format!(
-                        "Definition lookup in an indexed repo: use mcp__indexio__find_symbol {{name:\"{name}\"}} instead{body}"
-                    ));
-                }
-                // `grep "^class \|^def " file` is an outline by hand
-                if let [(repo, rel)] = targets.as_slice() {
-                    if !rel.is_empty() && is_outline_pattern(&ere) {
-                        return Some(format!(
-                            "Outline of an indexed file: use mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} instead (every definition with start-end lines)"
-                        ));
-                    }
-                }
-                // a grep lists every matching line: code_search with
-                // `lines` (literal) or code_grep (regex) do the same, ranked
-                // per file
-                let call = if !is_regex {
-                    let lit = if fixed { pattern.to_string() } else { ere.replace('\\', "") };
-                    format!(
-                        "mcp__indexio__code_search {{query:\"{}\"{repo_filter}{path_filter}, lines:20}}",
-                        lit.replace('"', "\\\"")
-                    )
-                } else {
-                    format!(
-                        "mcp__indexio__code_grep {{pattern:\"{}{repo_filter}{path_filter}\"}}",
-                        ere.replace('"', "\\\"")
-                    )
-                };
-                let ctx = match g.after {
-                    Some(n) => format!(", then read_span {{repo, path, start:line, end:line+{n}}} for context"),
-                    None => String::new(),
-                };
-                return Some(format!(
-                    "Indexed files: use {call} instead (every matching line per file, ranked, current with your edits{ctx})"
-                ));
-            }
-            "python" | "python3" | "py" | "node" | "deno" | "bun" | "ruby" | "perl" | "php" => {
-                let Some((path, needle)) = script_read(first) else { continue };
-                let abs = resolve(&cwd, &path);
-                if !abs.is_file() {
-                    continue;
-                }
-                let Some((repo, rel)) = locate(&repos, &abs) else { continue };
-                let Some(rel) = indexed_as(&mut engine, &repo, &rel, &abs) else { continue };
-                freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
-                let call = match needle {
-                    Some(n) => format!(
-                        "mcp__indexio__code_grep {{pattern:\"{}\", repo:\"{repo}\", path:\"{rel}\"}} then read_span {{repo, path, start:line, end:line+60}}",
-                        grep_literal(&n).replace('"', "\\\"")
-                    ),
-                    None => format!(
-                        "mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need"
-                    ),
-                };
-                return Some(format!("{path} is indexed: use {call} instead of a script that opens it (numbered, fresh)"));
-            }
-            "find" => {
-                let pos = positional(args);
-                let dir = pos.first().map(|d| resolve(&cwd, d)).unwrap_or_else(|| cwd.clone());
-                if let Some((repo, rel)) = locate(&repos, &dir) {
-                    let name = args
-                        .iter()
-                        .position(|a| a == "-name" || a == "-iname")
-                        .and_then(|i| args.get(i + 1))
-                        .cloned()
-                        .unwrap_or_else(|| "*".to_string());
-                    let pattern = if rel.is_empty() { format!("**/{name}") } else { format!("{rel}/**/{name}") };
-                    return Some(format!(
-                        "Indexed folder: use mcp__indexio__list_files {{pattern:\"{pattern}\", repo:\"{repo}\"}} instead"
-                    ));
-                }
-            }
-            _ => {}
+        if let Some(s) = serve_pipeline(&mut ctx, &cwd, pipeline) {
+            out.push((i, s));
         }
     }
-    None
+    out
+}
+
+fn has_redirect_any(pipeline: &[String]) -> bool {
+    pipeline.iter().any(|st| has_redirect(st))
+}
+
+/// `indexio --data-dir D` as a shell word sequence every shell accepts.
+fn tool_prefix(exe: &Path, data_dir: &Path) -> String {
+    let dd = data_dir.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
+    hook_command(exe, &format!("--data-dir '{dd}'"))
+}
+
+/// `command` with each answered pipeline replaced by its `indexio tool`
+/// call; the original pipeline runs if the call fails.
+fn bash_rewrite(exe: &Path, data_dir: &Path, command: &str, current: Option<&str>, served: &[(usize, Served)]) -> String {
+    let spans = split_spans(command);
+    let prefix = tool_prefix(exe, data_dir);
+    let mut out = command.to_string();
+    for (i, (serve, keep)) in served.iter().rev() {
+        let (range, stages) = &spans[*i];
+        let (name, b64) = serve.payload(current);
+        let call = format!("{prefix} tool {name} {b64}");
+        let rep = match keep {
+            Some(k) => format!("{{ {call} || {}; }} | {k}", stages[0]),
+            None => format!("{{ {call} || {}; }}", &command[range.clone()]),
+        };
+        out.replace_range(range.clone(), &rep);
+    }
+    out
+}
+
+/// The command to run instead of `command`, when the index answers a read
+/// in it (SPEC-P11): `None` = run it as typed.
+pub fn rewrite_bash(data_dir: &Path, cwd: &Path, command: &str, exe: &Path) -> Option<String> {
+    let served = plan(data_dir, cwd, command);
+    if served.is_empty() {
+        return None;
+    }
+    let current = locate(&repos(data_dir), cwd).map(|(r, _)| r);
+    Some(bash_rewrite(exe, data_dir, command, current.as_deref(), &served))
+}
+
+/// The base64url alphabet (RFC 4648 §5): shell-safe in Bash, Git Bash's
+/// path conversion and PowerShell alike, so the tool's JSON arguments need
+/// no quoting.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+pub(crate) fn b64url_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        for k in 0..=chunk.len() {
+            out.push(B64[((n >> (18 - 6 * k)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = B64.iter().position(|&b| b == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Entry point for `indexio tool NAME [ARGS]`: freshen what the call reads,
+/// run it, print the answer (and the hook's note). Returns the exit status:
+/// 0, or 1 when the tool failed (its message on stderr, nothing on stdout,
+/// so a hook-written fallback prints the original command's output alone).
+pub fn run_tool(data_dir: &Path, name: &str, args: Option<&str>, current: Option<&str>) -> i32 {
+    use std::io::Write as _;
+    let parsed = match args.map(str::trim) {
+        None | Some("") => Some(json!({})),
+        Some(a) if a.starts_with('{') => serde_json::from_str::<Value>(a).ok(),
+        Some(a) => b64url_decode(a).and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
+    };
+    let Some(Value::Object(mut obj)) = parsed else {
+        eprintln!("indexio tool: the arguments are neither a JSON object nor one base64url-encoded");
+        return 2;
+    };
+    let cur = obj.remove("_current").and_then(|v| v.as_str().map(str::to_string)).or(current.map(str::to_string));
+    let note = obj.remove("_note").and_then(|v| v.as_str().map(str::to_string));
+    let fresh: Vec<(String, String)> = obj.remove("_fresh").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let current = crate::mcp::resolve_current_repo(data_dir, cur.as_deref());
+    // the index must be current with the files on disk: the MCP server
+    // refreshes before each call, and this call has no server
+    for (repo, rel) in &fresh {
+        freshen_paths(data_dir, repo, (!rel.is_empty()).then_some(rel.as_str()));
+    }
+    let args = Value::Object(obj);
+    let calls: Vec<(String, Value)> = if name == "batch" {
+        args["calls"]
+            .as_array()
+            .map(|a| a.iter().map(|c| (c["name"].as_str().unwrap_or("").to_string(), c["args"].clone())).collect())
+            .unwrap_or_default()
+    } else {
+        vec![(name.to_string(), args)]
+    };
+    let mut out = String::new();
+    for (n, a) in &calls {
+        match crate::mcp::call_once(data_dir, n, a, current.as_deref()) {
+            // a grep that finds nothing exits 1 (`grep x f || echo none`):
+            // the typed grep runs instead, prints nothing and exits 1
+            Ok(text) if n == "code_grep" && calls.len() == 1 && text.trim_start().starts_with("no matches") => return 1,
+            Ok(text) => {
+                out.push_str(&text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Err(e) => {
+                eprintln!("indexio {n}: {e}");
+                return 1;
+            }
+        }
+    }
+    if let Some(n) = note {
+        out.push_str(&n);
+        out.push('\n');
+    }
+    // a reader that stops early (`| head`) is not an error
+    let mut so = std::io::stdout().lock();
+    let _ = so.write_all(out.as_bytes());
+    let _ = so.flush();
+    0
 }
 
 /// The command string Claude Code should run for this binary. Claude Code
@@ -1177,18 +1601,6 @@ fn without_raw(command: &str) -> String {
     s.trim().to_string()
 }
 
-/// Whether `# raw` on this command is a retry of the command the hook last
-/// denied in `session` — the only case the marker escapes the hook
-/// (SPEC-P10 §13: a model that had seen the marker once put it on every
-/// later grep, unprompted).
-fn raw_is_retry(data_dir: &Path, session: &str, command: &str) -> bool {
-    if !command.contains("# raw") {
-        return false;
-    }
-    let hash = indexio_types::BlobId::from_content(without_raw(command).as_bytes()).hex();
-    std::fs::read_to_string(last_denied_path(data_dir, session)).is_ok_and(|prev| prev.trim() == hash)
-}
-
 /// The verdict for one `Read` tool call (SPEC-P10 §16): a file the index
 /// holds is served by `file_outline` + `read_span` instead — a whole-file
 /// Read of a source file was the largest single result in a session hour
@@ -1272,8 +1684,25 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
     let data_dir = data_dir.to_path_buf();
     let verdict = within_budget(move || {
         let reason = read_verdict(&data_dir, cwd.as_deref(), &file_path, offset, limit)?;
+        // a deny names tools this caller cannot reach: let the Read through
+        if indexio_unreachable(&v, cwd.as_deref()) {
+            return None;
+        }
         let key = format!("Read {file_path} {offset:?} {limit:?}");
-        (!repeated_denial(&data_dir, &session, &key)).then_some(reason)
+        if repeated_denial(&data_dir, &session, &key) {
+            return None;
+        }
+        // a subagent's indexio tools are deferred (a ToolSearch first); its
+        // shell reads are answered from the index in one call
+        if v["agent_id"].is_string() {
+            let path = file_path.replace('\\', "/");
+            let shell = match (offset, limit) {
+                (Some(s), Some(n)) if n > 0 => format!("sed -n {},{}p '{path}'", s.max(1), s.max(1) + n - 1),
+                _ => format!("cat '{path}'"),
+            };
+            return Some(format!("{reason} (or Bash `{shell}`, answered from the index)"));
+        }
+        Some(reason)
     })
     .flatten();
     if let Some(reason) = verdict {
@@ -1289,6 +1718,72 @@ pub fn run_read_hook(data_dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Agent types whose tool list has no MCP tools.
+const AGENTS_WITHOUT_MCP: &[&str] = &["claude-code-guide", "statusline-setup"];
+
+/// Whether the caller of a hooked call cannot use the indexio MCP tools: an
+/// agent type whose tool list leaves them out, or a transcript whose last
+/// indexio call failed as unavailable (the server dropped mid-session: the
+/// Read deny then sent the model to tools it no longer had, and it wrote
+/// scripts to read files).
+fn indexio_unreachable(hook_input: &Value, cwd: Option<&Path>) -> bool {
+    if let Some(t) = hook_input["agent_type"].as_str() {
+        if agent_lacks_indexio(t, cwd, crate::sessions::default_claude_dir().as_deref()) {
+            return true;
+        }
+    }
+    let Some(t) = hook_input["transcript_path"].as_str() else { return false };
+    // a subagent's hook input names the session's transcript
+    let path = match hook_input["agent_id"].as_str() {
+        Some(a) => Path::new(t).with_extension("").join("subagents").join(format!("agent-{a}.jsonl")),
+        None => PathBuf::from(t),
+    };
+    transcript_says_unavailable(&path)
+}
+
+/// An agent definition (`.claude/agents/<type>.md`, project then user)
+/// whose `tools:` list has no indexio tool, or a built-in type without MCP.
+fn agent_lacks_indexio(agent_type: &str, cwd: Option<&Path>, claude_dir: Option<&Path>) -> bool {
+    if AGENTS_WITHOUT_MCP.contains(&agent_type) {
+        return true;
+    }
+    if agent_type.contains(['/', '\\', ':']) {
+        return false; // a plugin's agent: not looked up
+    }
+    let dirs = [cwd.map(|c| c.join(".claude").join("agents")), claude_dir.map(|c| c.join("agents"))];
+    for dir in dirs.into_iter().flatten() {
+        let Ok(text) = std::fs::read_to_string(dir.join(format!("{agent_type}.md"))) else { continue };
+        let Some(front) = text.strip_prefix("---").and_then(|r| r.split_once("\n---")).map(|(f, _)| f) else {
+            return false;
+        };
+        return front.lines().find_map(|l| l.trim().strip_prefix("tools:")).is_some_and(|tools| {
+            let t = tools.trim();
+            !(t.is_empty() || t == "*" || t.contains("mcp__indexio"))
+        });
+    }
+    false
+}
+
+/// Whether the transcript's last indexio call failed as unavailable ("No
+/// such tool available: mcp__indexio__…", with no indexio call after it).
+/// Reads the transcript's tail only.
+fn transcript_says_unavailable(path: &Path) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const TAIL: u64 = 512 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let Some(at) = text.rfind("No such tool available: mcp__indexio__") else { return false };
+    !text[at..].contains("\"name\":\"mcp__indexio__")
 }
 
 /// Touched when a session's context is compacted or cleared.
@@ -1416,26 +1911,11 @@ pub fn run_powershell_hook(data_dir: &Path) -> anyhow::Result<()> {
     }
     let command = v["tool_input"]["command"].as_str().unwrap_or("").to_string();
     let cwd = v["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
-    let session = v["session_id"].as_str().unwrap_or("nosession").to_string();
-    if raw_is_retry(data_dir, &session, &command) {
-        return Ok(());
-    }
+    let Ok(exe) = std::env::current_exe() else { return Ok(()) };
     let dd = data_dir.to_path_buf();
-    let decided = within_budget(move || {
-        let reason = ps::verdict(&dd, &cwd, &without_raw(&command))?;
-        (!repeated_denial(&dd, &session, &command)).then_some(reason)
-    });
-    if let Some(Some(reason)) = decided {
-        println!(
-            "{}",
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            })
-        );
+    let decided = within_budget(move || ps::rewrite(&dd, &cwd, &command, &exe));
+    if let Some(Some(rewritten)) = decided {
+        print_served(&rewritten);
     }
     Ok(())
 }
@@ -1454,47 +1934,47 @@ pub fn run_bash_hook(data_dir: &Path) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    let session = v["session_id"].as_str().unwrap_or("nosession");
-    if raw_is_retry(data_dir, session, command) {
-        return Ok(());
-    }
+    let Ok(exe) = std::env::current_exe() else { return Ok(()) };
     // SPEC-P10 §31: a script or build runs through `indexio run`, which
     // keeps a long output in the runs source and returns a digest
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(rewritten) = runner_rewrite(&exe, command) {
-            println!(
-                "{}",
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecisionReason": "indexio run: long output is stored and digested",
-                        "updatedInput": { "command": rewritten },
-                    }
-                })
-            );
-            return Ok(());
-        }
-    }
-    // judge the command as the shell will run it: the marker is a comment
-    let judged = without_raw(command);
-    let (dd, cmd, sess) = (data_dir.to_path_buf(), command.to_string(), session.to_string());
-    let decided = within_budget(move || {
-        let reason = verdict(&dd, &cwd, &judged)?;
-        (!repeated_denial(&dd, &sess, &cmd)).then_some(reason)
-    });
-    if let Some(Some(reason)) = decided {
+    if let Some(rewritten) = runner_rewrite(&exe, command) {
         println!(
             "{}",
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
+                    "permissionDecisionReason": "indexio run: long output is stored and digested",
+                    "updatedInput": { "command": rewritten },
                 }
             })
         );
+        return Ok(());
+    }
+    // SPEC-P11: a read the index answers runs as `indexio tool` in place
+    let (dd, cmd) = (data_dir.to_path_buf(), command.to_string());
+    let decided = within_budget(move || rewrite_bash(&dd, &cwd, &cmd, &exe));
+    if let Some(Some(rewritten)) = decided {
+        print_served(&rewritten);
     }
     Ok(())
+}
+
+/// The hook answer that runs `rewritten` instead of the call. `allow` is
+/// what lets it win over another hook's rewrite of the same call (rtk turns
+/// `cat`/`grep` into `rtk read`/`rtk grep`; Claude Code applies the
+/// `updatedInput` of the hook that also decided).
+fn print_served(rewritten: &str) {
+    println!(
+        "{}",
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "indexio: answered from the index",
+                "updatedInput": { "command": rewritten },
+            }
+        })
+    );
 }
 
 #[cfg(test)]
@@ -1561,15 +2041,26 @@ mod tests {
         assert!(shows_bytes("tail", &s("-f run.log")));
         assert!(shows_bytes("head", &s("-c 200 a.bin")));
         assert!(!shows_bytes("head", &s("-n 20 a.rs")));
-        assert!(!is_viewer("cat -A"));
-        assert!(!is_viewer("wc -l"));
-        assert!(!is_viewer("uniq -c"));
-        assert!(is_viewer("head -20"));
-        for (cmd, args) in [("grep", "-c foo a.rs"), ("grep", "-rl foo src"), ("rg", "-o foo"), ("grep", "-rhoE x src"), ("grep", "--count foo a")] {
-            assert!(grep_args(cmd, &s(args)).not_lines, "{cmd} {args}");
+        // counts, file lists, matched parts, inverted matches, filters and
+        // context before a match are not lines the index returns
+        for (cmd, args) in [
+            ("grep", "-c foo a.rs"),
+            ("grep", "-rl foo src"),
+            ("rg", "-o foo"),
+            ("grep", "-rhoE x src"),
+            ("grep", "--count foo a"),
+            ("grep", "-v foo a.rs"),
+            ("grep", "-rn --include=*.rs foo src"),
+            ("rg", "-t rust foo"),
+            ("grep", "-B3 foo a.rs"),
+            ("grep", "-e a -e b a.rs"),
+            ("grep", "foo"),
+            ("rg", "-r x foo"),
+        ] {
+            assert!(parse_grep(cmd, &s(args)).is_none(), "{cmd} {args}");
         }
-        for (cmd, args) in [("grep", "-n foo a.rs"), ("grep", "-rn -A3 foo src"), ("rg", "-n foo")] {
-            assert!(!grep_args(cmd, &s(args)).not_lines, "{cmd} {args}");
+        for (cmd, args) in [("grep", "-n foo a.rs"), ("grep", "-rn -A3 foo src"), ("rg", "-n foo"), ("grep", "-rni foo .")] {
+            assert!(parse_grep(cmd, &s(args)).is_some(), "{cmd} {args}");
         }
     }
 
@@ -1605,26 +2096,32 @@ mod tests {
         assert!(has_redirect("cat > out.txt"));
         assert!(has_redirect("cat file <<EOF"));
         assert!(!has_redirect("echo '>' x"));
-        assert!(is_viewer("head -20"));
-        assert!(is_viewer("grep -n foo"));
-        assert!(!is_viewer("python -"));
-        assert!(!is_viewer("sed -i s/a/b/"));
     }
 
     #[test]
     fn grep_option_values_are_not_paths() {
         let a: Vec<String> = ["-n", "class Blocked", "-A", "12", "src/errors.py"].iter().map(|s| s.to_string()).collect();
-        let g = grep_args("grep", &a);
-        assert_eq!(g.pattern.as_deref(), Some("class Blocked"));
+        let g = parse_grep("grep", &a).unwrap();
+        assert_eq!(g.pattern, "class Blocked");
         assert_eq!(g.paths, vec!["src/errors.py"]);
         assert_eq!(g.after, Some(12));
         assert!(!g.ere);
-        let b: Vec<String> = ["-rn", "--include=*.rs", "-e", "foo|bar", "-A3", "crates", "docs"].iter().map(|s| s.to_string()).collect();
-        let g = grep_args("rg", &b);
-        assert_eq!(g.pattern.as_deref(), Some("foo|bar"));
+        let b: Vec<String> = ["-n", "-e", "foo|bar", "-A3", "crates", "docs"].iter().map(|s| s.to_string()).collect();
+        let g = parse_grep("rg", &b).unwrap();
+        assert_eq!(g.pattern, "foo|bar");
         assert_eq!(g.paths, vec!["crates", "docs"]);
         assert_eq!(g.after, Some(3));
         assert!(g.ere);
+        // `-E` inside a bundle is extended syntax too (`-nE "^a|^b"` was
+        // turned into `^a\|^b`, a literal bar)
+        let c: Vec<String> = ["-nE", "^stage 1|^trial +15 ", "funnel.log"].iter().map(|s| s.to_string()).collect();
+        let g = parse_grep("grep", &c).unwrap();
+        assert!(g.ere);
+        assert_eq!(grep_regex(&g), "^stage 1|^trial +15 ");
+        let d: Vec<String> = ["-rniw", "foo", "src"].iter().map(|s| s.to_string()).collect();
+        let g = parse_grep("grep", &d).unwrap();
+        assert!(g.icase && g.recursive);
+        assert_eq!(grep_regex(&g), r"\b(?:foo)\b");
     }
 
     #[test]
@@ -1657,14 +2154,6 @@ mod tests {
         assert_eq!(w, vec!["grep", "-n", "add(\"--id\"\\|x", "src/a.py"]);
         assert_eq!(words("grep -n foo\\ bar f"), vec!["grep", "-n", "foo bar", "f"]);
         assert_eq!(words("grep 'a\\|b' f"), vec!["grep", "a\\|b", "f"]);
-    }
-
-    #[test]
-    fn outline_patterns() {
-        assert!(is_outline_pattern("^class |^def |^async def |^@pytest"));
-        assert!(is_outline_pattern("^pub fn |^impl |^struct "));
-        assert!(!is_outline_pattern("^class Foo|bar"));
-        assert!(!is_outline_pattern("def test_"));
     }
 
     /// A plain folder's PDF is indexed by name only: a Read of it is the
@@ -1747,19 +2236,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_marker_only_escapes_a_retry() {
+    fn a_resent_read_goes_through() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        let cmd = "sed -n 1,5p src/lib.rs";
-        // a fresh `# raw` on a never-denied command is not a retry
-        assert!(!raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs # raw"));
-        // first denial records the command
+        let cmd = "Read src/lib.rs None None";
+        // first denial records the call
         assert!(!repeated_denial(d, "s1", cmd));
-        // now the marker on that command is a retry, on another it is not
-        assert!(raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs # raw"));
-        assert!(raw_is_retry(d, "s1", "sed -n 1,5p src/lib.rs  # raw"));
-        assert!(!raw_is_retry(d, "s1", "sed -n 1,9p src/lib.rs # raw"));
-        assert!(!raw_is_retry(d, "s2", "sed -n 1,5p src/lib.rs # raw"), "per session");
+        assert!(!repeated_denial(d, "s2", cmd), "per session");
         // the identical re-send repeats (and goes through); the one after starts over
         assert!(repeated_denial(d, "s1", cmd));
         assert!(!repeated_denial(d, "s1", cmd));
@@ -1801,6 +2284,208 @@ mod tests {
         assert_eq!(rw("C:/Users/x/.cargo/bin/indexio.exe run -- python x.py"), None, "already wrapped");
         assert_eq!(rw("python x.py # raw"), None);
         assert_eq!(rw("ls; python x.py"), None, "a non-cd stage before the runner");
+    }
+
+    #[test]
+    fn pipelines_keep_their_place_in_the_command() {
+        let cmd = "cd x && cat 'a b.rs' | head -5;  grep -n \"x;y\" src || echo no";
+        let spans = split_spans(cmd);
+        let texts: Vec<&str> = spans.iter().map(|(r, _)| &cmd[r.clone()]).collect();
+        assert_eq!(texts, vec!["cd x", "cat 'a b.rs' | head -5", "grep -n \"x;y\" src", "echo no"]);
+        assert_eq!(spans[1].1, vec!["cat 'a b.rs'", "head -5"]);
+        // multi-byte text before a pipeline
+        let cmd = "echo 'é→' && cat f";
+        let spans = split_spans(cmd);
+        assert_eq!(&cmd[spans[1].0.clone()], "cat f");
+    }
+
+    #[test]
+    fn grep_classes_stay_on_one_line() {
+        assert_eq!(line_local(r"^\s*mod "), r"^[^\S\n]*mod ");
+        assert_eq!(line_local(r"a[^;]*;"), r"a[^\n;]*;");
+        assert_eq!(line_local(r"[\s,]x\W\D\.\\s"), r"[ \t\r\f\v,]x[^\w\n][^\d\n]\.\\s");
+        assert_eq!(line_local(r"[]a]b[^]c]"), r"[]a]b[^\n]c]");
+        assert_eq!(line_local(r"^[[:space:]]*#"), r"^[ \t\r\f\v]*#");
+        assert_eq!(line_local(r"[[:alpha:]_]+"), r"[[:alpha:]_]+");
+        for re in [r"^\s*mod ", r"a[^;]*;", r"[\s,]x\W\D", r"[]a]b[^]c]", r"^[[:space:]]*#"] {
+            assert!(regex::Regex::new(&line_local(re)).is_ok(), "{re}");
+        }
+    }
+
+    #[test]
+    fn base64url_round_trips() {
+        for s in ["", "a", "ab", "abc", "{\"repo\":\"x y\",\"pattern\":\"a|b'c\\\"\"}", "é→\u{1F600}"] {
+            let e = b64url_encode(s.as_bytes());
+            assert!(e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "{e}");
+            assert_eq!(b64url_decode(&e).unwrap(), s.as_bytes());
+        }
+        assert!(b64url_decode("a+b").is_none());
+    }
+
+    #[test]
+    fn comments_and_substitutions_are_left_alone() {
+        assert!(has_unmodelled_syntax("cat f # look"));
+        assert!(has_unmodelled_syntax("cat $(ls | head -1)"));
+        assert!(has_unmodelled_syntax("cat `ls`"));
+        assert!(has_unmodelled_syntax("diff <(cat a) b"));
+        assert!(!has_unmodelled_syntax("grep -n 'a#b $(x)' f"));
+        assert!(!has_unmodelled_syntax("grep -n \"issue#4\" f"));
+        assert!(!has_unmodelled_syntax("sed -n 1,80p a.rs"));
+    }
+
+    /// An indexed folder: `code.rs` (90 lines, 6 functions), `notes.md`
+    /// (100 lines, one heading), `short.md` (3 lines).
+    fn served_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("folder");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut code = String::new();
+        for f in 0..6 {
+            code.push_str(&format!("fn f{f}() {{\n"));
+            for l in 0..13 {
+                code.push_str(&format!("    let x{l} = {l}; // Needle{f}\n"));
+            }
+            code.push_str("}\n");
+        }
+        std::fs::write(root.join("src/code.rs"), &code).unwrap();
+        std::fs::write(root.join("notes.md"), format!("# Notes\n{}", "some text\n".repeat(99))).unwrap();
+        std::fs::write(root.join("short.md"), "# Short\nsome text\n").unwrap();
+        let cas = indexio_ingest::Cas::open(&data.join("cas")).unwrap();
+        indexio_ingest::index_dir(&root, "folder", &data, &cas).unwrap();
+        (tmp, data, root)
+    }
+
+    /// The calls a command's reads are answered with: one line per served
+    /// pipeline (`index: tool args…`), `[]` when it runs as typed.
+    fn served(data: &Path, cwd: &Path, cmd: &str) -> Vec<String> {
+        plan(data, cwd, cmd)
+            .into_iter()
+            .map(|(i, (s, keep))| {
+                let calls: Vec<String> = s.calls.iter().map(|(n, a)| format!("{n} {a}")).collect();
+                format!("{i}: {}{}", calls.join(" + "), keep.map(|k| format!(" | {k}")).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shell_reads_are_answered_in_place() {
+        let (_t, data, root) = served_fixture();
+        let s = |c: &str| served(&data, &root, c);
+        // a whole read of a file with definitions: its outline (and a note)
+        assert_eq!(s("cat src/code.rs"), vec![r#"0: file_outline {"path":"src/code.rs","repo":"folder"}"#]);
+        let p = plan(&data, &root, "cat src/code.rs");
+        assert!(p[0].1 .0.note.as_deref().is_some_and(|n| n.contains("90 lines")), "{:?}", p[0].1 .0.note);
+        // one without: its lines
+        assert_eq!(s("cat notes.md"), vec![r#"0: read_span {"end":100,"path":"notes.md","repo":"folder","start":1}"#]);
+        // `| head -N` folds into the range; a small read stays the shell's
+        assert_eq!(s("cat notes.md | head -80"), vec![r#"0: read_span {"end":80,"path":"notes.md","repo":"folder","start":1}"#]);
+        assert!(s("cat notes.md | head -20").is_empty());
+        assert!(s("cat short.md").is_empty());
+        assert!(s("head -20 src/code.rs").is_empty());
+        assert_eq!(s("sed -n 5,90p src/code.rs"), vec![r#"0: read_span {"end":90,"path":"src/code.rs","repo":"folder","start":5}"#]);
+        assert_eq!(s("tail -n 70 notes.md"), vec![r#"0: read_span {"end":100,"path":"notes.md","repo":"folder","start":31}"#]);
+        // a grep: case-sensitive like grep, `-i` not, cut by `| head`
+        assert_eq!(
+            s("grep -n Needle3 src/code.rs | head -5"),
+            vec![r#"0: code_grep {"lines":5,"pattern":"Needle3 case:yes repo:folder path:^src/code.rs$"}"#]
+        );
+        assert_eq!(s("grep -rni needle src"), vec![r#"0: code_grep {"pattern":"needle case:no repo:folder path:^src/"}"#]);
+        // a definition with its body
+        assert_eq!(s("grep -n 'fn f2' -A 40 src/code.rs"), vec![r#"0: read_span {"end":45,"path":"src/code.rs","repo":"folder","start":31}"#]);
+        // several pipelines: each answered in place, the rest left as typed
+        assert_eq!(
+            s("cd src && sed -n 1,80p code.rs; echo ---; grep -n Needle1 code.rs"),
+            vec![
+                r#"1: read_span {"end":80,"path":"src/code.rs","repo":"folder","start":1}"#.to_string(),
+                r#"3: code_grep {"pattern":"Needle1 case:yes repo:folder path:^src/code.rs$"}"#.to_string(),
+            ]
+        );
+        // what the index cannot answer as asked stays the shell's
+        for cmd in [
+            "cat notes.md | grep text",          // a filter after a read
+            "grep -v Needle src/code.rs",        // inverted
+            "grep -c Needle src/code.rs",        // a count
+            "grep -n Needle -B 2 src/code.rs",   // context before
+            "sed 's/a/b/' notes.md",             // a transform
+            "sed -n '/fn/,/}/p' src/code.rs",    // regex addresses
+            "cat notes.md > copy.md",            // a write
+            "cat notes.md # why",                // a comment
+            "python build.py && cat notes.md",   // other work in the call
+            "find . -name '*.rs' -delete",       // not a listing
+            "grep -n Needle missing.rs",         // not a file of the index
+        ] {
+            assert!(s(cmd).is_empty(), "{cmd}: {:?}", s(cmd));
+        }
+        assert_eq!(s("find . -name '*.rs' | head -3"), vec![r#"0: list_files {"pattern":"**/*.rs","repo":"folder"} | head -3"#]);
+    }
+
+    #[test]
+    fn the_rewrite_falls_back_to_the_original() {
+        let (_t, data, root) = served_fixture();
+        let exe = Path::new("C:/Program Files/indexio/indexio.exe");
+        let out = rewrite_bash(&data, &root, "cd src && grep -n Needle1 code.rs | head -3 && echo done", exe).unwrap();
+        assert!(out.starts_with("cd src && { \"C:/Program Files/indexio/indexio.exe\" --data-dir '"), "{out}");
+        assert!(out.ends_with(" tool code_grep ") || out.contains(" tool code_grep "), "{out}");
+        assert!(out.contains(" || grep -n Needle1 code.rs | head -3; } && echo done"), "{out}");
+        // over a folder the cut stays, widened for the per-file lines
+        let dir = rewrite_bash(&data, &root, "grep -rn Needle1 src | head -3", exe).unwrap();
+        assert!(dir.ends_with(" || grep -rn Needle1 src; } | head -n 7"), "{dir}");
+        // the payload carries the repo to freshen and the session's repo
+        let b64 = out.split(" tool code_grep ").nth(1).unwrap().split(' ').next().unwrap();
+        let v: Value = serde_json::from_slice(&b64url_decode(b64).unwrap()).unwrap();
+        assert_eq!(v["_fresh"], json!([["folder", "src/code.rs"]]));
+        assert_eq!(v["_current"], json!("folder"));
+        let out = rewrite_bash(&data, &root, "sed -n 1,80p src/code.rs", exe).unwrap();
+        assert!(out.ends_with(" || sed -n 1,80p src/code.rs; }"), "{out}");
+        assert_eq!(rewrite_bash(&data, &root, "cat short.md", exe), None);
+    }
+
+    #[test]
+    fn powershell_reads_are_answered_in_place() {
+        let (_t, data, root) = served_fixture();
+        let exe = Path::new("C:/x/indexio.exe");
+        let rw = |c: &str| ps::rewrite(&data, &root, c, exe);
+        let out = rw("Select-String -Path src/code.rs -Pattern 'Needle4' | Select-Object -Last 6").unwrap();
+        assert!(out.starts_with("$global:LASTEXITCODE = 1; & 'C:/x/indexio.exe' --data-dir '"), "{out}");
+        assert!(out.contains(" tool code_grep ") && out.contains(" | Select-Object -Last 13; if ($LASTEXITCODE -ne 0) { Select-String"), "{out}");
+        assert!(rw("Get-Content src/code.rs -TotalCount 80").unwrap().contains(" tool read_span "));
+        // shapes the answer would not keep: the shell's
+        assert_eq!(rw("Get-Content notes.md | Where-Object { $_ -match 'x' }"), None);
+        assert_eq!(rw("Select-String -Path src/code.rs -Pattern 'x' | ForEach-Object { $_.LineNumber }"), None);
+        assert_eq!(rw("Get-Content short.md"), None);
+    }
+
+    #[test]
+    fn a_caller_without_indexio_tools_reads_files_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path().join("s1.jsonl");
+        let fail = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"<tool_use_error>Error: No such tool available: mcp__indexio__read_span. Its MCP server 'indexio' has disconnected.</tool_use_error>"}]}}"#;
+        let call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__indexio__read_span","input":{}}]}}"#;
+        std::fs::write(&t, format!("{call}\n{fail}\n")).unwrap();
+        assert!(transcript_says_unavailable(&t));
+        std::fs::write(&t, format!("{call}\n{fail}\n{call}\n")).unwrap();
+        assert!(!transcript_says_unavailable(&t), "a later call: the server is back");
+        // a subagent's own transcript
+        let sub = tmp.path().join("s1").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("agent-a1.jsonl"), format!("{call}\n{fail}\n")).unwrap();
+        std::fs::write(&t, format!("{call}\n")).unwrap();
+        let input = json!({"transcript_path": t.to_string_lossy(), "agent_id": "a1", "agent_type": "general-purpose"});
+        assert!(indexio_unreachable(&input, None));
+        assert!(!indexio_unreachable(&json!({"transcript_path": t.to_string_lossy()}), None));
+        // agent definitions
+        let agents = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("reader.md"), "---\nname: reader\ntools: Read, Grep\n---\nbody").unwrap();
+        std::fs::write(agents.join("full.md"), "---\nname: full\n---\nbody").unwrap();
+        std::fs::write(agents.join("idx.md"), "---\ntools: Read, mcp__indexio__read_span\n---\n").unwrap();
+        let cwd = Some(tmp.path());
+        assert!(agent_lacks_indexio("reader", cwd, None));
+        assert!(!agent_lacks_indexio("full", cwd, None));
+        assert!(!agent_lacks_indexio("idx", cwd, None));
+        assert!(agent_lacks_indexio("claude-code-guide", None, None));
+        assert!(!agent_lacks_indexio("Explore", cwd, None));
     }
 
     #[test]

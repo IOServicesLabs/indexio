@@ -216,6 +216,30 @@ pub fn path_alternatives(v: &str) -> String {
     out.join("|")
 }
 
+/// One alternative of a `path:` filter against a lowercased repo-relative
+/// path: a substring, or anchored with `^` (starts with) and/or `$` (ends
+/// with) — `path:^src/a.rs$` is exactly that file, not `x/src/a.rs`.
+fn path_alternative_matches(path: &str, alt: &str) -> bool {
+    let (start, alt) = match alt.strip_prefix('^') {
+        Some(a) => (true, a),
+        None => (false, alt),
+    };
+    let (end, alt) = match alt.strip_suffix('$') {
+        Some(a) => (true, a),
+        None => (false, alt),
+    };
+    if alt.is_empty() {
+        return false;
+    }
+    let alt = alt.to_ascii_lowercase();
+    match (start, end) {
+        (true, true) => path == alt,
+        (true, false) => path.starts_with(&alt),
+        (false, true) => path.ends_with(&alt),
+        (false, false) => path.contains(&alt),
+    }
+}
+
 /// `a|(b|c)d` -> [`a`, `(b|c)d`]: split on `|` outside parentheses.
 fn split_top_level(s: &str) -> Vec<String> {
     let mut parts = vec![String::new()];
@@ -1108,7 +1132,7 @@ impl Engine {
             // `path:a.py|b.py` — any of several substrings (a grep over a
             // handful of files, SPEC-P9 §19)
             let path = dm.path.to_ascii_lowercase();
-            if !path_sub.split('|').any(|p| !p.is_empty() && path.contains(&p.to_ascii_lowercase())) {
+            if !path_sub.split('|').any(|p| path_alternative_matches(&path, p)) {
                 return false;
             }
         }
@@ -1418,9 +1442,13 @@ impl Engine {
         let mut found: Vec<(f64, Vec<(u32, u32)>)> =
             Vec::with_capacity(c.q.literals.len() + c.regexes.len());
         let mut lit_matches: Vec<Vec<(u32, u32)>> = vec![Vec::new(); c.q.literals.len()];
+        // a listing of `per_doc` lines needs that many matches at least (a
+        // line can hold several); the score still counts the first
+        // MAX_HITS_PER_DOC, so the ranking is the same at any `per_doc`
+        let cap = MAX_HITS_PER_DOC.max(per_doc.saturating_mul(4));
         for &i in c.lit_order {
             let lit = &c.q.literals[i];
-            let m = verify::find_literal(&content, &lit.text, lit.case_insensitive, MAX_HITS_PER_DOC);
+            let m = verify::find_literal(&content, &lit.text, lit.case_insensitive, cap);
             if m.is_empty() {
                 return None;
             }
@@ -1428,16 +1456,16 @@ impl Engine {
         }
         for (i, m) in lit_matches.into_iter().enumerate() {
             let df = c.lit_df[i].unwrap_or(1).max(1) as f64;
-            score += bm25(c.n, df, m.len() as f64, dm.raw_len as f64, c.avgdl);
+            score += bm25(c.n, df, m.len().min(MAX_HITS_PER_DOC) as f64, dm.raw_len as f64, c.avgdl);
             found.push((df, m));
         }
         for (j, re) in c.regexes.iter().enumerate() {
-            let m = verify::find_regex_with(&content, re, MAX_HITS_PER_DOC);
+            let m = verify::find_regex_with(&content, re, cap);
             if m.is_empty() {
                 return None;
             }
             let df = c.regex_dfs[j].max(1) as f64;
-            score += bm25(c.n, df, m.len() as f64, dm.raw_len as f64, c.avgdl);
+            score += bm25(c.n, df, m.len().min(MAX_HITS_PER_DOC) as f64, dm.raw_len as f64, c.avgdl);
             found.push((df, m));
         }
         let first_match = snippet_position(&found);
@@ -2251,6 +2279,17 @@ mod tests {
     use indexio_core::grams;
     use indexio_index::ShardWriter;
     use indexio_types::{BlobId, CallRec, DocMeta, ExtractedArtifact, SymbolKind, SymbolRec};
+
+    #[test]
+    fn path_filters_can_be_anchored() {
+        assert!(path_alternative_matches("cargo.toml", "^Cargo.toml$"));
+        assert!(!path_alternative_matches("crates/a/cargo.toml", "^Cargo.toml$"));
+        assert!(path_alternative_matches("crates/a/cargo.toml", "Cargo.toml"));
+        assert!(path_alternative_matches("src/a/b.rs", "^src/"));
+        assert!(!path_alternative_matches("x/src/a/b.rs", "^src/"));
+        assert!(path_alternative_matches("x/src/b.rs", "b.rs$"));
+        assert!(!path_alternative_matches("b.rs", "^$"));
+    }
 
     #[test]
     fn path_filter_groups_expand_to_substrings() {

@@ -410,6 +410,21 @@ enum Commands {
     },
     /// Print lines of an indexed file: REPO:PATH START[:END] (max 400 lines).
     Span { target: String, range: String },
+    /// Run one MCP tool without a server and print its answer, exactly as
+    /// the MCP tool returns it (`indexio tool read_span '{"repo":"r",
+    /// "path":"a.rs","start":1,"end":40}'`). The shell hooks rewrite a read
+    /// the index can answer into this call. Exit status 1 = the tool failed.
+    Tool {
+        /// Tool name (code_grep, read_span, file_outline, ...), or `batch`
+        /// with {"calls":[{"name":..,"args":{..}},..]}.
+        name: String,
+        /// The tool's arguments: JSON, or the same JSON base64url-encoded.
+        args: Option<String>,
+        /// The session's repo, whose hits rank first (default: the repo
+        /// holding the current directory).
+        #[arg(long)]
+        current: Option<String>,
+    },
 }
 
 /// Exactly one impact target must be selected (SPEC-P6 §3).
@@ -891,6 +906,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Usage { days, json } => {
             print_usage(&data_dir, days, json)?;
+        }
+        Commands::Tool { name, args, current } => {
+            let code = hook::run_tool(&data_dir, &name, args.as_deref(), current.as_deref());
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Commands::Hook { which, claude_dir, print_only, repo, path } => match which.as_str() {
             "freshen" => {

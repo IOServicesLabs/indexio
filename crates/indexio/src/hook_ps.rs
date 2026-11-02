@@ -12,8 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{contents_indexed, freshen_later, locate, repos, tail_range};
-use indexio_query::Engine;
+use super::{locate, serve_files, serve_search, Ctx, GrepArgs, Serve, Want};
 
 /// Split `s` at top-level occurrences of any of `seps` (outside quotes,
 /// braces, parens and brackets). PowerShell quoting: `'…'` (with `''` for a
@@ -502,136 +501,145 @@ fn var_read(command: &str, cwd: &Path) -> Option<Lookup> {
     Some(Lookup::Ranges(path, ranges))
 }
 
-/// The verdict for one PowerShell command: `Some(reason)` = deny.
-pub fn verdict(data_dir: &Path, cwd: &Path, command: &str) -> Option<String> {
+/// `Select-Object -First/-Last/-Skip/-Index` and nothing else.
+fn is_selector(w: &[String]) -> bool {
+    w.first().is_some_and(|c| cmd_is(c, &["Select-Object", "select"])) && {
+        let a = parse_args(&w[1..], &["First", "Last", "Skip", "Index"]);
+        a.switches.is_empty() && a.positional.is_empty() && !a.named.is_empty()
+    }
+}
+
+/// How a lookup statement's later stages relate to its answer:
+/// `Some(None)` = folded into the lookup (or there are none),
+/// `Some(Some(text))` = stages to keep after the answer (`| Select-Object
+/// -Last 6` on a search), `None` = they reshape it (`ForEach-Object`,
+/// `Where-Object`, a filtered folder listing): the shell's.
+fn stmt_tail(stmt: &str) -> Option<Option<String>> {
+    if stmt.starts_with('(') {
+        return Some(None);
+    }
+    let stages = split_top(stmt, &['|']);
+    let words: Vec<Vec<String>> = stages.iter().map(|s| ps_words(s)).collect();
+    let head = words.first()?.first()?;
+    let search_at = if cmd_is(head, SELECT_STRING) {
+        Some(0)
+    } else if words.get(1).and_then(|w| w.first()).is_some_and(|c| cmd_is(c, SELECT_STRING)) {
+        if cmd_is(head, GET_CHILD) {
+            let a = parse_args(&words[0][1..], &["Path", "LiteralPath", "Include", "Filter", "Exclude", "Depth"]);
+            if a.get(&["Include", "Filter", "Exclude", "Depth"]).is_some() {
+                return None;
+            }
+        }
+        Some(1)
+    } else {
+        None
+    };
+    match search_at {
+        Some(k) => {
+            let first_last = |w: &Vec<String>| {
+                is_selector(w) && parse_args(&w[1..], &["First", "Last", "Skip", "Index"]).get(&["Skip", "Index"]).is_none()
+            };
+            if !words[k + 1..].iter().all(first_last) {
+                return None;
+            }
+            // the answer adds a `repo:path` line per file and a count line:
+            // `-First/-Last n` becomes 2n+1, which never drops a match the
+            // typed cut would show
+            let mut after = Vec::new();
+            for w in &words[k + 1..] {
+                let a = parse_args(&w[1..], &["First", "Last"]);
+                let mut stage = "Select-Object".to_string();
+                for p in ["First", "Last"] {
+                    if let Some(v) = a.get(&[p]) {
+                        let n: u64 = v.parse().ok()?;
+                        stage.push_str(&format!(" -{p} {}", 2 * n + 1));
+                    }
+                }
+                after.push(stage);
+            }
+            Some((!after.is_empty()).then(|| after.join(" | ")))
+        }
+        None => words[1..].iter().all(|w| is_selector(w)).then_some(None),
+    }
+}
+
+/// The index's answer to one lookup, or `None` (the shell's).
+fn serve_lookup(ctx: &mut Ctx, l: Lookup) -> Option<Serve> {
+    match l {
+        Lookup::Read(abs, range, tail) => {
+            let want = match (range, tail) {
+                (Some((s, e)), _) => Want::Range(s, e),
+                (None, Some(n)) => Want::Tail(n),
+                _ => Want::Whole,
+            };
+            serve_files(ctx, &[abs], &[want])
+        }
+        Lookup::Ranges(abs, ranges) => {
+            let wants: Vec<Want> = ranges.into_iter().map(|(s, e)| Want::Range(s, e)).collect();
+            serve_files(ctx, &[abs], &wants)
+        }
+        Lookup::Search { paths, pattern, simple, case_sensitive, after } => {
+            // context lines, and a wildcard (its extension filter), are the shell's
+            if after.is_some_and(|n| n > 0) || paths.iter().any(|p| p.to_string_lossy().contains(['*', '?'])) {
+                return None;
+            }
+            // Select-String: .NET regex, case-insensitive unless -CaseSensitive
+            let g = GrepArgs { pattern, ere: true, fixed: simple, icase: !case_sensitive, ..Default::default() };
+            serve_search(ctx, &paths, &g, None)
+        }
+    }
+}
+
+/// `s` in single quotes for PowerShell.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The command to run instead of `command` when the index answers a read
+/// in it (SPEC-P11): each answered statement becomes an `indexio tool`
+/// call, with the statement itself as the fallback. `None` = as typed.
+pub fn rewrite(data_dir: &Path, cwd: &Path, command: &str, exe: &Path) -> Option<String> {
     if command.contains("INDEXIO_RAW") || command.contains("# raw") {
         return None;
     }
+    let mut ctx = Ctx::new(data_dir);
+    if ctx.repos.is_empty() {
+        return None;
+    }
+    let current = locate(&ctx.repos, cwd).map(|(r, _)| r);
+    let exe = ps_quote(&exe.to_string_lossy().replace('\\', "/"));
+    let dd = ps_quote(&data_dir.to_string_lossy().replace('\\', "/"));
+    // a missing binary leaves the code at 1, so the fallback runs
+    let call = |s: &Serve, keep: Option<&str>| {
+        let (name, b64) = s.payload(current.as_deref());
+        let keep = keep.map(|k| format!(" | {k}")).unwrap_or_default();
+        format!("$global:LASTEXITCODE = 1; & {exe} --data-dir {dd} tool {name} {b64}{keep}")
+    };
     if let Some(l) = var_read(command, cwd) {
-        return judge_lookup(data_dir, cwd, l);
+        let s = serve_lookup(&mut ctx, l)?;
+        return Some(format!("{}; if ($LASTEXITCODE -ne 0) {{ {command} }}", call(&s, None)));
     }
     let mut here = cwd.to_path_buf();
     let mut vars: Vec<(String, String)> = Vec::new();
-    let mut lookups = Vec::new();
+    let mut out = Vec::new();
+    let mut any = false;
     for stmt in split_top(command, &[';', '\n', '\r']) {
         match statement(&stmt, &mut here, &mut vars) {
-            Ok(Some(l)) => lookups.push(l),
-            Ok(None) => {}
             Err(()) => return None, // the shell is needed anyway
+            Ok(None) => out.push(stmt),
+            Ok(Some(l)) => {
+                let served = stmt_tail(&stmt).and_then(|keep| Some((serve_lookup(&mut ctx, l)?, keep)));
+                match served {
+                    Some((s, keep)) => {
+                        any = true;
+                        out.push(format!("{}; if ($LASTEXITCODE -ne 0) {{ {stmt} }}", call(&s, keep.as_deref())));
+                    }
+                    None => out.push(stmt),
+                }
+            }
         }
     }
-    let more = lookups.len() > 1;
-    let first = lookups.into_iter().next()?;
-    let reason = judge_lookup(data_dir, cwd, first)?;
-    Some(if more { format!("{reason} The rest of this call is fine to run on its own.") } else { reason })
-}
-
-fn judge_lookup(data_dir: &Path, cwd: &Path, first: Lookup) -> Option<String> {
-    let repos = repos(data_dir);
-    if repos.is_empty() {
-        return None;
-    }
-    let own = locate(&repos, cwd).map(|(r, _)| r);
-    let engine = Engine::open(data_dir).ok()?;
-    match first {
-        Lookup::Read(abs, range, tail) => {
-            // a wildcard path that resolves to nothing, a folder: not ours
-            if !abs.is_file() {
-                return None;
-            }
-            let (repo, rel) = locate(&repos, &abs)?;
-            let rel = super::indexed_rel(&engine, &repo, &rel, &abs)?;
-            if range.is_none() && tail.is_none() && super::is_small_file(&engine, &repo, &rel) {
-                return None; // a short file read whole
-            }
-            let range = range.or_else(|| tail_range(&engine, &repo, &rel, tail?));
-            // a few lines are cheaper read than denied (as for Read)
-            if range.is_some_and(|(s, e)| e.saturating_sub(s) < super::SMALL_READ_LINES) {
-                return None;
-            }
-            freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
-            let name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
-            Some(match range {
-                Some((s, e)) => format!(
-                    "{name} is indexed: use mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{s}, end:{e}}} instead (numbered, fresh)"
-                ),
-                None => format!(
-                    "{name} is indexed: use mcp__indexio__file_outline {{repo:\"{repo}\", path:\"{rel}\"}} then read_span for the lines you need (numbered, fresh)"
-                ),
-            })
-        }
-        Lookup::Ranges(abs, ranges) => {
-            if !abs.is_file() {
-                return None;
-            }
-            let (repo, rel) = locate(&repos, &abs)?;
-            let rel = super::indexed_rel(&engine, &repo, &rel, &abs)?;
-            let last = tail_range(&engine, &repo, &rel, 1).map_or(TO_END, |(_, e)| e);
-            let ranges: Vec<(u64, u64)> = ranges.into_iter().map(|(s, e)| (s, e.min(last))).filter(|(s, e)| s <= e).collect();
-            if ranges.iter().map(|(s, e)| e - s + 1).sum::<u64>() <= super::SMALL_READ_LINES {
-                return None;
-            }
-            freshen_later(data_dir, own.as_deref(), &repo, Some(&rel));
-            let name = abs.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
-            let calls: Vec<String> = ranges
-                .iter()
-                .map(|(s, e)| format!("mcp__indexio__read_span {{repo:\"{repo}\", path:\"{rel}\", start:{s}, end:{e}}}"))
-                .collect();
-            Some(format!("{name} is indexed: use {} instead (numbered, fresh)", calls.join(" + ")))
-        }
-        Lookup::Search { paths, pattern, simple, case_sensitive, after } => {
-            let mut targets: Vec<(String, String)> = Vec::new();
-            for p in &paths {
-                if p.to_string_lossy().contains(['*', '?']) {
-                    // `src\*.rs`: the folder, if it is indexed
-                    let dir = p.parent()?;
-                    let (repo, rel) = locate(&repos, dir)?;
-                    targets.push((repo, rel));
-                    continue;
-                }
-                let (repo, rel) = locate(&repos, p)?;
-                if p.is_file() && !contents_indexed(&engine, &repo, &rel) {
-                    return None;
-                }
-                if !p.exists() {
-                    return None;
-                }
-                targets.push((repo, rel));
-            }
-            if targets.is_empty() {
-                return None;
-            }
-            let mut names: Vec<&str> = targets.iter().map(|(r, _)| r.as_str()).collect();
-            names.sort();
-            names.dedup();
-            let repo_filter = if names.len() == 1 { format!(" repo:{}", names[0]) } else { String::new() };
-            let mut rels: Vec<&str> = targets.iter().map(|(_, r)| r.as_str()).filter(|r| !r.is_empty()).collect();
-            rels.sort();
-            rels.dedup();
-            let path_filter =
-                if rels.is_empty() || rels.len() < targets.len() { String::new() } else { format!(" path:{}", rels.join("|")) };
-            for repo in names {
-                freshen_later(data_dir, own.as_deref(), repo, None);
-            }
-            // Select-String ignores case unless -CaseSensitive; code_grep is
-            // smart-case, so only a pattern with capitals needs the flag
-            let ci = !case_sensitive && pattern.chars().any(|c| c.is_uppercase());
-            let call = if simple {
-                format!("mcp__indexio__code_search {{query:\"{}\"{repo_filter}{path_filter}, lines:20}}", pattern.replace('"', "\\\""))
-            } else {
-                format!(
-                    "mcp__indexio__code_grep {{pattern:\"{}{}{repo_filter}{path_filter}\"}}",
-                    if ci { "(?i)" } else { "" },
-                    pattern.replace('"', "\\\"")
-                )
-            };
-            let ctx = match after {
-                Some(n) if n > 0 => format!(", then read_span {{repo, path, start:line, end:line+{n}}} for context"),
-                _ => String::new(),
-            };
-            Some(format!("Indexed files: use {call} instead (every matching line per file, ranked, current with your edits{ctx})"))
-        }
-    }
+    any.then(|| out.join("\n"))
 }
 
 #[cfg(test)]

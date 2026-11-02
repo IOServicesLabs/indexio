@@ -905,27 +905,10 @@ impl McpServer {
     /// when the call has a mechanical built-in equivalent, what that would
     /// have returned (SPEC-P10 §22; `indexio usage`, `index_stats`).
     fn log_usage(&self, tool: &str, ms: u64, bytes: usize, builtin: Option<u64>, ok: bool) {
-        // benchmarks and sweeps set INDEXIO_NO_USAGE so the stats stay real traffic
-        if std::env::var_os("INDEXIO_NO_USAGE").is_some() {
-            return;
-        }
-        let Some(dir) = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.join("usage")) else {
+        let Some(data_dir) = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.to_path_buf()) else {
             return;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let day = indexio_ingest::unix_to_iso_date(now);
-        let line = json!({
-            "ts": now, "pid": std::process::id(), "repo": self.current(),
-            "tool": tool, "ms": ms, "bytes": bytes, "builtin": builtin, "ok": ok,
-        });
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.jsonl"))) {
-            use std::io::Write as _;
-            let _ = writeln!(f, "{line}");
-        }
+        log_usage_line(&data_dir, self.current().as_deref(), tool, ms, bytes, builtin, ok, None);
     }
 
     /// Take over the pre-warmed sidecars if the background open finished.
@@ -2089,6 +2072,76 @@ fn stats_text(engine: &Engine) -> String {
         }
     }
     mcp_text::stats(&stats, &detail)
+}
+
+/// One usage line (see [`McpServer::log_usage`]); `via` marks a call that
+/// did not come over MCP (`"shell"`: a read the shell hooks served through
+/// `indexio tool`), which `indexio usage` does not count as a session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_usage_line(
+    data_dir: &std::path::Path,
+    repo: Option<&str>,
+    tool: &str,
+    ms: u64,
+    bytes: usize,
+    builtin: Option<u64>,
+    ok: bool,
+    via: Option<&str>,
+) {
+    // benchmarks and sweeps set INDEXIO_NO_USAGE so the stats stay real traffic
+    if std::env::var_os("INDEXIO_NO_USAGE").is_some() {
+        return;
+    }
+    let dir = data_dir.join("usage");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day = indexio_ingest::unix_to_iso_date(now);
+    let mut line = json!({
+        "ts": now, "pid": std::process::id(), "repo": repo,
+        "tool": tool, "ms": ms, "bytes": bytes, "builtin": builtin, "ok": ok,
+    });
+    if let Some(v) = via {
+        line["via"] = json!(v);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.jsonl"))) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// One tool call outside a server (`indexio tool`): the text the MCP tool
+/// would return, or its error message. The shell hooks rewrite a read the
+/// index can answer into this call, so the answer does not depend on the
+/// session's MCP connection — a server that dropped, a subagent whose
+/// indexio tools are deferred, an agent type without them all get it.
+pub fn call_once(data_dir: &std::path::Path, name: &str, args: &Value, current: Option<&str>) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let engine = Engine::open(data_dir).map_err(|e| format!("opening index at {}: {e}", data_dir.display()))?;
+    // the lexical tools never embed: skip loading the model
+    let semantic = matches!(name, "semantic_search" | "recall")
+        || args.get("mode").and_then(Value::as_str).is_some_and(|m| !m.eq_ignore_ascii_case("lexical"));
+    let embedder: Arc<dyn Embedder> = if semantic {
+        crate::select_embedder_or_fallback(data_dir)
+    } else {
+        Arc::new(indexio_embed::embed::HashEmbedder::new(512))
+    };
+    let reranker = crate::select_reranker_or_fallback();
+    let read_seen: ReadSeen = Mutex::new(HashMap::new());
+    let mut baseline = None;
+    let out = call_tool(&engine, embedder.as_ref(), reranker.as_ref(), name, args, OutputFormat::Text, current, &read_seen, &mut baseline)
+        .map(|v| {
+            v["content"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default()
+        })
+        .map_err(|(_, m)| m);
+    let bytes = out.as_ref().map_or(0, String::len);
+    log_usage_line(data_dir, current, name, t0.elapsed().as_millis() as u64, bytes, baseline, out.is_ok(), Some("shell"));
+    out
 }
 
 /// `baseline` receives the size of the harness's own tool's output for

@@ -143,7 +143,10 @@ pub fn aggregate(data_dir: &Path, days: u64) -> Report {
             let bytes = v["bytes"].as_u64().unwrap_or(0);
             let ok = v["ok"].as_bool().unwrap_or(true);
             let builtin = v["builtin"].as_u64();
-            sessions.insert(v["pid"].as_u64().unwrap_or(0));
+            // a shell-served call runs in its own short process: not a session
+            if v.get("via").is_none() {
+                sessions.insert(v["pid"].as_u64().unwrap_or(0));
+            }
             r.by_tool.entry(tool).or_default().add(ok, bytes, builtin, ms);
             r.by_repo.entry(repo).or_default().add(ok, bytes, builtin, ms);
             r.total.add(ok, bytes, builtin, ms);

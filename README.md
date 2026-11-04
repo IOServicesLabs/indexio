@@ -24,10 +24,11 @@ Install indexio (https://github.com/IOServicesLabs/indexio) on this machine and 
 to me. Do these steps in order and stop at the first failure with the exact error.
 
 1. Install the binary.
-   - Linux or macOS:  curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh | sh
+   - Linux:  curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh | sh
    - Windows (PowerShell):  irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 | iex
-   - If neither works, use `pip install indexio-cli`, `npm install -g indexio`, or `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
-   The binary lands in ~/.local/bin (Linux, macOS) or %LOCALAPPDATA%\Programs\indexio (Windows).
+   - macOS (no prebuilt binary):  cargo install --git https://github.com/IOServicesLabs/indexio indexio
+   - If the script fails, use `pip install indexio-cli`, `npm install -g indexio`, or the `cargo install` above.
+   The binary lands in ~/.local/bin (Linux), %LOCALAPPDATA%\Programs\indexio (Windows) or ~/.cargo/bin (cargo).
    If `indexio --version` is not found afterwards, add that folder to PATH and open a new shell.
    `git` must be on PATH.
 
@@ -64,13 +65,13 @@ Pick one. Each one gives you the `indexio` command.
 
 | Platform | Command |
 |---|---|
-| Linux, macOS | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
+| Linux | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
 | Windows (PowerShell) | `irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 \| iex` |
-| npm (any platform) | `npm install -g indexio` |
-| pip (any platform) | `pip install indexio-cli` |
+| npm (Linux, Windows) | `npm install -g indexio` |
+| pip (Linux, Windows) | `pip install indexio-cli` |
 | Docker | `docker pull ghcr.io/ioserviceslabs/indexio` |
 | Homebrew, winget | not yet; use a script or a package above |
-| From source (Rust 1.85+) | `cargo install --git https://github.com/IOServicesLabs/indexio indexio` |
+| From source (Rust 1.85+; the way to install on macOS) | `cargo install --git https://github.com/IOServicesLabs/indexio indexio` |
 
 The scripts and the npm package download the binary of the latest
 [release](https://github.com/IOServicesLabs/indexio/releases) for your OS and CPU and
@@ -87,7 +88,7 @@ index again.
 
 | Installed with | Upgrade command |
 |---|---|
-| Script, Linux or macOS | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
+| Script, Linux | `curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh \| sh` |
 | Script, Windows | `irm https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.ps1 \| iex` |
 | npm | `npm install -g indexio@latest` |
 | pip | `pip install -U indexio-cli` |
@@ -424,7 +425,7 @@ to the name to act as.
 
 ### What is enforced server-side
 
-- Credential paths (`Lang::is_secret_path`) are never accepted into an
+- Credential paths are never accepted into an
   overlay, and neither are patches over 32 MiB.
 - ACL `allow` patterns filter what each user reads — on the documents
   themselves for MCP (rendered text cannot be un-shown), as hit-filtering
@@ -456,7 +457,7 @@ to the name to act as.
 - `impact_of_diff` without a `diff` maps the developer's synced worktree
   against its merge-base.
 
-### Limits
+### Team limits
 
 - Overlays are lexical planes. Vector search ranks the base content; edits
   to tracked files surface through every tool, while brand-new untracked
@@ -623,7 +624,7 @@ Do one of these:
 - Run `indexio setup claude`. It runs `claude mcp add` for this binary and data directory,
   and it prints the guidance block for your `CLAUDE.md`. Add `--claude-md ~/.claude/CLAUDE.md`
   to append the block.
-- Run `claude mcp add indexio -- /usr/local/bin/indexio mcp --data-dir /var/lib/ciindex`.
+- Run `claude mcp add indexio -- /usr/local/bin/indexio mcp --data-dir /var/lib/indexio`.
 - Commit a `.mcp.json` to the project:
 
   ```json
@@ -631,7 +632,7 @@ Do one of these:
     "mcpServers": {
       "indexio": {
         "command": "/usr/local/bin/indexio",
-        "args": ["mcp", "--data-dir", "/var/lib/ciindex"]
+        "args": ["mcp", "--data-dir", "/var/lib/indexio"]
       }
     }
   }
@@ -649,7 +650,7 @@ This writes five Claude Code hooks into `~/.claude/settings.json`:
 |---|---|
 | PreToolUse, Bash | A shell read or search of an indexed file (`cat`, `sed -n`, `head`, `tail`, `grep`, `rg`, `find -name`) that the index can answer exactly is answered from the index in place: the hook rewrites that part of the command to `indexio tool …` (fresh, numbered lines, an outline for a long file), with the typed command as the fallback if the call fails. Reads of 60 lines or less, filters the index cannot reproduce (`grep -v`, `-c`, `-B`, `--include`, a `sed` transform, a filter after the read) and commands that also do other work run as typed. Nothing is refused, so a session without the indexio tools (MCP server down, a subagent without them) is never stuck. With rtk installed, `hook install` runs rtk's Bash hook from inside this one (`--then 'rtk hook claude'`), so a call gets one rewrite: indexio's when the index answers, rtk's otherwise. |
 | PreToolUse, Read | A whole-file Read of an indexed file over 60 lines is refused. The refusal names `file_outline` and `read_span` (and, in a subagent, the `sed -n` that is answered from the index). A Read of an agent worktree's copy that is identical to the indexed file counts as a read of that file. When the caller cannot call indexio (its transcript shows `No such tool available: mcp__indexio__…`, or it is an agent type whose `tools:` exclude indexio), the Read goes through. |
-| PreToolUse, PowerShell | The same rule for `Get-Content`, `Select-String` and `Get-ChildItem \| Select-String` reads and searches, including `$c = Get-Content f` followed by line ranges, and a trailing `Select-Object -First/-Last N`. |
+| PreToolUse, PowerShell | The same in-place answers as the Bash hook, for `Get-Content`, `Select-String` and `Get-ChildItem \| Select-String` reads and searches, including `$c = Get-Content f` followed by line ranges, and a trailing `Select-Object -First/-Last N`. |
 | PreCompact | Session transcripts and Claude Code memory notes (`~/.claude/projects/*/memory/`) are imported for the `recall` tool. |
 | SessionStart | A new session gets one line about the previous session in the same project: its title, dates, files changed, commits and the `recall` call for its card (70–115 tokens). After a compaction, the session gets its own changed files and commits back (75–300 tokens). A resumed session gets nothing. |
 
@@ -658,8 +659,7 @@ The Bash hook also routes scripts and builds (`python`, `node`, `npm`, `pytest`,
 lines, the error lines and the last lines are returned with a `runs:<repo>/<log>` pointer,
 and the full output stays searchable for 30 days.
 
-To run a refused command as typed, add `# raw` to it and send it again, or set
-`INDEXIO_RAW=1`.
+To keep a shell command from being rewritten, add `# raw` to it or set `INDEXIO_RAW=1`.
 
 ### The tools
 
@@ -1121,7 +1121,7 @@ Data layout:
 ## Measured performance
 
 Storage and start-up, measured on the author's machine on a 44-repository, 10,000-file
-data directory (`docs/SPEC-P10.md`):
+data directory:
 
 | Metric | Before | After |
 |---|---|---|
@@ -1188,7 +1188,7 @@ prescan gave no speed-up. These stay off by default.
 ## Development and releases
 
 ```
-cargo test --workspace                  # every crate, 325 tests
+cargo test --workspace                  # every crate
 cargo clippy --workspace --all-targets
 tools/build-release.sh                  # release build; remaps local paths out of the binary
 ```
@@ -1197,8 +1197,8 @@ Crates: `indexio-types` (shared types, posting codec), `indexio-core` (n-grams, 
 query literals), `indexio-index` (shards, merge, tombstones), `indexio-symbols` (tree-sitter
 symbols, calls and chunks for 6 languages), `indexio-ingest` (git delta, content store,
 sources), `indexio-embed` (embedders, embedding store, vector index, pipeline),
-`indexio-query` (planner, ranking, fusion, impact), `indexio` (CLI, HTTP, MCP, hooks). The
-design notes are in `docs/`; `docs/DEVELOPMENT.md` is the operator manual.
+`indexio-query` (planner, ranking, fusion, impact), `indexio` (CLI, HTTP, MCP, hooks). 
+`docs/DEVELOPMENT.md` is the operator manual.
 
 CI (`.github/workflows/ci.yml`) runs on each push and pull request. It checks that the
 manifests parse, the scripts compile and the workflows are valid. It is killed after 90
@@ -1209,8 +1209,8 @@ Releases (`.github/workflows/release.yml`) come from `main`:
 1. Set `version` in `Cargo.toml` (`[workspace.package]`).
 2. Merge to `main`. In less than 90 seconds the workflow creates the tag `v<version>` and a
    GitHub release with generated notes. A merge without a version change does nothing.
-3. The same workflow then builds the binaries for Linux (x86_64, aarch64), macOS (Apple
-   silicon, Intel) and Windows (x86_64), attaches each archive with a `.sha256` and a pip
+3. The same workflow then builds the binaries for Linux (x86_64, aarch64) and Windows
+   (x86_64), attaches each archive with a `.sha256` and a pip
    wheel to the release, publishes the container image to `ghcr.io`, publishes the npm
    package when the `NPM_TOKEN` secret exists, and publishes the `indexio-cli` wheels to
    PyPI when the `PYPI_API_TOKEN` secret exists. These jobs compile Rust and take some

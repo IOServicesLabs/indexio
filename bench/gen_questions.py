@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Known-answer questions for the user's OWN repos, written by an LLM
-(SPEC-P10 §14): sample code windows from the registered repos, ask the model
+sample code windows from the registered repos, ask the model
 for the natural-language question a developer would type to find that code
 (no identifiers copied verbatim), and save `{q, repo, path_suffix}` rows that
 `eval_modes.py` scores as MRR / recall@k per search mode.

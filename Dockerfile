@@ -7,7 +7,7 @@
 # The data dir is /data (a volume); repos to index are mounted wherever you
 # like and added by path. The default command serves the HTTP API on all
 # container interfaces, which the CLI only permits with an auth token or an
-# ACL file — set INDEXIO_AUTH_TOKEN. See README "Deploying with Docker".
+# ACL file — set INDEXIO_AUTH_TOKEN. See README "Deploy with Docker".
 
 FROM rust:1-bookworm AS build
 WORKDIR /src

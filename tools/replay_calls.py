@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay a project's real indexio tool calls against the installed server
 and compare result sizes: what a session on an old server would get from a
-restart (SPEC-P10 §16).
+restart.
 
     python tools/replay_calls.py --project C--Users-me-code-my-service --since 2026-09-16T12:00
 """

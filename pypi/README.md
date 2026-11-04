@@ -21,8 +21,8 @@ that cuts what the tools return by 50 to 90 percent against the built-in Read, G
 Glob, and a lookup takes single-digit milliseconds instead of tens.
 
 The wheel bundles the `indexio` binary for your platform, so nothing is downloaded at
-install time and no Rust toolchain is needed. Wheels are published for Linux and macOS
-(x86_64, arm64) and Windows (x86_64). `git` must be on the PATH. The package is called
+install time and no Rust toolchain is needed. Wheels are published for Linux
+(x86_64, arm64) and Windows (x86_64). On macOS, build from source. `git` must be on the PATH. The package is called
 `indexio-cli` because `indexio` on PyPI belongs to an unrelated project; the command it
 installs is `indexio`.
 

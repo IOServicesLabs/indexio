@@ -22,7 +22,7 @@ Glob, and a lookup takes single-digit milliseconds instead of tens.
 
 This package downloads the prebuilt binary for your platform from the matching GitHub
 release at install time and verifies its SHA-256. Nothing is sent anywhere: the index is a
-set of files in `~/.indexio`. Supported: Linux and macOS (x86_64, arm64), Windows (x86_64).
+set of files in `~/.indexio`. Supported: Linux (x86_64, arm64), Windows (x86_64). On macOS, build from source.
 `git` must be on the PATH.
 
 If the download is blocked, install the binary another way and the shim will use it:

@@ -4,9 +4,9 @@ How to build, test and benchmark indexio, how to plug in real embedding and rera
 models, and where to continue development. Read `README.md` for the user guide; this
 document is the operator manual.
 
-## 0. What you have
+## 0. Overview
 
-A single Cargo workspace, 8 crates, about 30k lines of Rust, 303 tests, no external runtime
+A single Cargo workspace, 8 crates, about 30k lines of Rust, no external runtime
 services. Everything lives in one binary (`indexio`) + one data directory.
 
 | Crate | Owns | Key files |
@@ -20,12 +20,6 @@ services. Everything lives in one binary (`indexio`) + one data directory.
 | `indexio-query` | Query parser, planner, BM25-lite ranking, RRF hybrid fusion + rerank stage | `src/lib.rs` |
 | `indexio` | CLI (clap), HTTP (axum), MCP (stdio JSON-RPC) | `src/main.rs`, `src/serve.rs`, `src/mcp.rs` |
 
-Design contracts: `SPEC.md` (P0/P1), `SPEC-P2.md` (semantic plane + org-sync), `SPEC-P3.md`
-(evaluation), `SPEC-P6.md` (impact analysis + perf), `SPEC-P7.md` (sources / onboarding),
-`SPEC-P8.md` (harness integration), `SPEC-P9.md` and `SPEC-P10.md` (the agent-facing tools,
-hooks and their measurements), `SPEC-P11.md` (central index design). The `research-p5/`
-folder holds the lexical and vector-index studies.
-
 ## 1. Local setup
 
 ```bash
@@ -36,12 +30,12 @@ rustup default stable          # built/tested on 1.98; any recent stable works
 # build + full test suite (first build ~5–10 min; tests ~2–5 min)
 cd indexio
 cargo build --release
-cargo test --workspace         # expect: 236 passed, 0 failed
+cargo test --workspace         # expect: 0 failed
 ```
 
 You do **not** need: Docker, Postgres, Qdrant, any model weights, or any network service
 for the core system. The default offline embedder/reranker let the whole pipeline run
-air-gapped; real models are external HTTP endpoints you add later (§4).
+air-gapped; real models are external HTTP endpoints you add later (section 4).
 
 ## 2. Smoke-test checklist (10 minutes)
 
@@ -53,66 +47,65 @@ scratch dir and committed to; the others are only read):
 tools/functest.sh ~/src/some-small-repo ~/src/another-repo     # expect: ALL PASS
 ```
 
-
 ```bash
-CI=target/release/indexio
+INDEXIO=target/release/indexio
 export INDEXIO_DATA_DIR=$HOME/.indexio
 
 # 2.1 index a real repo (uses your local clones)
 git clone --depth 1 https://github.com/BurntSushi/ripgrep /tmp/ripgrep
-$CI index /tmp/ripgrep --name ripgrep
+$INDEXIO index /tmp/ripgrep --name ripgrep
 
 # 2.2 lexical queries — expect ms latencies printed per query
-$CI search "WalkState" --json | head -30
-$CI search "/fn\s+parse_/" --limit 5
-$CI search 'error lang:rust' --limit 5
+$INDEXIO search "WalkState" --json | head -30
+$INDEXIO search "/fn\s+parse_/" --limit 5
+$INDEXIO search 'error lang:rust' --limit 5
 
 # 2.3 symbols + call graph
-$CI symbol Searcher
-$CI calls "Printer::write"
+$INDEXIO symbol Searcher
+$INDEXIO calls "Printer::write"
 
 # 2.4 delta re-index — make a commit, re-run, expect ~1 doc changed in <1s
 cd /tmp/ripgrep && git checkout -b test && echo "// hi" >> crates/core/main.rs \
   && git commit -aqm test && cd -
-$CI reindex ripgrep
+$INDEXIO reindex --repo ripgrep
 
 # 2.5 semantic plane (Random Indexing — CPU-only, in-process, no downloads)
-$CI embed --all                 # builds + trains rindex-v1 model from YOUR corpus
-$CI embcas-stats
-$CI search "how does the printer buffer output" --mode semantic --limit 5
-$CI search "how does the printer buffer output" --mode hybrid --rerank --limit 5
+$INDEXIO embed --all                 # builds + trains the rindex-v2 model from YOUR corpus
+$INDEXIO embcas-stats
+$INDEXIO search "how does the printer buffer output" --mode semantic --limit 5
+$INDEXIO search "how does the printer buffer output" --mode hybrid --rerank --limit 5
 
 # 2.6 HTTP + auth
-$CI serve --port 7717 &
+$INDEXIO serve --port 7717 &
 curl 'http://127.0.0.1:7717/search?q=printer&mode=hybrid&limit=3'
 kill %1
 
-# 2.7 impact analysis (SPEC-P6) — what does a change touch?
-$CI outline ripgrep:crates/core/flags/parse.rs         # skeleton with line ranges
-$CI span ripgrep:crates/core/flags/parse.rs 1:40       # exact lines from the index
-$CI impact --symbol parse --depth 2                    # transitive callers, all repos
-$CI impact --diff ripgrep                              # the uncommitted edit from 2.4
+# 2.7 impact analysis — what does a change touch?
+$INDEXIO outline ripgrep:crates/core/flags/parse.rs         # skeleton with line ranges
+$INDEXIO span ripgrep:crates/core/flags/parse.rs 1:40       # exact lines from the index
+$INDEXIO impact --symbol parse --depth 2                    # transitive callers, all repos
+$INDEXIO impact --diff ripgrep                              # the uncommitted edit from 2.4
 
 # 2.8 MCP handshake (what Claude Code will do)
 printf '%s\n%s\n' \
  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' \
- '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | $CI mcp | python3 -m json.tool | grep '"name"'
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | $INDEXIO mcp | python3 -m json.tool | grep '"name"'
 ```
 
 If 2.1–2.8 all behave, your build is healthy. Expected index size: ~1–3× the source size
 (shard + CAS on disk); queries in the single/double-digit ms range on a laptop.
 
-## 3. Pulling real code: sources (SPEC-P7)
+## 3. Pulling real code: sources
 
 ```bash
-$CI add ~/code                            # all git repos under it, any depth; plain folders too
+$INDEXIO add ~/code                            # all git repos under it, any depth; plain folders too
 export GITHUB_TOKEN=ghp_...               # read scope is enough; public repos need none
-$CI add github:YOUR_ORG --limit 10        # trial: 10 repos first
-$CI add github:YOUR_ORG                   # then the whole org (or a user, or OWNER/REPO)
+$INDEXIO add github:YOUR_ORG --limit 10        # trial: 10 repos first
+$INDEXIO add github:YOUR_ORG                   # then the whole org (or a user, or OWNER/REPO)
 export AZDO_TOKEN=...                     # Azure DevOps PAT with Code: Read
-$CI add azdo:YOUR_ORG/YOUR_PROJECT        # every repo of the project
-$CI sources                               # what is remembered + every registered repo
-$CI sync                                  # freshness loop: cron/systemd timer every 15 min
+$INDEXIO add azdo:YOUR_ORG/YOUR_PROJECT        # every repo of the project
+$INDEXIO sources                               # what is remembered + every registered repo
+$INDEXIO sync                                  # freshness loop: cron/systemd timer every 15 min
 ```
 
 `indexio sync` is incremental end to end: clones are ff-pulled, new repos discovered, git deltas
@@ -127,14 +120,14 @@ indexing a fork; 76% of chunk embeddings deduped across 4 repos).
 ## 4. Semantic plane: standalone first, neural optional
 
 **Default (no setup): Random Indexing.** `indexio embed --all` builds a corpus-native semantic
-model in-process on CPU (`<data-dir>/sem/rindex-v1.rimodel`) — single streaming pass,
+model in-process on CPU (`<data-dir>/sem/rindex-v2.rimodel`) — single streaming pass,
 incremental per chunk thereafter, no GPU/sidecar/downloads. It learns your org's own
 vocabulary. Evaluate it on your corpus with the bench harness:
 
 ```bash
 python3 bench/eval_modes.py --ci target/release/indexio --data-dir $INDEXIO_DATA_DIR \
   --answers bench/known_answers20.json --modes lexical,semantic,hybrid --limit 10
-# our ripgrep+serde reference numbers (P5): lexical MRR 0.050 / semantic 0.293 /
+# our ripgrep+serde reference numbers: lexical MRR 0.050 / semantic 0.293 /
 # hybrid MRR 0.397, R@5 60% (20 queries: 16 hard + 4 medium)
 ```
 
@@ -145,9 +138,8 @@ hub cut, header×2.5, thesaurus query expansion). Model namespaces (`rindex-v2`,
 `indexio embed --all --rebuild-model` to purge deleted-doc drift from the RI model.
 
 Hybrid fusion is 3-leg RRF (file-lexical + chunk-BM25F + semantic); `--fusion combmnz`
-exists for experiments (measured worse: 0.34 vs 0.397 MRR). Do NOT use `--rerank` without
-a real `INDEXIO_RERANK_BASE` endpoint — the offline overlap reranker measurably hurts
-(0.195 MRR vs 0.397).
+exists for experiments (measured worse: 0.34 vs 0.397 MRR). `--rerank` needs a real
+`INDEXIO_RERANK_BASE` endpoint; without one it leaves the fused order as it is.
 
 **Optional upgrade: neural endpoint.** The engine never runs neural inference in-process —
 it calls OpenAI-compatible endpoints. One GPU box (or a CPU box with the 0.6B variants)
@@ -172,8 +164,8 @@ export INDEXIO_EMBED_BASE=http://localhost:8080     # base URL; /v1/embeddings i
 export INDEXIO_EMBED_MODEL=Qwen/Qwen3-Embedding-8B
 export INDEXIO_EMBED_DIM=1024                       # 1024 for 8B, 1024 for 0.6B (check config)
 # export INDEXIO_EMBED_KEY=...                      # only if your gateway requires it
-$CI embed --all                                # builds vec/<model-id>.civec + .cihnsw at ≥50k chunks
-$CI search "refresh expired oauth tokens" --mode hybrid --limit 10
+$INDEXIO embed --all                                # builds vec/<model-id>.civec (+ .cihnsw above INDEXIO_HNSW_THRESHOLD)
+$INDEXIO search "refresh expired oauth tokens" --mode hybrid --limit 10
 ```
 
 Model namespaces are keyed by `model-id`, so the old `hash-v1` index and the new
@@ -188,7 +180,7 @@ docker run -p 8081:80 ghcr.io/huggingface/text-embeddings-inference:latest \
 
 export INDEXIO_RERANK_BASE=http://localhost:8081
 export INDEXIO_RERANK_MODEL=Qwen/Qwen3-Reranker-8B
-$CI search "how is backpressure handled" --mode hybrid --rerank --limit 10
+$INDEXIO search "how is backpressure handled" --mode hybrid --rerank --limit 10
 ```
 
 ### Quality A/B you should run once
@@ -202,17 +194,17 @@ MCP client instructions.
 ## 5. Claude Code / agent integration (recap)
 
 ```bash
-claude mcp add indexio -- /path/to/indexio mcp --data-dir /var/lib/ciindex
-# or .mcp.json: {"mcpServers":{"indexio":{"command":"/path/to/indexio","args":["mcp","--data-dir","/var/lib/ciindex"]}}}
+claude mcp add indexio -- /path/to/indexio mcp --data-dir /var/lib/indexio
+# or .mcp.json: {"mcpServers":{"indexio":{"command":"/path/to/indexio","args":["mcp","--data-dir","/var/lib/indexio"]}}}
 ```
 
 ```bash
 indexio setup claude --claude-md ~/.claude/CLAUDE.md   # registers the server + appends the guidance block
 ```
 
-12 tools: `code_search` (with `mode` + `rerank`), `semantic_search`, `code_grep`, `list_files`,
+13 tools: `code_search` (with `mode` + `rerank`), `semantic_search`, `code_grep`, `list_files`,
 `refresh_index`,
-`find_symbol`, `who_calls`, `index_stats`, and the SPEC-P6 set: `impact_of_symbol`,
+`find_symbol`, `who_calls`, `index_stats`, `recall`, and the impact set: `impact_of_symbol`,
 `impact_of_diff` (pass a patch, or omit `diff` to analyse the registered repo's
 working tree), `file_outline`, `read_span`. Tool descriptions already coach the agent on
 when to use lexical vs semantic vs hybrid and to prefer outline+span over reading files.
@@ -249,10 +241,6 @@ when to use lexical vs semantic vs hybrid and to prefer outline+span over readin
 
 ## 7. Where to continue (suggested roadmap, cheapest first)
 
-Done in P6 (`SPEC-P6.md`): impact analysis (`indexio impact`, `impact_of_symbol`,
-`impact_of_diff`), file outline + span, compact MCP payloads, and a planner fix
-(regex alternation prefixes were intersected instead of unioned — `/(a|b)x/` lost recall).
-
 1. **Scope-aware impact edges** — call postings only store the callee's last identifier
    segment. Storing the receiver/qualifier (`Foo::new` vs `Bar::new`) needs a CALL payload
    extension (format version bump) but would remove most hub noise from `indexio impact`.
@@ -267,7 +255,7 @@ Done in P6 (`SPEC-P6.md`): impact analysis (`indexio impact`, `impact_of_symbol`
    expose MCP over a network transport.
 6. **Query-time repo/path boosting config** — ranking constants live at the top of
    `indexio-query/src/lib.rs`; they're one-line experiments.
-7. **SCIP ingestion (big, optional)** — the report's cost ladder says only do this if
+7. **SCIP ingestion (big, optional)** — only worth doing if
    cross-repo *precise* references become a hard requirement.
 8. **Web UI** — the HTTP API is already JSON-shaped for it.
 
@@ -281,21 +269,14 @@ Done in P6 (`SPEC-P6.md`): impact analysis (`indexio impact`, `impact_of_symbol`
 | `--rerank` rejected | Only valid with `--mode hybrid` (by design) |
 | 403 on `/admin/*` | Your ACL token lacks `allow: ["*"]` |
 | Index bigger than expected | Run `indexio compact`; check `indexio cas-stats` for vendored duplication (it's deduped, that's the point) |
-| Weird query errors | Query grammar is in `SPEC.md` §query-language: literals, `"phrases"`, `/regex/`, `repo:/lang:/path:/case:` filters |
+| Weird query errors | Query grammar: literals, `"phrases"`, `/regex/`, `repo:/lang:/path:/case:` filters |
 | `indexio add azdo:…` fails with 401/203 | Set `AZDO_TOKEN` to a PAT with *Code: Read* for that org; SSO-backed orgs need the PAT created under the same identity |
 | `indexio add github:org` lists 0 private repos | `GITHUB_TOKEN` needs `repo` scope (classic) or *Contents: Read* on the repos (fine-grained) |
 | Two repos with the same folder name | The second is registered as `<parent>-<name>` (see `indexio sources`) |
 
-## 9. Verifying integrity after the transfer
+## 9. Test suite
 
-```bash
-cd indexio
-git log --oneline | head -30        # 30+ commits, latest = docs commit on main
-git status                          # clean tree
-cargo test --workspace 2>&1 | tail -3
-```
-
-Test suite anatomy (what's covered, all offline): posting codec round-trips, gram
+What's covered, all offline: posting codec round-trips, gram
 extraction consistency, shard write/read/merge/tombstones, 6-language symbol extraction,
 chunking edge cases, CAS + git-delta ingest (incl. fork dedup), vector index
 (BQ-prescan-vs-brute-force equivalence, HNSW recall≥0.95, persistence), embedder/reranker

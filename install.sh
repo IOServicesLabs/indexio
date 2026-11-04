@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install the latest indexio release on Linux or macOS.
+# Install the latest indexio release on Linux. Releases carry no macOS binary
+# right now: on macOS use `cargo install --git https://github.com/IOServicesLabs/indexio indexio`.
 #
 #   curl -fsSL https://raw.githubusercontent.com/IOServicesLabs/indexio/main/install.sh | sh
 #

@@ -16,8 +16,7 @@ query. Do not include tokens or private code.
 4. Write the commit message in the imperative: what the change does and why.
 5. Open a pull request. CI checks the manifests, the scripts and the workflows.
 
-`docs/DEVELOPMENT.md` explains the crates, the benchmarks and the data layout. The design
-of each subsystem is in `docs/SPEC*.md`.
+`docs/DEVELOPMENT.md` explains the crates, the benchmarks and the data layout.
 
 ## License
 

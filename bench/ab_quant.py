@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A/B of vector-row storage (SPEC-P10 int8 segments vs the f32 segments they
+"""A/B of vector-row storage (int8 segments vs the f32 segments they
 were built from): copies the live data dir's semantic plane, re-encodes the
 copy with `compact --vectors`, then runs the same semantic + hybrid queries
 against both and reports top-1 agreement, top-k overlap, size and latency.

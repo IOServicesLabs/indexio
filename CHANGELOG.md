@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.13
+
+Cleanup of the CLI help and the docs, plus an rtk hook fix. No change to search
+results or tool output.
+
+- `indexio --help` and the subcommand help no longer carry internal design-doc
+  tags such as `(SPEC-P7)`. The hook help now describes the in-place rewrite
+  instead of the deny that 0.1.11 replaced, and lists the `powershell` and
+  `session-start` hooks. The `--rerank` help says what it does without a
+  reranker endpoint: nothing.
+- `indexio hook install` keeps rtk's command in settings under a matcher that
+  never runs, so rtk sees its hook and stops printing "No hook installed", and
+  `rtk init -g` does not add the competing hook back.
+- Docs: macOS is listed as build-from-source, since releases carry no macOS
+  binaries. The README describes the PowerShell hook and `# raw` as they work
+  now, and `docs/DEVELOPMENT.md` drops stale counts and commands.
+
 ## 0.1.12
 
 0.1.11's in-place answers lost to rtk: with both hooks installed, a `grep`,

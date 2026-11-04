@@ -64,7 +64,7 @@ impl Cas {
             }
         }
         if removed > 0 {
-            tracing::info!(dir = %dir.display(), dirs = removed, "swept the pre-P10 extraction cache");
+            tracing::info!(dir = %dir.display(), dirs = removed, "removed the old-layout extraction cache");
         }
     }
 

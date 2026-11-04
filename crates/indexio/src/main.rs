@@ -50,7 +50,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add a source and index it now (SPEC-P7). A source is a local folder
+    /// Add a source and index it now. A source is a local folder
     /// (every git repo under it, any depth; a folder with no repos is
     /// indexed as-is), `github:ORG`, `github:OWNER/REPO`,
     /// `azdo:ORG/PROJECT`, `azdo:ORG/PROJECT/REPO`, or any clone URL.
@@ -141,17 +141,17 @@ enum Commands {
         /// (natural-language concepts), hybrid (RRF fusion of both).
         #[arg(long, default_value = "lexical")]
         mode: String,
-        /// Rerank the hybrid results (SPEC-P3 §2). Only valid with
+        /// Rerank the hybrid results. Only valid with
         /// --mode hybrid; reranker = INDEXIO_RERANK_BASE HttpReranker when set,
         /// else the offline OverlapReranker.
         #[arg(long)]
         rerank: bool,
-        /// Fusion algorithm for --mode hybrid (SPEC-P5 §A3): rrf
+        /// Fusion algorithm for --mode hybrid: rrf
         /// (reciprocal-rank, k=60; default) or combmnz (min-max normalized
         /// scores, sum x number of legs).
         #[arg(long, default_value = "rrf", value_name = "rrf|combmnz")]
         fusion: String,
-        /// Embedder for semantic/hybrid modes (SPEC-P4 §2): "hash" selects
+        /// Embedder for semantic/hybrid modes: "hash" selects
         /// the legacy HashEmbedder (A/B escape hatch), "rindex" the default
         /// self-contained random-indexing model. INDEXIO_EMBED_BASE (HTTP)
         /// overrides this flag.
@@ -173,10 +173,10 @@ enum Commands {
         max_chars: usize,
         /// Embedder: "hash" selects the legacy HashEmbedder (A/B escape
         /// hatch), "rindex" the default self-contained random-indexing
-        /// model (SPEC-P4 §2). INDEXIO_EMBED_BASE (HTTP) overrides this flag.
+        /// model. INDEXIO_EMBED_BASE (HTTP) overrides this flag.
         #[arg(long, value_name = "hash|rindex")]
         embedder: Option<String>,
-        /// Rebuild the semantic model from scratch (SPEC-P4 §2): delete
+        /// Rebuild the semantic model from scratch: delete
         /// the on-disk model and this model's embcas namespace, then
         /// re-observe ALL chunks (every chunk becomes a CAS miss). Needed
         /// because the RI model state still includes contributions of
@@ -222,14 +222,15 @@ enum Commands {
     Symbol { name: String },
     /// Find callers of a function/method.
     Calls { name: String },
-    /// Claude Code hooks (SPEC-P9). `hook bash` is a PreToolUse hook for the
-    /// Bash tool: it reads the hook JSON on stdin and denies plain shell
-    /// reads/searches (cat, sed -n, head, grep, rg, find) of files the index
-    /// holds, naming the indexio call to make instead. `hook install` writes
-    /// it (and the PreCompact `sessions --quiet` import) into
+    /// Claude Code hooks. `hook bash` is a PreToolUse hook for the Bash tool:
+    /// it reads the hook JSON on stdin and answers plain shell reads/searches
+    /// (cat, sed -n, head, grep, rg, find) of files the index holds in place,
+    /// by rewriting them to `indexio tool`; the typed command still runs when
+    /// the index cannot answer. `hook install` writes indexio's hooks (Bash,
+    /// PowerShell, Read, PreCompact, SessionStart) into
     /// `~/.claude/settings.json` with a path every shell accepts.
     Hook {
-        /// bash or read (act as that PreToolUse hook), or install.
+        /// bash, powershell, read or session-start (act as that hook), or install.
         which: String,
         /// install: Claude config dir (default: $CLAUDE_CONFIG_DIR or ~/.claude).
         #[arg(long)]
@@ -237,7 +238,7 @@ enum Commands {
         /// install: show the changes without writing settings.json.
         #[arg(long)]
         print_only: bool,
-        /// freshen (spawned by a deny): the repo to bring up to date.
+        /// freshen (spawned by a hook): the repo to bring up to date.
         #[arg(long, hide = true)]
         repo: Option<String>,
         /// freshen: only this repo-relative file.
@@ -250,7 +251,7 @@ enum Commands {
         then: Option<String>,
     },
     /// Import Claude Code session transcripts into the `sessions` source
-    /// (SPEC-P9 recall): `<claude dir>/projects/*/*.jsonl` become compact
+    /// that `recall` searches: `<claude dir>/projects/*/*.jsonl` become compact
     /// Markdown under `<data-dir>/sessions`, registered as a plain-folder
     /// source and re-indexed. Idempotent; only changed transcripts are
     /// re-rendered. Meant for a PreCompact hook and the MCP server.
@@ -268,8 +269,8 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
-    /// Run a command and keep its output out of the model's context
-    /// (SPEC-P10 §31): short output is printed as it is; long output is
+    /// Run a command and keep its output out of the model's context:
+    /// short output is printed as it is; long output is
     /// stored under `<data-dir>/runs/<repo>/` (indexed, searchable, rolled
     /// off after $INDEXIO_RETAIN_DAYS, default 30) and a digest with the
     /// error lines and a `read_span` pointer is printed instead. The Bash
@@ -298,7 +299,7 @@ enum Commands {
         /// Target maximum shard count.
         #[arg(long, default_value_t = 4)]
         max_shards: usize,
-        /// Also fold every vector segment into one (re-encodes pre-P10 f32
+        /// Also fold every vector segment into one (re-encodes older f32
         /// segments as int8 rows).
         #[arg(long)]
         vectors: bool,
@@ -322,8 +323,8 @@ enum Commands {
         /// Falls back to $INDEXIO_BIND when unset.
         #[arg(long, value_name = "ADDR")]
         bind: Option<std::net::IpAddr>,
-        /// Bearer token required on all routes except GET /health
-        /// (SPEC-P3 §3). Falls back to $INDEXIO_AUTH_TOKEN when unset.
+        /// Bearer token required on all routes except GET /health.
+        /// Falls back to $INDEXIO_AUTH_TOKEN when unset.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
         /// JSON ACL file: {"tokens":{"tok":{"allow":["core","team-*"]}}}.
@@ -351,7 +352,7 @@ enum Commands {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Register indexio with an agent harness (SPEC-P8). `setup claude`
+    /// Register indexio with an agent harness. `setup claude`
     /// runs `claude mcp add` for this binary + data dir and prints the
     /// guidance block to put in CLAUDE.md (or appends it with --claude-md).
     Setup {
@@ -373,7 +374,7 @@ enum Commands {
         #[arg(long)]
         team_sync: bool,
     },
-    /// Impact analysis (SPEC-P6): what else does a change touch? Exactly
+    /// Impact analysis: what else does a change touch? Exactly
     /// one of --symbol / --diff / --diff-file / --file selects the target.
     Impact {
         /// Root symbol name to walk (repeatable).
@@ -956,7 +957,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let exe = std::env::current_exe().context("locating the indexio binary")?;
                 hook::install(&claude, &exe, print_only)?;
             }
-            other => anyhow::bail!("unknown hook '{other}' (expected: bash, read, session-start or install)"),
+            other => anyhow::bail!("unknown hook '{other}' (expected: bash, powershell, read, session-start or install)"),
         },
         Commands::Run { cwd, command } => {
             let cwd = match cwd {

@@ -1,5 +1,5 @@
 //! What the harness's own tools would have put in the model's context for
-//! the same call (SPEC-P10 §22), and the aggregate of the usage log that
+//! the same call, and the aggregate of the usage log that
 //! `index_stats` and `indexio usage` report.
 //!
 //! Every successful tool call is logged with the bytes it returned and,

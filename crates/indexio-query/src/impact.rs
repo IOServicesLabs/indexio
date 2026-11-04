@@ -1,4 +1,4 @@
-//! Impact analysis + agent context economy (SPEC-P6).
+//! Impact analysis + agent context economy.
 //!
 //! Everything here is computed at query time from what the shards already
 //! hold — symbol postings, name-based call postings, and file content — so
@@ -26,7 +26,7 @@ use indexio_types::{BlobId, DocMeta, Lang, SearchHit, SymbolKind};
 
 use crate::{content_line, snippet_line, sort_hits, DocRef, Engine, Filters, Literal, Query};
 
-/// Hard cap on lines returned by `read_span` (SPEC-P6 §2.4).
+/// Hard cap on lines returned by `read_span`.
 pub const MAX_SPAN_LINES: u32 = 400;
 /// Changed lines examined per diff range when mapping to definitions.
 const MAX_RANGE_LINES: u32 = 5_000;
@@ -41,7 +41,7 @@ const PLAUSIBILITY_BUDGET: usize = 5;
 // Report types
 // ---------------------------------------------------------------------------
 
-/// Walk limits (SPEC-P6 §2.1).
+/// Walk limits.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ImpactOptions {
     /// Hops of the reverse call graph to follow (1 = direct callers).
@@ -101,7 +101,7 @@ pub struct ImpactReport {
     pub took_ms: u64,
 }
 
-/// A definition touched by a diff (SPEC-P6 §2.2).
+/// A definition touched by a diff.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedSymbol {
     pub path: String,
@@ -111,7 +111,7 @@ pub struct ChangedSymbol {
     /// Changed lines that fell inside this definition (capped at 20).
     pub lines: Vec<u32>,
     /// First line of the definition (its signature), for the call-site
-    /// judgement of §20 (`def search(self, ..)` takes a receiver).
+    /// judgement (`def search(self, ..)` takes a receiver).
     #[serde(default)]
     pub signature: String,
 }
@@ -231,7 +231,7 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
 }
 
 // ---------------------------------------------------------------------------
-// Import patterns (SPEC-P6 §2.3)
+// Import patterns
 // ---------------------------------------------------------------------------
 
 fn file_stem(path: &str) -> &str {
@@ -298,7 +298,7 @@ pub fn import_pattern(lang: Lang, path: &str) -> Option<(String, String)> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Call-site plausibility (SPEC-P9 §20)
+// Call-site plausibility
 // ---------------------------------------------------------------------------
 
 /// What the definitions of a root name look like, so a name-based call
@@ -595,7 +595,7 @@ impl Engine {
         shape
     }
 
-    /// Transitive reverse call graph from `names` (SPEC-P6 §2.1).
+    /// Transitive reverse call graph from `names`.
     pub fn impact_symbols(&self, names: &[String], opts: &ImpactOptions) -> ImpactReport {
         let t0 = Instant::now();
         let roots = dedup_names(names);
@@ -714,7 +714,7 @@ impl Engine {
         (sites, truncated)
     }
 
-    /// Grep-grade file-level dependents of `path` (SPEC-P6 §2.3): one
+    /// Grep-grade file-level dependents of `path`: one
     /// lexical regex search, `lang:` filtered, module key as a required
     /// literal so the planner intersects on it. The file itself is excluded.
     pub fn who_imports(&self, repo: &str, path: &str, limit: usize) -> Vec<SearchHit> {
@@ -747,12 +747,12 @@ impl Engine {
         self.search(&q, limit).hits
     }
 
-    /// Definitions with ranges for one indexed file (SPEC-P6 §2.4).
+    /// Definitions with ranges for one indexed file.
     pub fn outline(&self, repo: &str, path: &str) -> Option<Vec<OutlineItem>> {
         self.outline_cached(repo, path).map(|o| (*o).clone())
     }
 
-    /// [`outline`](Self::outline) through the per-engine cache (SPEC-P9).
+    /// [`outline`](Self::outline) through the per-engine cache.
     pub fn outline_cached(&self, repo: &str, path: &str) -> Option<Arc<Vec<OutlineItem>>> {
         let (si, docid) = self.locate_doc(repo, path)?;
         let dm = self.set.doc(si, docid)?;
@@ -788,7 +788,7 @@ impl Engine {
     }
 
     /// `(start, end)` of the innermost definition containing `line`
-    /// (SPEC-P9): what `read_span` returns when no `end` is given and what
+    ///: what `read_span` returns when no `end` is given and what
     /// `find_symbol` shows next to a hit. `None` outside any definition.
     pub fn definition_range(&self, repo: &str, path: &str, line: u32) -> Option<(u32, u32)> {
         let items = self.outline_cached(repo, path)?;
@@ -808,7 +808,7 @@ impl Engine {
     }
 
     /// The raw bytes of one indexed file (`None` when it is not indexed):
-    /// what a whole-file read would have returned (SPEC-P10 §22).
+    /// what a whole-file read would have returned.
     pub fn file_content(&self, repo: &str, path: &str) -> Option<Vec<u8>> {
         let (si, docid) = self.locate_doc(repo, path)?;
         self.set.content(si, docid).ok()
@@ -843,7 +843,7 @@ impl Engine {
     }
 
     /// Map a diff's changed line ranges to the definitions they fall in
-    /// (SPEC-P6 §2.2). Post-change content comes from `new_content(path)`
+    ///. Post-change content comes from `new_content(path)`
     /// (the working tree); pre-change content from the index.
     pub fn changed_symbols(
         &self,
@@ -928,7 +928,7 @@ impl Engine {
             .collect()
     }
 
-    /// The "I am about to change this" flow (SPEC-P6 §2.2): changed
+    /// The "I am about to change this" flow: changed
     /// definitions → reverse-call walk (changed files excluded from sites)
     /// + importers of every changed file.
     pub fn impact_diff(
@@ -1060,7 +1060,7 @@ fn constructor_alias(name: &str, kind: SymbolKind, scope: &str) -> Option<String
 }
 
 /// Root names for a set of changed/listed definitions: the names themselves
-/// plus constructor aliases (SPEC-P6 §2.2).
+/// plus constructor aliases.
 fn roots_for(items: impl Iterator<Item = (String, SymbolKind, String)>) -> Vec<String> {
     let mut names = Vec::new();
     for (name, kind, scope) in items {

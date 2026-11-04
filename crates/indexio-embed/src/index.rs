@@ -1,6 +1,6 @@
-//! Binary-quantized flat vector index sidecar (SPEC-P2 §2.3).
+//! Binary-quantized flat vector index sidecar.
 //!
-//! On-disk (v2, written since SPEC-P6): `<dir>/<model_id>.civec`
+//! On-disk (v2): `<dir>/<model_id>.civec`
 //! (pipeline passes `<data_dir>/vec`):
 //! ```text
 //! magic "CIVEC002" (8B) | u32 dim | u32 n_rows | u32 n_deleted
@@ -12,7 +12,7 @@
 //! ```
 //! v1 files (`CIVEC001`, unpadded) are still opened, into owned memory.
 //!
-//! Segments written since SPEC-P10 are v3 (`CIVEC003`): the same header and
+//! Newer segments are v3 (`CIVEC003`): the same header and
 //! meta block, then `n_rows` f32 per-row scales, `n_rows x dim` **int8**
 //! rows (`x = q * scale`, scale = max|x| / 127 per row), the binary codes
 //! and the tombstones. A row is 2 KB instead of 8 at dim 2048, the rescore
@@ -22,16 +22,15 @@
 //! files stay readable; `create_with_options` (the HNSW full build) still
 //! writes v2 because the graph walks f32 rows.
 //!
-//! Opening a v2 file memory-maps it (SPEC-P6 perf): the vector block is
+//! Opening a v2 file memory-maps it: the vector block is
 //! never copied, so opening a multi-GB index costs the meta parse only and
 //! a query touches just the binary codes plus the rescored candidates. The
 //! mapping is the crate's single `unsafe` site (`mapped`), under the same
 //! policy as indexio-index shards: the file is immutable after its atomic rename.
 //!
-//! Documented deviations from SPEC-P2:
-//! - Tombstones are a bincode sorted `Vec<u32>` rather than a
-//!   `RoaringBitmap` to avoid a new dependency; the `.civec` file is a
-//!   rebuildable sidecar, so the encoding is internal to this crate.
+//! Tombstones are a bincode sorted `Vec<u32>` rather than a
+//! `RoaringBitmap` to avoid a new dependency; the `.civec` file is a
+//! rebuildable sidecar, so the encoding is internal to this crate.
 //!
 //! Query: hamming-distance prescan on the binary codes keeps the top
 //! `max(k*8, 256)` candidates (capped at live rows), rescores with exact
@@ -79,7 +78,7 @@ fn dot_i8(q: &[f32], row: &[i8], scale: f32) -> f32 {
 /// Environment override for the HNSW build threshold (rows).
 pub const HNSW_THRESHOLD_ENV: &str = "INDEXIO_HNSW_THRESHOLD";
 
-/// Options for [`VecIndex::create_with_options`] (SPEC-P3 §1, additive).
+/// Options for [`VecIndex::create_with_options`] (additive).
 #[derive(Clone, Debug)]
 pub struct IndexOptions {
     /// Build + save an HNSW `.cihnsw` sidecar when the row count is at or
@@ -218,7 +217,7 @@ mod mapped {
     }
 
     /// A read-only mapping of a v3 `.civec`: per-row scales, int8 rows and
-    /// binary codes (SPEC-P10). Same soundness argument as
+    /// binary codes. Same soundness argument as
     /// [`MappedVectors`].
     pub struct MappedQuant {
         map: Mmap,
@@ -286,7 +285,7 @@ use mapped::{MappedQuant, MappedVectors};
 enum Storage {
     Owned { vectors: Vec<f32>, codes: Vec<u8> },
     Mapped(MappedVectors),
-    /// v3: int8 rows + per-row scales (SPEC-P10).
+    /// v3: int8 rows + per-row scales.
     Quant(MappedQuant),
 }
 
@@ -298,10 +297,10 @@ pub struct VecIndex {
     /// n_rows * dim f32 (row-major) and n_rows * ceil(dim/8) codes.
     store: Storage,
     tombstones: BTreeSet<u32>,
-    /// HNSW ANN graph (SPEC-P3 §1); `None` below threshold / when absent.
+    /// HNSW ANN graph; `None` below threshold / when absent.
     hnsw: Option<Hnsw>,
     /// Runs of consecutive rows with the same repo, `(repo, start, end)`
-    /// half-open (SPEC-P10 §11): a compaction writes rows grouped by repo,
+    /// half-open: a compaction writes rows grouped by repo,
     /// so a repo-scoped search scans one run instead of testing every row.
     repo_runs: OnceLock<Vec<(String, u32, u32)>>,
 }
@@ -356,7 +355,7 @@ impl VecIndex {
         Self::create_with_options(dir, model_id, dim, rows, &IndexOptions::default())
     }
 
-    /// Full build with options (SPEC-P3 §1). When
+    /// Full build with options. When
     /// `rows.len() >= opts.hnsw_threshold`, also builds a deterministic HNSW
     /// graph and saves `<dir>/<model_id>.cihnsw` alongside the `.civec`;
     /// otherwise any stale `.cihnsw` is removed so a shrunken rebuild never
@@ -423,7 +422,7 @@ impl VecIndex {
             return Ok(None);
         }
         let mut idx = Self::open_file(path)?;
-        // Load the HNSW sidecar if present (SPEC-P3 §1). It is rebuildable,
+        // Load the HNSW sidecar if present. It is rebuildable,
         // so a corrupt or stale (row-count mismatch) graph is ignored with a
         // warning rather than failing the open — search falls back to the
         // flat BQ path.
@@ -519,7 +518,7 @@ impl VecIndex {
         })
     }
 
-    /// v3 (SPEC-P10): header | metas | pad | scales f32 | rows i8 | codes | tombs.
+    /// v3: header | metas | pad | scales f32 | rows i8 | codes | tombs.
     fn open_v3(path: PathBuf, file: fs::File) -> anyhow::Result<Self> {
         let header_len = 8 + 4 + 4 + 4 + 8;
         let mut head = vec![0u8; header_len];
@@ -571,7 +570,7 @@ impl VecIndex {
             fs::create_dir_all(dir).with_context(|| format!("create vec dir {}", dir.display()))?;
         }
         if std::env::var_os("INDEXIO_VEC_F32").is_some() {
-            // A/B knob: the pre-P10 f32 layout (v2)
+            // A/B knob: the older f32 layout (v2)
             let mut vectors: Vec<f32> = Vec::with_capacity(rows.len() * dim);
             let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
             let mut metas = Vec::with_capacity(rows.len());
@@ -597,7 +596,7 @@ impl VecIndex {
             }
             return Ok(());
         }
-        // v3 (SPEC-P10): int8 rows with a per-row scale
+        // v3: int8 rows with a per-row scale
         let mut scales: Vec<u8> = Vec::with_capacity(rows.len() * 4);
         let mut qrows: Vec<u8> = Vec::with_capacity(rows.len() * dim);
         let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
@@ -743,11 +742,11 @@ impl VecIndex {
     /// Exact top-k cosine (dot on L2-normalized vectors). Returns
     /// `(row, score)` sorted by score desc, ties by row asc.
     ///
-    /// Two candidate paths (SPEC-P3 §1):
+    /// Two candidate paths:
     /// - HNSW present: approximate `hnsw.search` with `ef = max(k*10, 100)`,
     ///   then exact f32 rescore of candidates, skipping tombstoned rows.
     /// - Otherwise: binary prescan keeps `max(k*8, 256)` candidates (capped
-    ///   at live rows), rescored exactly. Unchanged from SPEC-P2.
+    ///   at live rows), rescored exactly.
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(u32, f32)> {
         self.search_excluding(q, k, &BTreeSet::new())
     }
@@ -779,7 +778,7 @@ impl VecIndex {
     }
 
     /// [`search_excluding`](Self::search_excluding) over the rows of `repo`
-    /// only (SPEC-P10 §11): the prescan walks that repo's row runs — one
+    /// only: the prescan walks that repo's row runs — one
     /// run after a compaction — instead of testing every row of the segment.
     pub fn search_in_repo(&self, q: &[f32], k: usize, dead: &BTreeSet<u32>, repo: &str) -> Vec<(u32, f32)> {
         let Some(ranges) = self.repo_ranges(repo) else { return Vec::new() };
@@ -824,7 +823,7 @@ impl VecIndex {
     }
 
     /// [`search_excluding`](Self::search_excluding) restricted to rows for
-    /// which `keep(row)` holds (SPEC-P10: a repo-scoped semantic leg — the
+    /// which `keep(row)` holds (a repo-scoped semantic leg — the
     /// prescan pool is then made of matching rows only, instead of a
     /// post-filter over a pool that a large corpus fills with other repos).
     pub fn search_where(&self, q: &[f32], k: usize, dead: &BTreeSet<u32>, keep: &(dyn Fn(u32) -> bool + Sync)) -> Vec<(u32, f32)> {
@@ -928,7 +927,7 @@ impl VecIndex {
         n
     }
 
-    /// Persists tombstones (SPEC-P9): the full set goes to the small
+    /// Persists tombstones: the full set goes to the small
     /// `<file>.tomb` side file (tmp+rename); the segment itself — possibly
     /// gigabytes, possibly mapped by other processes — is never rewritten.
     pub fn save_tombstones(&mut self) -> anyhow::Result<()> {
@@ -976,7 +975,7 @@ fn align8(v: usize) -> usize {
     (v + 7) & !7
 }
 
-/// `<segment>.tomb`: bincode `Vec<u32>` of tombstoned rows (SPEC-P9).
+/// `<segment>.tomb`: bincode `Vec<u32>` of tombstoned rows.
 pub(crate) fn tomb_side_path(seg: &Path) -> PathBuf {
     let mut s = seg.as_os_str().to_owned();
     s.push(".tomb");
@@ -1011,7 +1010,7 @@ pub(crate) fn write_tomb_side(seg: &Path, tombs: &BTreeSet<u32>) -> anyhow::Resu
 }
 
 // ---------------------------------------------------------------------------
-// VecSet: the segmented vector index (SPEC-P9)
+// VecSet: the segmented vector index
 // ---------------------------------------------------------------------------
 
 /// Extension merged-but-still-mapped segments are parked under.
@@ -1242,7 +1241,7 @@ impl VecSet {
     }
 
     /// [`search`](Self::search) over the rows of `repo` only, walking each
-    /// segment's runs of that repo (SPEC-P10 §11).
+    /// segment's runs of that repo.
     pub fn search_repo(&self, q: &[f32], k: usize, repo: &str) -> Vec<(u32, f32)> {
         let mut out: Vec<(u32, f32)> = Vec::new();
         for (i, s) in self.segs.iter().enumerate() {
@@ -1471,7 +1470,7 @@ mod tests {
 
     #[test]
     fn int8_segment_matches_f32_ranking() {
-        // SPEC-P10: a v3 segment (int8 rows) ranks like the f32 rows it was
+        // a v3 segment (int8 rows) ranks like the f32 rows it was
         // built from, and its rows round-trip through a compaction exactly.
         let tmp = tempfile::tempdir().unwrap();
         // n below the prescan pool (256): every row is rescored, so any
@@ -1583,7 +1582,7 @@ mod tests {
         );
     }
 
-    /// SPEC-P3 §1: below-threshold create writes NO .cihnsw and uses the
+    /// below-threshold create writes NO .cihnsw and uses the
     /// flat BQ path (result must equal brute-force top-k).
     #[test]
     fn below_threshold_no_cihnsw_flat_path() {
@@ -1626,7 +1625,7 @@ mod tests {
         assert_eq!(idx2.search(&q, k), brute);
     }
 
-    /// SPEC-P3 §1: above-threshold create writes .cihnsw and the HNSW path
+    /// above-threshold create writes .cihnsw and the HNSW path
     /// ranks a planted nearest neighbor #1 (in-memory and after reopen).
     #[test]
     fn above_threshold_cihnsw_planted_nn() {
@@ -1689,7 +1688,7 @@ mod tests {
         assert!(recall >= 0.9, "HNSW path recall {recall} too low on fixture");
     }
 
-    /// SPEC-P3 §1: tombstoned rows are never returned on the HNSW path.
+    /// tombstoned rows are never returned on the HNSW path.
     #[test]
     fn hnsw_path_excludes_tombstones() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1791,7 +1790,7 @@ mod tests {
     }
 
     /// Two servers (two opened sets) tombstone different rows of one
-    /// segment: neither write may undo the other's (SPEC-P9).
+    /// segment: neither write may undo the other's.
     #[test]
     fn side_file_tombstones_union_across_writers() {
         let tmp = tempfile::tempdir().unwrap();

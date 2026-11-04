@@ -4,14 +4,13 @@
 //! JSON-RPC message (a single object, or an array for batch requests).
 //! Content-Length framing is intentionally NOT supported.
 //!
-//! Contract: docs/SPEC.md, section "indexio — binary"; SPEC-P8 (harness
-//! integration): the `initialize` result carries `instructions` that tell
+//! Harness integration: the `initialize` result carries `instructions` that tell
 //! the harness to prefer these tools over its own grep/glob/read, the tool
 //! descriptions say which built-in they replace, `list_files` covers glob,
 //! `refresh_index` lets the model repair staleness itself, and
 //! `index_stats` reports per-repo freshness.
 //!
-//! SECURITY NOTE (SPEC-P3 §3): the MCP stdio channel is the TRUSTED local
+//! SECURITY NOTE: the MCP stdio channel is the TRUSTED local
 //! interface — it runs as the invoking user over a pipe, so it is
 //! intentionally NOT authenticated and NOT repo-ACL filtered. HTTP auth
 //! and ACLs live only in `indexio serve`. Do not expose this handler over a
@@ -37,7 +36,7 @@ const INTERNAL_ERROR: i64 = -32603;
 const DEFAULT_LIMIT: usize = 50;
 
 /// `code_grep` lists this many matching lines per file by default
-/// (`grep -n` semantics, SPEC-P9 §19); `code_search` lists 1 (the densest
+/// (`grep -n` semantics); `code_search` lists 1 (the densest
 /// line) unless asked with `lines`.
 const GREP_LINES_PER_FILE: usize = 20;
 /// Upper bound for `lines`.
@@ -52,7 +51,7 @@ const COMPACT_ABOVE: usize = 12;
 /// …down to this many.
 const COMPACT_TO: usize = 6;
 
-/// How tool results are rendered (SPEC-P9): `Text` is the token-dense
+/// How tool results are rendered: `Text` is the token-dense
 /// default for models; `Json` the compact JSON envelope for scripts/tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -85,20 +84,20 @@ pub struct McpServer {
     embedder: Arc<dyn Embedder>,
     reranker: Arc<dyn Reranker>,
     format: OutputFormat,
-    /// The registered repo this session works in (SPEC-P9): its hits are
+    /// The registered repo this session works in: its hits are
     /// listed first and its impact call sites are shown in full. `None`
     /// until the working directory is under a registered repo — resolved
-    /// at start and, while still `None`, again once a minute (SPEC-P10
-    /// §23: a session started before its folder was registered).
+    /// at start and, while still `None`, again once a minute
+    /// (a session started before its folder was registered).
     current_repo: RwLock<Option<String>>,
     /// Filesystem watch on the current repo: when it reports changes, the
     /// next tool call re-indexes the working tree first (auto-refresh).
     watch: Mutex<Option<crate::watch::RepoWatch>>,
     /// Last late-resolution attempt (see `current_repo`).
     repo_checked: Mutex<Option<std::time::Instant>>,
-    /// Last periodic shard-count check (SPEC-P10 §29).
+    /// Last periodic shard-count check.
     compact_checked: Mutex<Option<std::time::Instant>>,
-    /// The model save running off the call path (SPEC-P10 §30), joined
+    /// The model save running off the call path, joined
     /// before the next one starts and at shutdown.
     saver: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Stat cache for the current repo's working tree so a refresh only
@@ -116,7 +115,7 @@ pub struct McpServer {
     /// to be adopted.
     warm: Arc<Mutex<Option<Engine>>>,
     /// Paths of the current repo whose semantic rows still need embedding:
-    /// drained by the background embed thread (SPEC-P10 §37); what it
+    /// drained by the background embed thread; what it
     /// could not embed (another server mid-append) stays queued for the
     /// next refresh.
     pending_embed: Arc<Mutex<std::collections::BTreeSet<String>>>,
@@ -145,29 +144,29 @@ pub struct McpServer {
     prepare_again: Arc<AtomicBool>,
     /// Watch on `<data_dir>/shards` that triggers the preparation.
     shards_watch: Mutex<Option<notify::RecommendedWatcher>>,
-    /// Last transcript import (SPEC-P9 recall); throttled to
+    /// Last transcript import; throttled to
     /// [`SESSIONS_IMPORT_EVERY`] and run on a background thread.
     sessions_last: Mutex<Option<std::time::Instant>>,
     sessions_busy: Arc<AtomicBool>,
-    /// Stat cache for the `sessions` folder (SPEC-P10): only rewritten
+    /// Stat cache for the `sessions` folder: only rewritten
     /// transcript parts are re-read by the periodic import.
     sessions_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
-    /// The same for the `runs` folder (SPEC-P10 §31).
+    /// The same for the `runs` folder.
     runs_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
     /// The `memory` source's stat cache (see `sessions::index_memory`).
     memory_cache: Arc<Mutex<indexio_ingest::WorktreeCache>>,
-    /// Last background sync of the other registered repos (SPEC-P10 §21);
+    /// Last background sync of the other registered repos;
     /// throttled to [`SYNC_EVERY`], one server at a time across the data dir.
     sync_last: Mutex<Option<std::time::Instant>>,
     sync_busy: Arc<AtomicBool>,
     /// The binary this server was started from and its (len, mtime) then:
     /// a newer install is noticed on a later call and reported once
-    /// (SPEC-P10 §12 — sessions kept running week-old servers for days).
+    /// (sessions kept running week-old servers for days).
     exe: Option<(std::path::PathBuf, (u64, Option<std::time::SystemTime>))>,
     exe_checked: Mutex<Option<std::time::Instant>>,
     stale_noted: AtomicBool,
     /// Files this session has already been charged a whole-file read for
-    /// (SPEC-P10 §22): only the first `read_span` of a file is measured
+    ///: only the first `read_span` of a file is measured
     /// against the harness reading it whole.
     read_seen: Mutex<HashMap<(String, String), [u8; 16]>>,
     /// Recent `read_span` answers by content id (see `elide_repeat_span`).
@@ -195,7 +194,7 @@ type ReadSeen = Mutex<HashMap<(String, String), [u8; 16]>>;
 const SESSIONS_IMPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
 /// How often a server probes the other registered repos for moved HEADs.
 const SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
-/// How often a server without a current repo looks for one (SPEC-P10 §23).
+/// How often a server without a current repo looks for one.
 const ADOPT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often a server counts the shards for a compaction it did not cause.
 const COMPACT_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -283,8 +282,8 @@ impl McpServer {
         }
     }
 
-    /// Keep the repos this session is NOT working in current (SPEC-P10
-    /// §21): every [`SYNC_EVERY`], on a background thread, the registered
+    /// Keep the repos this session is NOT working in current:
+    /// every [`SYNC_EVERY`], on a background thread, the registered
     /// git repos whose HEAD moved since they were indexed get a HEAD-based
     /// delta and an embed. The session's own repo is the auto-refresh's
     /// (working tree, per call); plain folders and repos another server
@@ -487,7 +486,7 @@ impl McpServer {
         let memory_cache = Arc::clone(&self.memory_cache);
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            // SPEC-P10 §31: the command-output source rides the same cycle —
+            // the command-output source rides the same cycle —
             // roll off old logs, delta-index the folder, embed what changed
             let rolled = crate::runs::retain(&data_dir, crate::runs::retain_days());
             if data_dir.join(crate::runs::REPO).is_dir() {
@@ -576,7 +575,7 @@ impl McpServer {
     }
 
     /// Queue `paths` of the current repo for the semantic plane and embed
-    /// them on a background thread (SPEC-P10 §37): the call that triggered
+    /// them on a background thread: the call that triggered
     /// the refresh needed the lexical index, which is already fresh; the
     /// vectors follow within a few hundred milliseconds and the next call
     /// adopts them through `reload_needed`. One thread at a time; a batch
@@ -675,7 +674,7 @@ impl McpServer {
     }
 
     /// Save the semantic model on a background thread once its lazy
-    /// interval has passed (SPEC-P10 §30). The save holds the model's
+    /// interval has passed. The save holds the model's
     /// write lock for its duration, so a hybrid query in that window waits
     /// for it; every other tool is unaffected, and no tool call carries it.
     fn maybe_save_model(&self) {
@@ -700,7 +699,7 @@ impl McpServer {
     }
 
     /// Fold the oldest shards together in the background once more than
-    /// [`COMPACT_ABOVE`] exist (SPEC-P9): every refresh that changed
+    /// [`COMPACT_ABOVE`] exist: every refresh that changed
     /// something adds a delta shard and every lookup probes each shard.
     /// The merge (~20 s on 100 MB of source) never blocks a tool call; the
     /// engine is reopened by the next call after it finishes. Shards this
@@ -718,7 +717,7 @@ impl McpServer {
         let n = shards_stamp(&shards_dir).0;
         let shards_due = n > COMPACT_ABOVE;
         let vectors_due = indexio_embed::pipeline::needs_compaction(&data_dir, &model_id);
-        // SPEC-P10 §20: the model has learned a lot since the rows were
+        // the model has learned a lot since the rows were
         // embedded — rebuild the plane whole (30 s for 218k rows)
         let reembed_due = indexio_embed::pipeline::reembed_due(&data_dir, &model_id, self.embedder.texts_seen());
         if !(shards_due || vectors_due || reembed_due) || self.compacting.swap(true, Ordering::AcqRel) {
@@ -774,7 +773,7 @@ impl McpServer {
     }
 
     /// [`maybe_compact`](Self::maybe_compact) once a minute regardless of
-    /// who wrote the shards (SPEC-P10 §29): the Bash hook, `indexio sync`,
+    /// who wrote the shards: the Bash hook, `indexio sync`,
     /// the background sync and other sessions' servers all add delta
     /// shards, and a server whose own repo is idle never refreshed — the
     /// data dir reached 30 shards with every lookup probing each one.
@@ -803,7 +802,7 @@ impl McpServer {
     }
 
     /// Reopen the engine if a background compaction finished, or if the
-    /// shard directory changed under us (SPEC-P9): another session's
+    /// shard directory changed under us: another session's
     /// auto-refresh, the CLI, the Bash hook or a sync may have written new
     /// shards for repos this session reads. One `read_dir` per call.
     fn reload_if_needed(&self) {
@@ -898,12 +897,12 @@ impl McpServer {
     }
 
     /// Append one JSON line per tool call to `<data_dir>/usage/<date>.jsonl`
-    /// (SPEC-P9 telemetry): what the sessions sharing this index actually
+    /// (telemetry): what the sessions sharing this index actually
     /// ask for, how big the answers are and how long they take. `indexio
     /// usage` aggregates it. Never fails a call.
     /// One usage line per call: what was returned, how long it took and,
     /// when the call has a mechanical built-in equivalent, what that would
-    /// have returned (SPEC-P10 §22; `indexio usage`, `index_stats`).
+    /// have returned (`indexio usage`, `index_stats`).
     fn log_usage(&self, tool: &str, ms: u64, bytes: usize, builtin: Option<u64>, ok: bool) {
         let Some(data_dir) = self.engine.read().expect("engine lock poisoned").data_dir().map(|d| d.to_path_buf()) else {
             return;
@@ -958,7 +957,7 @@ impl McpServer {
     }
 
     /// A server that started outside any registered repo looks again, at
-    /// most once a minute (SPEC-P10 §23): the folder is often registered
+    /// most once a minute: the folder is often registered
     /// (`indexio add`) after the session that works in it has started,
     /// and until then that session gets no auto-refresh, no repo-first
     /// ranking and no per-repo usage. Costs one `repos/` listing per
@@ -1011,7 +1010,7 @@ impl McpServer {
     }
 
     /// Re-index the current repo's working tree if the watcher saw a
-    /// change since the last call (SPEC-P9 auto-refresh): stat-cached
+    /// change since the last call (auto-refresh): stat-cached
     /// delta, lexical plane only, engine reopened when docs moved. Never
     /// fails the caller's tool call.
     fn auto_refresh(&self) {
@@ -1067,9 +1066,9 @@ impl McpServer {
                     Ok(()) => *self.shards_seen.lock().expect("shards stamp poisoned") = stamp,
                     Err(e) => tracing::warn!(error = %e, "auto-refresh: reopen failed"),
                 }
-                // Semantic plane too (SPEC-P9 incremental embed): only the
+                // Semantic plane too (incremental embed): only the
                 // changed paths are chunked, diffed and appended — on a
-                // background thread, off this call (SPEC-P10 §37).
+                // background thread, off this call.
                 self.embed_current_paths(repo, &data_dir, &r.changed_paths);
                 drop(cache);
                 drop(watch);
@@ -1180,7 +1179,7 @@ impl McpServer {
     }
 
     /// The tool result and, when the call has one, the size of the
-    /// built-in tool's output for it (SPEC-P10 §22).
+    /// built-in tool's output for it.
     fn call_tool(&self, params: &Value) -> Result<(Value, Option<u64>), (i64, String)> {
         let name = params
             .get("name")
@@ -1284,7 +1283,7 @@ impl McpServer {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(invalid("'embed' must be a boolean")),
         };
-        // SPEC-P9: an agent refreshes to see what it is editing, so the
+        // an agent refreshes to see what it is editing, so the
         // working tree is the default; worktree=false re-indexes HEAD.
         let worktree = match args.get("worktree") {
             None | Some(Value::Null) => true,
@@ -1410,7 +1409,7 @@ pub fn handle_text(engine: &Engine, line: &str) -> Option<String> {
     server.handle(line)
 }
 
-/// The `initialize` instructions (SPEC-P8): what is indexed, how fresh it
+/// The `initialize` instructions: what is indexed, how fresh it
 /// is, and when to prefer these tools over the harness's own. Kept short —
 /// harnesses inject it into every system prompt.
 pub fn server_instructions(engine: &Engine, current: Option<&str>) -> String {
@@ -1796,8 +1795,8 @@ fn tools_list() -> Value {
     })
 }
 
-/// MCP tool result envelope: compact JSON as a single text block (SPEC-P6
-/// §3: compact, not pretty — the consumer is a model, and whitespace is
+/// MCP tool result envelope: compact JSON as a single text block
+/// (compact, not pretty — the consumer is a model, and whitespace is
 /// paid for in tokens).
 fn text_result(payload: Value) -> Value {
     let text = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
@@ -1861,7 +1860,7 @@ fn internal(msg: impl Into<String>) -> (i64, String) {
 }
 
 /// `repo:path`, the form every answer prints, pasted back as the path
-/// (SPEC-P10 §38): the prefix is dropped when it names this repo.
+///: the prefix is dropped when it names this repo.
 fn strip_repo_prefix<'a>(repo: &str, path: &'a str) -> &'a str {
     path.strip_prefix(repo).and_then(|rest| rest.strip_prefix(':')).unwrap_or(path)
 }
@@ -1970,7 +1969,7 @@ fn with_filters(engine: &Engine, args: &Value, query: &str) -> (String, Option<S
 }
 
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
-    // the names agents reach for from the built-in tools (SPEC-P10 §38):
+    // the names agents reach for from the built-in tools:
     // `query` for a grep pattern, `symbol` for a symbol name, `file` for a path
     let alias = match key {
         "pattern" => Some("query"),
@@ -2007,7 +2006,7 @@ fn opt_usize(args: &Value, key: &str, default: usize) -> Result<usize, (i64, Str
     }
 }
 
-/// index_stats payload: EngineStats plus per-repo freshness (SPEC-P8).
+/// index_stats payload: EngineStats plus per-repo freshness.
 fn stats_payload(engine: &Engine) -> Value {
     let stats = engine.stats();
     let mut v = serde_json::to_value(&stats).expect("EngineStats is Serialize");
@@ -2054,7 +2053,7 @@ fn semantic_health(engine: &Engine, data_dir: &std::path::Path, model_id: &str) 
     s
 }
 
-/// index_stats as text (SPEC-P9).
+/// index_stats as text.
 fn stats_text(engine: &Engine) -> String {
     let stats = engine.stats();
     let mut detail = Vec::new();
@@ -2145,7 +2144,7 @@ pub fn call_once(data_dir: &std::path::Path, name: &str, args: &Value, current: 
 }
 
 /// `baseline` receives the size of the harness's own tool's output for
-/// the same call where one exists (SPEC-P10 §22, see `usage`).
+/// the same call where one exists (see `usage`).
 #[allow(clippy::too_many_arguments)]
 fn call_tool(
     engine: &Engine,
@@ -2204,7 +2203,7 @@ fn call_tool(
                         .map(|query| without_transcripts(query, q))
                         .map_err(|e| invalid(format!("invalid query: {e}")))?;
                     let mut res = engine.search_lines(&query, fetch(limit), lines);
-                    // SPEC-P10 §27: `a|b|c`, `width: 3[5-9]` — a grep-style
+                    // `a|b|c`, `width: 3[5-9]` — a grep-style
                     // pattern handed to lexical mode as if it were code_grep;
                     // as literal text it matches nothing, so run it as the
                     // regex it is
@@ -2236,7 +2235,7 @@ fn call_tool(
                         v["fallback"] = json!("regex");
                         return Ok(text_result(v));
                     }
-                    // SPEC-P10 §25: several words and nothing matches them
+                    // several words and nothing matches them
                     // all — the model meant "any of these"; answer with the
                     // hybrid ranking instead of an empty result it retries
                     if res.hits.is_empty()
@@ -2248,7 +2247,7 @@ fn call_tool(
                         if let Ok(mut fused) = engine.search_hybrid_in(q, limit.saturating_mul(2), embedder, FusionAlgo::Rrf, scope.as_deref()) {
                             fused.retain(|h| h.hit.repo != crate::sessions::REPO);
                             // a guess, not a grep: a short list, and other
-                            // repos folded like the literal answer (§35)
+                            // repos folded like the literal answer
                             let mut folded = Folded::default();
                             if let Some(cur) = current {
                                 let (mut here, rest): (Vec<_>, Vec<_>) = fused.into_iter().partition(|h| h.hit.repo == cur);
@@ -2305,7 +2304,7 @@ fn call_tool(
                     let scope = repo_scope(engine, q);
                     // no explicit repo: the session's own repo gets a pass of
                     // its own — in the global ranking a sibling corpus can
-                    // push every one of its rows out (SPEC-P10 §35 for hybrid)
+                    // push every one of its rows out (for hybrid)
                     let own = current.filter(|_| scope.is_none() && !rerank && !wants_sessions(q));
                     let (fused, scoped) = std::thread::scope(|s| {
                         let scoped = own.map(|cur| s.spawn(move || engine.search_hybrid_in(q, limit, embedder, fusion, Some(cur))));
@@ -2379,7 +2378,7 @@ fn call_tool(
             };
             let lines = opt_usize(args, "lines", default_lines)?.clamp(1, MAX_LINES_PER_FILE);
             // an unbalanced parenthesis (`):.*=>` meaning a literal `)`) is
-            // escaped and retried instead of failing the call (SPEC-P10 §33)
+            // escaped and retried instead of failing the call
             // a lookaround (unsupported by the regex engine; 4 failed calls in
             // two weeks) is dropped: the answer is a superset, and says so
             let (query, note) = match grep_query(pattern) {
@@ -2549,10 +2548,10 @@ fn call_tool(
             }
             let q = req_str(args, "query")?;
             let limit = opt_usize(args, "limit", 8)?;
-            // every leg scoped to the transcripts (SPEC-P10): before, the
+            // every leg scoped to the transcripts: before, the
             // legs ran over the whole corpus and the session hits were
             // whatever survived in a 60-deep fused list; the command-output
-            // source (SPEC-P10 §31) is searched the same way and merged
+            // source is searched the same way and merged
             let n = limit.saturating_mul(3).max(24);
             let repos = engine.stats().repos;
             let has_runs = repos.iter().any(|r| r == crate::runs::REPO);
@@ -2591,7 +2590,7 @@ fn call_tool(
             here.extend(rest);
             hits = here;
             hits.truncate(limit);
-            // SPEC-P10 §31: when one exchange clearly answers, hand it back
+            // when one exchange clearly answers, hand it back
             // whole instead of a pointer the model has to follow
             let exchange = hits.first().filter(|_| hits.len() == 1 || limit == 1).and_then(|h| {
                 let start = h.line.saturating_sub(RECALL_EXCHANGE_BEFORE).max(1);
@@ -2709,7 +2708,7 @@ fn call_tool(
             let (repo, path) = (repo.as_str(), path.as_str());
             // no start (a worker omitted it) reads from the top, not an error
             let start = opt_usize(args, "start", 1)?.max(1);
-            // SPEC-P9: no `end` → the enclosing definition's end (a whole
+            // no `end` → the enclosing definition's end (a whole
             // function in one read), else the classic 60-line window.
             let default_end = engine
                 .definition_range(repo, path, start as u32)
@@ -2753,7 +2752,7 @@ fn prefer_repo(hits: &mut Vec<indexio_types::SearchHit>, current: Option<&str>, 
 }
 
 /// Other repos' rows kept in a grep-like answer once the session's own
-/// repo has hits (SPEC-P10 §35): a name that occurs in a sibling checkout
+/// repo has hits: a name that occurs in a sibling checkout
 /// or a copied project is shown once per file there, not in full.
 const OTHER_REPO_ROWS: usize = 3;
 
@@ -2874,7 +2873,7 @@ fn recall_cards(engine: &Engine, embedder: &dyn Embedder, q: &str, limit: usize)
     out
 }
 
-/// Rows of the lexical no-hit hybrid fallback (SPEC-P10 §25): a ranking
+/// Rows of the lexical no-hit hybrid fallback: a ranking
 /// by any of the words is a guess, and 50 guesses cost ~2k tokens.
 const FALLBACK_ROWS: usize = 10;
 
@@ -2897,12 +2896,12 @@ fn split_other_rows<T>(rest: Vec<T>, keep: usize, key: impl Fn(&T) -> (&String, 
 
 /// Days of the usage log `index_stats` summarises.
 const USAGE_DAYS: u64 = 7;
-/// Lines of transcript handed back around a lone recall hit (SPEC-P10 §31).
+/// Lines of transcript handed back around a lone recall hit.
 const RECALL_EXCHANGE_BEFORE: u32 = 4;
 const RECALL_EXCHANGE_AFTER: u32 = 36;
 
 /// What a built-in `Grep` in the session's repo (every repo without one)
-/// would have printed for these rows (SPEC-P10 §22).
+/// would have printed for these rows.
 fn grep_baseline(hits: &[indexio_types::SearchHit], current: Option<&str>) -> u64 {
     crate::usage::grep_bytes(
         hits.iter()
@@ -3037,7 +3036,7 @@ fn strip_lookarounds(pattern: &str) -> Option<String> {
 
 /// Whether a lexical query reads as a grep pattern rather than words: an
 /// alternation, a character class, a quantifier, an anchor or an escape
-/// (SPEC-P10 §27). `/…/` is already a regex to the parser and is excluded.
+///. `/…/` is already a regex to the parser and is excluded.
 fn looks_like_regex(q: &str) -> bool {
     let mut toks: Vec<&str> = q.split_whitespace().collect();
     while toks.last().is_some_and(|t| ["repo:", "path:", "lang:", "case:"].iter().any(|p| t.starts_with(p))) {
@@ -3076,7 +3075,7 @@ fn opt_repo(args: &Value) -> Result<Option<String>, (i64, String)> {
     }
 }
 
-/// Focus symbol-lookup rows (SPEC-P9 §20): an explicit `repo` keeps only
+/// Focus symbol-lookup rows: an explicit `repo` keeps only
 /// that repo; otherwise a hub name (> [`COLLAPSE_SYMBOLS_ABOVE`] rows)
 /// keeps the session's repo in full and collapses the others to per-repo
 /// counts in the returned note (empty when nothing was collapsed). Rows
@@ -3188,7 +3187,7 @@ pub(crate) fn shards_stamp(dir: &std::path::Path) -> ShardsStamp {
 /// The single registered repo an explicit `repo:X` token in `q` names
 /// (case-insensitive substring, like the lexical filter); `None` when there
 /// is no token or it matches several repos. Scopes every hybrid leg
-/// (SPEC-P10) instead of only the lexical one.
+/// instead of only the lexical one.
 fn repo_scope(engine: &Engine, q: &str) -> Option<String> {
     engine.repo_scope(q)
 }
@@ -3293,7 +3292,7 @@ pub fn repo_containing(data_dir: &std::path::Path, dir: &std::path::Path) -> Opt
     best.map(|(_, n)| n)
 }
 
-/// `depth` / `max_sites` (optional) → ImpactOptions (SPEC-P6 §3).
+/// `depth` / `max_sites` (optional) → ImpactOptions.
 fn impact_opts(args: &Value) -> Result<indexio_query::ImpactOptions, (i64, String)> {
     let d = indexio_query::ImpactOptions::default();
     let depth = opt_usize(args, "depth", d.depth as usize)?;
@@ -3504,7 +3503,7 @@ mod tests {
         assert!(payload["took_ms"].is_u64());
     }
 
-    /// SPEC-P10 §29: shards written by other processes are folded by any
+    /// shards written by other processes are folded by any
     /// server's periodic check, not only after its own refresh.
     #[test]
     fn periodic_check_compacts_shards_other_writers_left() {
@@ -3552,7 +3551,7 @@ mod tests {
         assert_eq!(payload["repos"], json!(["alpha"]));
     }
 
-    /// SPEC-P10 §22/§33: the whole-file Read baseline of `read_span` is
+    /// the whole-file Read baseline of `read_span` is
     /// charged on the first span of a file and again once the file changed,
     /// never for a repeat span of the same version.
     #[test]
@@ -3665,7 +3664,7 @@ mod tests {
         assert_eq!(with_repo("beta/nope.rs"), "beta/nope.rs", "left alone when the rest is not indexed either");
     }
 
-    /// SPEC-P10 §35: once the session's repo has hits, other repos get a
+    /// once the session's repo has hits, other repos get a
     /// few rows and a count, not the full list (a copied project next door
     /// doubled every grep answer).
     #[test]
@@ -3733,7 +3732,7 @@ mod tests {
             &handle(&e, &hash_emb(), &rr(), r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"nope"}}"#).unwrap(),
         );
         assert_eq!(v["error"]["code"], -32602);
-        // unparsable query (bad regex; an unbalanced parenthesis alone is repaired, §33)
+        // unparsable query (bad regex; an unbalanced parenthesis alone is repaired)
         let v = parse_resp(
             &handle(&e, &hash_emb(), &rr(), r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"code_grep","arguments":{"pattern":"a{3,1}"}}}"#).unwrap(),
         );
@@ -3779,7 +3778,7 @@ mod tests {
         assert!(paths.contains(&"src/foo.rs"), "{paths:?}");
     }
 
-    /// SPEC-P10 §27: a grep-style alternation given to lexical mode is run
+    /// a grep-style alternation given to lexical mode is run
     /// as the regex it is once the literal reading finds nothing.
     #[test]
     fn lexical_regex_looking_query_without_hits_is_retried_as_a_regex() {
@@ -3806,7 +3805,7 @@ mod tests {
         assert!(looks_like_regex("width: 3[5-9][0-9]"));
     }
 
-    /// SPEC-P10 §25: a multi-word lexical query that matches no line as a
+    /// a multi-word lexical query that matches no line as a
     /// conjunction falls through to the hybrid ranking with a note, instead
     /// of `no hits` (which the model answered with a reworded retry).
     #[test]
@@ -3887,7 +3886,7 @@ mod tests {
     #[test]
     fn code_search_rerank_requires_hybrid_mode() {
         let (_t, e) = fixture_engine();
-        // rerank=true + mode=lexical -> -32602 invalid params (SPEC-P3 §2)
+        // rerank=true + mode=lexical -> -32602 invalid params
         let req = r#"{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"code_search","arguments":{"query":"foo_bar_123","mode":"lexical","rerank":true}}}"#;
         let v = parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap());
         assert_eq!(v["error"]["code"], -32602);
@@ -3946,7 +3945,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // SPEC-P6 §3: impact / outline / span tools
+    // impact / outline / span tools
     // ------------------------------------------------------------------
 
     fn payload_of(v: &Value) -> Value {
@@ -4133,7 +4132,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // SPEC-P8: harness integration
+    // harness integration
     // ------------------------------------------------------------------
 
     #[test]
@@ -4171,7 +4170,7 @@ mod tests {
         let out = handle_text(&e, r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"find_symbol","arguments":{"name":"foo_bar_123"}}}"#).unwrap();
         let v = parse_resp(&out);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        // definition rows carry their end line (SPEC-P9): the fn spans lines 1-3
+        // definition rows carry their end line: the fn spans lines 1-3
         assert_eq!(text, "alpha:src/foo.rs\n  1-3: fn foo_bar_123(x: i32) -> i32 {\n-- 1 definitions in 1 file");
         // read_span without `end` returns exactly that definition
         let out = handle_text(&e, r#"{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"read_span","arguments":{"repo":"alpha","path":"src/foo.rs","start":1}}}"#).unwrap();
@@ -4209,7 +4208,7 @@ mod tests {
         assert_eq!(parse_resp(&handle(&e, &hash_emb(), &rr(), req).unwrap())["error"]["code"], -32602);
     }
 
-    /// SPEC-P10 §23: a server started outside any registered repo adopts
+    /// a server started outside any registered repo adopts
     /// the repo its working directory lands in once that repo is
     /// registered; a subdirectory counts, an unrelated folder does not.
     #[test]

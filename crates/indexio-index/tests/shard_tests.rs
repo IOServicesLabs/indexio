@@ -119,7 +119,7 @@ fn write_open_roundtrip() {
     }
 
     // postings roundtrip per gram (sample several grams, full decode):
-    // the doc is listed, with an empty position list (SPEC-P10)
+    // the doc is listed, with an empty position list
     for (i, (_, _, art)) in docs.iter().enumerate().step_by(17) {
         for gram in art.ngrams.iter().take(5) {
             let cursor: PostingCursor = shard.postings(gram).expect("gram must exist");
@@ -208,7 +208,7 @@ fn replace_by_latest_within_shard() {
 
 /// Two processes (two handles on one shard file) tombstone different docs:
 /// the second write must union with the bitmap on disk, not with the one
-/// it read at open (SPEC-P9).
+/// it read at open.
 #[test]
 fn tombstones_union_across_writers() {
     let dir = tempfile::tempdir().unwrap();

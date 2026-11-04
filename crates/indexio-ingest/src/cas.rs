@@ -1,12 +1,12 @@
 //! Global content-addressed store for `ExtractedArtifact`s.
 //!
-//! Layout (SPEC indexio-ingest, revised SPEC-P10): `<dir>/v2/<hex[0..2]>/
+//! Layout: `<dir>/v2/<hex[0..2]>/
 //! <hex[2..]>`, one file per blob: a 4-byte magic then the zstd frame of the
 //! bincode-serialized `ExtractedArtifact`. The CAS dedups *extraction work*
 //! (grams + tree-sitter) across repos, branches and forks — file content
 //! itself is not stored here (it lives in shards).
 //!
-//! The pre-P10 layout (`<dir>/<hh>/<rest>`, raw bincode with per-occurrence
+//! The old layout (`<dir>/<hh>/<rest>`, raw bincode with per-occurrence
 //! gram positions) averaged ~100 KB per blob — 7× the compressed content
 //! it described. Those entries cannot be parsed by the position-free
 //! artifact type, so `open` sweeps the legacy fan-out directories once; the
@@ -40,7 +40,7 @@ pub struct Cas {
 }
 
 impl Cas {
-    /// Open (creating if needed) the CAS rooted at `dir`; sweeps a pre-P10
+    /// Open (creating if needed) the CAS rooted at `dir`; sweeps an old
     /// layout found there.
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir.join(LAYOUT))?;

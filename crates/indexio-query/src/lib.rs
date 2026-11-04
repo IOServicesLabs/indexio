@@ -1,28 +1,26 @@
 //! indexio-query: query parsing, planning (the moat), candidate generation,
-//! verification and ranking. Contract: docs/SPEC.md, section "indexio-query".
+//! verification and ranking.
 //!
-//! Documented API adjustments vs SPEC (allowed):
+//! API notes:
 //!   - `Engine::search` returns `SearchResult { hits, truncated, took_ms }`
-//!     instead of a bare `Vec<SearchHit>` (SPEC step 1 explicitly permits
-//!     this side channel for the `truncated` flag).
+//!     instead of a bare `Vec<SearchHit>` (a side channel for the `truncated` flag).
 //!   - A query consisting only of filters (no literals, no regexes) is
 //!     rejected as `QueryError::Empty`, like the empty query.
 //!   - Smart-case is per-literal: a literal is case-insensitive iff it
-//!     contains no uppercase ASCII bytes (SPEC says "query is
-//!     all-lowercase"; per-literal is the strictly more useful reading and
-//!     matches the per-literal `case_insensitive` field in the contract).
+//!     contains no uppercase ASCII bytes (matches the per-literal
+//!     `case_insensitive` field).
 //!   - `Engine::open(dir)` opens `<dir>/shards` when that subdirectory
 //!     exists, otherwise `dir` itself (so tests / tools can point straight
 //!     at a shard directory).
 //!
-//! Planner invariants (docs/SPEC.md steps 1-6):
+//! Planner invariants:
 //!   1. Grams are computed with `CommonGrams::empty()`. Shards are built at
 //!      ingest time with `CommonGrams::empty()` (indexio-ingest / tests), so
 //!      `grams::grams_of(needle, empty)` yields exactly the gram keys that
 //!      `grams::extract(content, empty)` indexed — every content occurrence
 //!      of a case-sensitive literal with >= 1 gram is in the intersection.
 //!   2. Literals with >= 1 gram and regex `required_literals` with grams
-//!      drive posting-list intersection (SPEC-P9: only the rarest
+//!      drive posting-list intersection (only the rarest
 //!      `MAX_CONSTRAINT_GRAMS` trigrams, rarity read off the posting payload
 //!      size; shortest list first, galloping seek-merge). Case-INSENSITIVE
 //!      literals union the posting lists of every ASCII case variant of
@@ -68,19 +66,19 @@ use indexio_embed::index::VecSet;
 use indexio_index::ShardSet;
 use indexio_types::{BlobId, DocMeta, EngineStats, Lang, SearchHit};
 
-/// Maximum candidates verified per search (SPEC step 5).
+/// Maximum candidates verified per search.
 pub const CANDIDATE_CAP: usize = 2000;
 /// Brute-scan fallback budget: at most this many content bytes are scanned
-/// when no gram constraint exists (SPEC step 1).
+/// when no gram constraint exists.
 pub const SCAN_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
-/// Snippet length cap (SPEC step 5).
+/// Snippet length cap.
 pub const SNIPPET_MAX_CHARS: usize = 240;
 /// Per-doc match cap for verification / tf counting.
 const MAX_HITS_PER_DOC: usize = 256;
-/// BM25-lite parameters (SPEC step 6).
+/// BM25-lite parameters.
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
-/// Ranking boosts (SPEC step 6).
+/// Ranking boosts.
 const PATH_BOOST: f64 = 5.0;
 const SYMBOL_BOOST: f64 = 2.5;
 
@@ -366,7 +364,7 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// Semantic plane (SPEC-P2 §4)
+// Semantic plane
 // ---------------------------------------------------------------------------
 
 /// Search mode for the CLI/HTTP/MCP `mode` parameter. Default: Lexical.
@@ -411,7 +409,7 @@ impl std::str::FromStr for SearchMode {
     }
 }
 
-/// Fusion algorithm for the hybrid legs (SPEC-P5 §A3). Default: Rrf.
+/// Fusion algorithm for the hybrid legs. Default: Rrf.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FusionAlgo {
     /// Reciprocal-rank fusion, k = 60: score = Σ_legs 1/(60 + rank).
@@ -450,7 +448,7 @@ impl std::str::FromStr for FusionAlgo {
     }
 }
 
-/// SPEC-P5 §A4: strip English stopwords (indexio-embed::embed::stopwords) from
+/// strip English stopwords (indexio-embed::embed::stopwords) from
 /// query text before the semantic/BM25 legs. Query-side only; the
 /// conjunctive lexical mode is untouched (precision there is a feature).
 pub fn clean_query(q: &str) -> String {
@@ -464,17 +462,17 @@ pub fn clean_query(q: &str) -> String {
 }
 
 /// One hybrid (fused) hit. `rrf` is the fused score (the CombMNZ score when
-/// `FusionAlgo::CombMnz` is selected — the field name predates P5 and is
+/// `FusionAlgo::CombMnz` is selected — the field name predates that and is
 /// kept for API/JSON compatibility); `lex_rank` / `bm25_rank` / `sem_rank`
 /// are 1-based ranks in the contributing legs (`None` when the hit came
 /// from other legs — e.g. no vec index yet => all `sem_rank` are `None`).
-/// `rerank_score` is `Some` only when a reranker stage ran (SPEC-P3 §2).
+/// `rerank_score` is `Some` only when a reranker stage ran.
 #[derive(Clone, Debug)]
 pub struct HybridHit {
     pub hit: SearchHit,
     pub rrf: f64,
     pub lex_rank: Option<usize>,
-    /// 1-based rank in the chunk-BM25F leg (SPEC-P5 §A3; `None` when the
+    /// 1-based rank in the chunk-BM25F leg (`None` when the
     /// sidecar is absent or the doc only surfaces elsewhere).
     pub bm25_rank: Option<usize>,
     pub sem_rank: Option<usize>,
@@ -482,10 +480,10 @@ pub struct HybridHit {
     pub rerank_score: Option<f64>,
 }
 
-/// RRF constant (SPEC-P2 §4, SPEC-P5 §A3).
+/// RRF constant.
 pub const RRF_K: f64 = 60.0;
 
-/// Per-leg fusion weights `(lexical, bm25, semantic)` (SPEC-P10 §15): the
+/// Per-leg fusion weights `(lexical, bm25, semantic)`: the
 /// legs are not equally trustworthy on natural-language questions — on 80
 /// model-written questions over the user's repos, chunk BM25 alone beat the
 /// equal-weight fusion, and these weights recovered it (recall@5 61 → 68 %
@@ -506,7 +504,7 @@ fn fuse_weights() -> (f64, f64, f64) {
     })
 }
 
-/// Which retrieval leg a hit list came from (SPEC-P5 §A3).
+/// Which retrieval leg a hit list came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Leg {
     Lex,
@@ -514,13 +512,13 @@ pub(crate) enum Leg {
     Sem,
 }
 
-/// Generic fusion of per-leg hit lists, keyed on (repo, path) (SPEC-P5
-/// §A3). Rrf: Σ 1/(RRF_K + 1-based rank) per leg. CombMnz: each leg's
+/// Generic fusion of per-leg hit lists, keyed on (repo, path).
+/// Rrf: Σ 1/(RRF_K + 1-based rank) per leg. CombMnz: each leg's
 /// scores min-max normalized to [0,1] (a flat leg contributes 1.0 per
 /// entry), summed, then multiplied by the number of legs containing the
 /// doc. A doc appearing in one leg several times (multiple chunks of one
 /// file in the BM25/semantic legs) accumulates its occurrences with
-/// damped weights 1, 1/2, 1/4 (SPEC-P9; unbounded before); its leg COUNT
+/// damped weights 1, 1/2, 1/4 (unbounded before); its leg COUNT
 /// for MNZ still rises by one. The hit with the best (lowest) rank across
 /// legs supplies snippet/line.
 pub(crate) fn fuse_legs(
@@ -551,7 +549,7 @@ pub(crate) fn fuse_legs(
             mx = mx.max(h.score);
         }
         let flat = !(mx > mn); // empty or constant-score leg
-        // SPEC-P9: a file's repeat chunks in one leg are damped (1, 1/2,
+        // a file's repeat chunks in one leg are damped (1, 1/2,
         // 1/4, then nothing) instead of piling up without bound — a big
         // file with a dozen mediocre chunks in the semantic top-50 used to
         // bury a small file that was rank 1 in BOTH lexical legs.
@@ -627,8 +625,8 @@ pub(crate) fn fuse_legs(
     out
 }
 
-/// Reciprocal-rank fusion of a lexical and a semantic hit list (SPEC-P2 §4
-/// two-leg form; kept for the existing unit test — the hybrid search path
+/// Reciprocal-rank fusion of a lexical and a semantic hit list (two-leg
+/// form; kept for the existing unit test — the hybrid search path
 /// uses the 3-leg [`fuse_legs`] via `search_hybrid_fused`).
 #[cfg(test)]
 pub(crate) fn rrf_fuse(lex: &[SearchHit], sem: &[SearchHit], limit: usize) -> Vec<HybridHit> {
@@ -668,7 +666,7 @@ fn case_variants(gram: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// The (line, col) a hit should point at (SPEC-P9). One constraint: its
+/// The (line, col) a hit should point at. One constraint: its
 /// first match. Several (a multi-word query): the line matched by the most
 /// distinct constraints, ties broken by the rarest constraint present, then
 /// the earliest line — the earliest match of *any* word was usually a
@@ -773,17 +771,17 @@ pub struct Engine {
     /// for engines built via `from_shard_set` unless `with_data_dir` is set.
     data_dir: Option<PathBuf>,
     /// Opened semantic sidecars, keyed by model id and validated against
-    /// the file's (len, mtime) on every use (SPEC-P6 perf): a long-lived
+    /// the file's (len, mtime) on every use: a long-lived
     /// engine (HTTP/MCP) pays the open once per rebuild, not per query.
     sidecars: Arc<RwLock<SidecarCache>>,
-    /// Parsed outlines per content blob (SPEC-P9): `read_span` sizes its
+    /// Parsed outlines per content blob: `read_span` sizes its
     /// default range by the enclosing definition and `find_symbol` reports
     /// definition ends; a tree-sitter parse per lookup would cost ms. Keyed
     /// by (blob, lang) rather than doc so it survives an engine reload
     /// (`inherit_caches`): a reload happens on every edit and every
     /// transcript import, and unchanged files keep their parse.
     outline_cache: Arc<Mutex<OutlineCache>>,
-    /// Decompressed doc contents for snippet extraction (SPEC-P9): the
+    /// Decompressed doc contents for snippet extraction: the
     /// semantic/BM25 legs and symbol lookups each pull one line out of up
     /// to 50 docs per call, and agents keep returning to the same files.
     /// Keyed by blob (content-addressed, never stale); bounded, cleared
@@ -973,7 +971,7 @@ impl Engine {
         })
     }
 
-    /// Take over `from`'s opened semantic sidecars (SPEC-P9): a reloaded
+    /// Take over `from`'s opened semantic sidecars: a reloaded
     /// engine then reuses every parsed segment whose file is unchanged
     /// instead of re-parsing gigabytes after each refresh.
     pub fn inherit_sidecars(&self, from: &Engine) {
@@ -994,7 +992,7 @@ impl Engine {
     }
 
     /// Carry the content and outline caches over from the engine being
-    /// replaced (SPEC-P9 §22). Both are keyed by content blob, so nothing
+    /// replaced. Both are keyed by content blob, so nothing
     /// can be stale; a file that did not change keeps its parse.
     pub fn inherit_caches(&self, from: &Engine) {
         // a view layered over `from` already shares them
@@ -1034,7 +1032,7 @@ impl Engine {
         let Some(dir) = &self.data_dir else {
             return Ok(None);
         };
-        // stamp over every committed segment + tombstone side file (SPEC-P9)
+        // stamp over every committed segment + tombstone side file
         let paths = indexio_embed::pipeline::plane_paths(dir, model_id).vec;
         let Some(stamp) = indexio_embed::index::set_stamp_paths(&paths) else {
             return Ok(None);
@@ -1091,7 +1089,7 @@ impl Engine {
 
     /// Data dir this engine was opened from (`None` for `from_shard_set`
     /// engines without `with_data_dir`). Surfaces use it to find
-    /// `<data_dir>/repos/<name>.json` (SPEC-P6 diff impact).
+    /// `<data_dir>/repos/<name>.json`.
     pub fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
     }
@@ -1130,7 +1128,7 @@ impl Engine {
         }
         if let Some(path_sub) = &q.filters.path {
             // `path:a.py|b.py` — any of several substrings (a grep over a
-            // handful of files, SPEC-P9 §19)
+            // handful of files)
             let path = dm.path.to_ascii_lowercase();
             if !path_sub.split('|').any(|p| path_alternative_matches(&path, p)) {
                 return false;
@@ -1139,7 +1137,7 @@ impl Engine {
         true
     }
 
-    /// Gram constraint for one needle (SPEC-P9 planner): the intersection
+    /// Gram constraint for one needle: the intersection
     /// of the posting lists of its rarest trigrams. Rarity is read off the
     /// posting payload length (no decode) and at most
     /// [`MAX_CONSTRAINT_GRAMS`] trigrams are decoded: the rarest few bound
@@ -1193,7 +1191,7 @@ impl Engine {
     }
 
     /// `search` listing up to `per_doc` matching lines of every hit
-    /// document as separate hits (`grep -n` style, SPEC-P9 §19): a file's
+    /// document as separate hits (`grep -n` style): a file's
     /// lines share its score and come out ascending, files stay in ranked
     /// order. `per_doc == 1` is `search` (the densest line per file).
     pub fn search_lines(&self, q: &Query, limit: usize, per_doc: usize) -> SearchResult {
@@ -1522,7 +1520,7 @@ impl Engine {
 
     /// Exact symbol lookup across shards; falls back to substring matching
     /// (score 1.0) when the exact lookup is empty. Exact-name entries score
-    /// 10.0 (SPEC: find_symbol).
+    /// 10.0 (find_symbol).
     pub fn find_symbol(&self, name: &str, limit: usize) -> Vec<SearchHit> {
         let mut hits = self.symbol_hits(name, 10.0);
         if hits.is_empty() {
@@ -1606,7 +1604,7 @@ impl Engine {
         out
     }
 
-    /// Indexed file paths matching `pattern` (SPEC-P8 `list_files`): a glob
+    /// Indexed file paths matching `pattern` (`list_files`): a glob
     /// when it contains `*` or `?` (`**` crosses directories, `*`/`?` do
     /// not; anchored, case-insensitive), otherwise a case-insensitive
     /// substring. Optionally restricted to one repo. Sorted by (repo, path);
@@ -1662,11 +1660,11 @@ impl Engine {
     }
 
     /// Callers of `name`: one hit per call posting (snippet = call line,
-    /// score 1.0; SPEC: who_calls).
+    /// score 1.0).
     pub fn who_calls(&self, name: &str, limit: usize) -> Vec<SearchHit> {
         let postings = self.set.call_postings(name);
         // name-based edges judged by their qualifier against the
-        // definitions (SPEC-P9 §20): `tokio::spawn(` is not a call of the
+        // definitions: `tokio::spawn(` is not a call of the
         // repo's `spawn`
         let shape = self.root_shape(name);
         // Every hit scores 1.0, so the answer is the first `limit` plausible
@@ -1771,13 +1769,13 @@ impl Engine {
         })
     }
 
-    /// Semantic search (SPEC-P2 §4): embed `q` with `embedder`, run
+    /// Semantic search: embed `q` with `embedder`, run
     /// `VecIndex::search` over `<data_dir>/vec/<model_id>.civec`, map rows
     /// back to hits (repo/path/start_line from the row meta, snippet = up to
     /// 2 lines around start_line via shard content lookup, score = cosine).
     ///
-    /// SPEC-P5 §A4: query text is stopword-stripped (`clean_query`) before
-    /// embedding. (SPEC-P5 §B2 hook: the embedder's query expansion wraps
+    /// query text is stopword-stripped (`clean_query`) before
+    /// embedding. (The embedder's query expansion wraps
     /// this exact call site.)
     ///
     /// Graceful degradation: returns an empty vec (not an error) when the
@@ -1792,7 +1790,7 @@ impl Engine {
     }
 
     /// [`search_semantic`](Self::search_semantic) restricted to rows of
-    /// `repo` when given (SPEC-P10): the vector prescan skips other repos'
+    /// `repo` when given: the vector prescan skips other repos'
     /// rows, so a small repo (the session transcripts, say) is searched at
     /// full depth instead of competing with the whole corpus for the pool.
     pub fn search_semantic_in(
@@ -1808,7 +1806,7 @@ impl Engine {
         if k == 0 {
             return Ok(Vec::new());
         }
-        // SPEC-P5 A4+B2 integration: stopword-strip, then thesaurus-expand,
+        // Stopword-strip, then thesaurus-expand,
         // then embed. search_hybrid's semantic leg flows through here.
         let cleaned = clean_query(q);
         if cleaned.is_empty() {
@@ -1817,7 +1815,7 @@ impl Engine {
         let t = Instant::now();
         // Thesaurus expansion is opt-in (INDEXIO_EXPAND=1): on 80
         // model-written questions it cost the semantic leg 9 points of
-        // recall@5 and hybrid 4 (SPEC-P10 §18), and its first-time
+        // recall@5 and hybrid 4, and its first-time
         // vocabulary scan was the slowest part of a cold hybrid query.
         let expanded = if std::env::var("INDEXIO_EXPAND").is_ok_and(|v| !v.trim().is_empty()) {
             embedder.expand_query(&cleaned)
@@ -1846,10 +1844,10 @@ impl Engine {
         Ok(hits)
     }
 
-    /// Chunk-BM25F leg (SPEC-P5 §A3): `ChunkBm25::search` over
+    /// Chunk-BM25F leg: `ChunkBm25::search` over
     /// `<data_dir>/bm25/<model_id>.cibm25`, disjunctive and scored — the
     /// natural-language lexical leg. Rows are resolved through the
-    /// row-aligned VecIndex of the same namespace (SPEC-P5 §A2 invariant).
+    /// row-aligned VecIndex of the same namespace.
     ///
     /// Graceful degradation: empty vec when the engine has no data dir, or
     /// the BM25 sidecar / vec index does not exist for this model yet.
@@ -1889,7 +1887,7 @@ impl Engine {
         Ok(hits)
     }
 
-    /// Hybrid search (SPEC-P2 §4 / SPEC-P5 §A3): delegates to
+    /// Hybrid search: delegates to
     /// [`Engine::search_hybrid_fused`] with `FusionAlgo::Rrf` (3 legs).
     pub fn search_hybrid(
         &self,
@@ -1900,7 +1898,7 @@ impl Engine {
         self.search_hybrid_fused(q, limit, embedder, FusionAlgo::Rrf)
     }
 
-    /// 3-leg hybrid with a selectable fusion algorithm (SPEC-P5 §A3):
+    /// 3-leg hybrid with a selectable fusion algorithm:
     ///   1. file-lexical: the existing conjunctive search (fires on
     ///      identifier/regex queries; a query that fails lexical parse
     ///      contributes no lexical list),
@@ -1921,7 +1919,7 @@ impl Engine {
     }
 
     /// [`search_hybrid_fused`](Self::search_hybrid_fused) with every leg
-    /// restricted to `repo` when given (SPEC-P10; `recall` uses it for the
+    /// restricted to `repo` when given (`recall` uses it for the
     /// session transcripts).
     pub fn search_hybrid_in(
         &self,
@@ -1938,7 +1936,7 @@ impl Engine {
             None => q.to_string(),
         };
         // The three legs are independent reads: run them concurrently
-        // (SPEC-P9); wall time is the slowest leg, not the sum.
+        //; wall time is the slowest leg, not the sum.
         let (lex, (bm, sem)) = rayon::join(
             || match parse(&lex_q) {
                 Ok(query) => self.search(&query, n).hits,
@@ -1962,7 +1960,7 @@ impl Engine {
         ))
     }
 
-    /// Hybrid then rerank (SPEC-P3 §2): delegates to
+    /// Hybrid then rerank: delegates to
     /// [`Engine::search_hybrid_fused_reranked`] with `FusionAlgo::Rrf`.
     pub fn search_hybrid_reranked(
         &self,
@@ -1974,7 +1972,7 @@ impl Engine {
         self.search_hybrid_fused_reranked(q, limit, embedder, reranker, FusionAlgo::Rrf)
     }
 
-    /// Hybrid then rerank (SPEC-P3 §2 + SPEC-P5 §A3): the fused top
+    /// Hybrid then rerank: the fused top
     /// `max(limit*3, 30)` candidates (fusion algorithm `algo`) are reranked
     /// by `reranker` against doc text `path + "\n" + snippet`, reordered by
     /// rerank score (ties — and docs missing from the reranker's output —
@@ -2030,7 +2028,7 @@ impl Engine {
     /// The single registered repo an explicit `repo:X` token in `q` names
     /// (case-insensitive substring, like the lexical filter; the `sessions`
     /// source counts); `None` without a token or when it matches several
-    /// repos. Scopes every hybrid/semantic leg (SPEC-P10 §9), not only the
+    /// repos. Scopes every hybrid/semantic leg, not only the
     /// lexical one.
     pub fn repo_scope(&self, q: &str) -> Option<String> {
         let want = q.split_whitespace().find_map(|t| t.strip_prefix("repo:"))?.to_ascii_lowercase();
@@ -2042,7 +2040,7 @@ impl Engine {
             names.push("sessions".to_string());
         }
         // an exact name wins: `repo:indexio` must not fall back to every
-        // repo because `themlisten_indexio` contains it too
+        // repo because `acme_indexio` contains it too
         if let Some(exact) = names.iter().find(|n| n.to_ascii_lowercase() == want) {
             return Some(exact.clone());
         }
@@ -2119,7 +2117,7 @@ fn galloping_intersect(a: &[DocRef], b: &[DocRef]) -> Vec<DocRef> {
     out
 }
 
-/// BM25-lite term score (SPEC step 6).
+/// BM25-lite term score.
 fn bm25(n: f64, df: f64, tf: f64, dl: f64, avgdl: f64) -> f64 {
     let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
     let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl));
@@ -2169,7 +2167,7 @@ fn snippet_line(content: &[u8], line: u32) -> String {
 /// vector is near the corpus mean, so it matches every query weakly and
 /// shows as a row reading `}`.
 fn semantic_snippet(content: &[u8], start_line: u32, end_line: u32) -> Option<(u32, String)> {
-    // SPEC-P9: a chunk's first line is often a shebang, a comment banner, an
+    // a chunk's first line is often a shebang, a comment banner, an
     // attribute, a decorator or a lone `}`; point the hit at the first line
     // that looks like code, scanning a few lines past the chunk end if the
     // chunk itself has none, and fall back to the first line.
@@ -2431,7 +2429,7 @@ mod tests {
         (tmp, engine)
     }
 
-    /// `repo:indexio` names `indexio` although `themlisten_indexio` contains
+    /// `repo:indexio` names `indexio` although `acme_indexio` contains
     /// it too; a unique substring still scopes, an ambiguous one does not.
     #[test]
     fn repo_scope_prefers_an_exact_name() {
@@ -2440,12 +2438,12 @@ mod tests {
         std::fs::create_dir_all(&shards).unwrap();
         let doc = |p: &'static str| Doc { path: p, lang: Lang::Rust, content: "fn a() {}\n".into(), symbols: vec![], calls: vec![] };
         write_shard(&shards, &[doc("a.rs")], &["indexio".to_string()]);
-        write_shard(&shards, &[doc("b.rs")], &["themlisten_indexio".to_string()]);
+        write_shard(&shards, &[doc("b.rs")], &["acme_indexio".to_string()]);
         write_shard(&shards, &[doc("c.rs")], &["indexio_extra".to_string()]);
         let e = Engine::open(tmp.path()).unwrap();
         assert_eq!(e.repo_scope("x repo:indexio").as_deref(), Some("indexio"));
         assert_eq!(e.repo_scope("x repo:IndexIO").as_deref(), Some("indexio"));
-        assert_eq!(e.repo_scope("x repo:themlisten").as_deref(), Some("themlisten_indexio"));
+        assert_eq!(e.repo_scope("x repo:acme").as_deref(), Some("acme_indexio"));
         assert_eq!(e.repo_scope("x repo:index"), None);
         assert_eq!(e.repo_scope("x"), None);
     }
@@ -2541,7 +2539,7 @@ mod tests {
         assert_eq!(h.lang, Lang::Rust);
     }
 
-    /// Regression (SPEC-P6): a regex's required literals are one-per-branch
+    /// Regression: a regex's required literals are one-per-branch
     /// alternatives, so docs containing only ONE branch must still match.
     #[test]
     fn regex_alternation_prefixes_are_disjunctive() {
@@ -2774,7 +2772,7 @@ mod tests {
         assert!(s.index_bytes > 0);
     }
 
-    // ---- semantic plane (SPEC-P2 §4/§5) -----------------------------------
+    // ---- semantic plane -----------------------------------
 
     use indexio_embed::embed::HashEmbedder;
     use indexio_embed::pipeline::embed_repo;
@@ -2979,7 +2977,7 @@ mod tests {
         }
     }
 
-    // ---- reranker stage (SPEC-P3 §2) -------------------------------------
+    // ---- reranker stage -------------------------------------
 
     /// Same 2-repo fixture as `search_hybrid_merges_lexical_and_semantic`:
     /// alpha/src/hybrid.rs wins RRF (in both lists), beta/src/concepts.rs
@@ -3074,7 +3072,7 @@ mod tests {
         );
     }
 
-    // ---- SPEC-P5 §A3/A4: 3-leg fusion, fusion algos, query cleaning -----
+    // ---- 3-leg fusion, fusion algos, query cleaning -----
 
     #[test]
     fn fusion_algo_parsing() {
@@ -3102,7 +3100,7 @@ mod tests {
         assert_eq!(parse("the").unwrap().literals.len(), 1);
     }
 
-    /// CombMNZ on constructed lists (SPEC-P5 §A3 test): min-max
+    /// CombMNZ on constructed lists: min-max
     /// normalization per leg, flat legs map to 1.0, sum x #legs (MNZ).
     #[test]
     fn combmnz_correctness_constructed_lists() {
@@ -3138,7 +3136,7 @@ mod tests {
         assert_eq!(order, ["q.rs", "p.rs", "r.rs"]);
     }
 
-    /// 3-leg fusion on constructed lists (SPEC-P5 §A3 test): a doc present
+    /// 3-leg fusion on constructed lists: a doc present
     /// ONLY in the bm25 leg still surfaces, and a doc in all 3 legs beats a
     /// doc in fewer legs.
     #[test]
@@ -3176,7 +3174,7 @@ mod tests {
         assert!(fused[0].rrf > one.rrf, "3 legs > 2 legs");
     }
 
-    /// Engine-level 3-leg test (SPEC-P5 §A3): the disjunctive BM25 leg
+    /// Engine-level 3-leg test: the disjunctive BM25 leg
     /// surfaces a doc the conjunctive lexical leg rejects (missing one
     /// literal); the doc matching all legs wins; an unrelated doc rides
     /// only the semantic leg. Runs under both fusion algos.

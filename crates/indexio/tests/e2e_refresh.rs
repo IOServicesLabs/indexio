@@ -1,5 +1,5 @@
-//! End-to-end test for the MCP server's working-tree auto-refresh (SPEC-P9)
-//! with the semantic plane embedded off the call path (SPEC-P10 §37): an
+//! End-to-end test for the MCP server's working-tree auto-refresh
+//! with the semantic plane embedded off the call path: an
 //! edit is visible to the lexical tools on the very next call, and to
 //! semantic search shortly after, without a refresh_index call. Requires
 //! `git` on PATH. Fully offline (built-in embedder).

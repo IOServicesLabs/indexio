@@ -1,4 +1,4 @@
-//! Flat, memory-mappable rindex model file (SPEC-P10).
+//! Flat, memory-mappable rindex model file.
 //!
 //! The bincode model (`Vec<(term, df, ctx)>`) had to be read and
 //! deserialised whole — 250 MB of reads and ~300 MB of heap per server

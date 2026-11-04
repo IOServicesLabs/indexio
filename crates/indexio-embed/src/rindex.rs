@@ -1,4 +1,4 @@
-//! Random-indexing semantic model v2 (SPEC-P4 §2, upgraded per SPEC-P5 B1):
+//! Random-indexing semantic model v2:
 //! a self-contained, CPU-only embedder that learns corpus-native semantics
 //! in-process. No model downloads, no GPU, no external services.
 //!
@@ -10,7 +10,7 @@
 //! with. Chunk/query embedding = idf-weighted sum of its tokens' context
 //! vectors plus a small label component, L2-normalized.
 //!
-//! SPEC-P5 B1 changes over v1:
+//! Changes over v1:
 //! - dim 1024 -> **2048**, 6 -> **8 nonzeros** per label (Sahlgren consensus).
 //! - **True coordinate permutations** π/π' (xorshift64 Fisher-Yates seeded
 //!   from blake3(b"ri-perm-v2")) replace the ±1 dim rotation: left context
@@ -21,9 +21,9 @@
 //!   tokens before the first newline are weighted 2.5 in the pooling sum.
 //! - model_id "rindex-v2"; `open()` loads only `sem/rindex-v2.rimodel` (v1
 //!   files are ignored). Migration from v1: `indexio embed --rebuild-model`.
-//! - SPEC-P5 B2: `nearest_tokens` / `expand_query` thesaurus expansion.
+//! - `nearest_tokens` / `expand_query` thesaurus expansion.
 //!
-//! Documented design choices (SPEC-P4 §2 invites documenting them):
+//! Design choices:
 //! - **min-df 2** is enforced as the *eviction priority* at the vocabulary
 //!   cap (lowest-df types are dropped first, so singleton contexts are the
 //!   first to go) rather than as an online gate on accumulation. Rationale:
@@ -65,9 +65,9 @@ use rayon::prelude::*;
 use crate::embed::{l2_normalize, Embedder};
 use crate::rimodel::{self, Comp, Snapshot};
 
-/// Vector dimension (SPEC-P5 B1).
+/// Vector dimension.
 pub const DIM: usize = 2048;
-/// Nonzero components per sparse ternary label vector (SPEC-P5 B1).
+/// Nonzero components per sparse ternary label vector.
 const LABEL_NONZEROS: usize = 8;
 /// Context window radius: distances 1..=3.
 const CTX_RADIUS: i64 = 3;
@@ -76,10 +76,10 @@ const CTX_RADIUS: i64 = 3;
 const CTX_TOP: usize = 128;
 /// Weight of the label component in `embed`.
 const LABEL_WEIGHT: f32 = 0.25;
-/// Header field weight (SPEC-P5 B1): tokens before the first '\n' of a
+/// Header field weight: tokens before the first '\n' of a
 /// chunk text count 2.5x in the pooling sum (BM25F/SIF evidence).
 const HEADER_WEIGHT: f32 = 2.5;
-/// Hub-cut absolute floor (SPEC-P5 B1): tokens with df strictly greater
+/// Hub-cut absolute floor: tokens with df strictly greater
 /// than max(HUB_DF_FLOOR, 40% of n_texts_seen) are excluded at embed time.
 const HUB_DF_FLOOR: u64 = 100;
 /// Hard vocabulary cap (types), by frequency.
@@ -89,7 +89,7 @@ const MODEL_ID: &str = "rindex-v2";
 const MODEL_FILE: &str = "rindex-v2.rimodel";
 
 // ---------------------------------------------------------------------------
-// Tokenizer (pub for tests, SPEC-P4 §2)
+// Tokenizer (pub for tests)
 // ---------------------------------------------------------------------------
 
 /// One token occurrence in the final token stream: the term, its weight,
@@ -205,7 +205,7 @@ type Label = [(u32, f32); LABEL_NONZEROS];
 /// Process-wide label cache. `label()` is pure but costs a blake3 XOF, a
 /// 2 KiB scratch array and a sort per call, and `observe` visits every
 /// token once per neighbor (6x) — this cache is the single largest win in
-/// the embed pipeline (SPEC-P6 perf note). Bounded to keep memory sane on
+/// the embed pipeline. Bounded to keep memory sane on
 /// pathological vocabularies; misses past the bound just recompute.
 fn label_cached(term: &str) -> Label {
     const CACHE_MAX: usize = 2_000_000;
@@ -248,7 +248,7 @@ fn label(term: &str) -> Label {
 }
 
 // ---------------------------------------------------------------------------
-// Direction permutations (SPEC-P5 B1, Random Permutation Model)
+// Direction permutations (Random Permutation Model)
 // ---------------------------------------------------------------------------
 
 /// Minimal xorshift64 PRNG (Marsaglia) — deterministic across platforms.
@@ -279,7 +279,7 @@ fn build_permutation(seed_bytes: [u8; 8]) -> [u32; DIM] {
     perm.try_into().expect("permutation has exactly DIM entries")
 }
 
-/// The two direction permutations (SPEC-P5 B1): left context applies
+/// The two direction permutations: left context applies
 /// PERM_LEFT (π), right context applies PERM_RIGHT (π') to the neighbor's
 /// label dims. Both derive from blake3(b"ri-perm-v2"): π from digest bytes
 /// 0..8, π' from bytes 8..16.
@@ -362,7 +362,7 @@ fn compute_update(text: &str) -> TextUpdate {
                     continue;
                 }
                 let w = 1.0f32 / (1.0 + d as f32);
-                // Right context applies π', left applies π (SPEC-P5 B1).
+                // Right context applies π', left applies π.
                 let perm = if side > 0 { perm_right } else { perm_left };
                 for &ri in &by_pos[j as usize] {
                     let lab = permute(&labels[ri], perm);
@@ -401,7 +401,7 @@ fn compute_update(text: &str) -> TextUpdate {
 /// Number of vocabulary shards (parallel apply in `observe`).
 const VOCAB_SHARDS: usize = 32;
 
-/// The vocabulary (SPEC-P10): a memory-mapped, immutable snapshot
+/// The vocabulary: a memory-mapped, immutable snapshot
 /// ([`Snapshot`], the file on disk) plus an in-memory overlay of the entries
 /// changed since it was written. A lookup checks the overlay first; a save
 /// merges the two into a new snapshot and empties the overlay. The overlay
@@ -588,7 +588,7 @@ struct Entry {
 
 struct Model {
     n_texts_seen: u64,
-    /// Sharded hash map (SPEC-P6 perf); every iteration site sorts
+    /// Sharded hash map; every iteration site sorts
     /// (`to_disk`, `nearest`, `enforce_cap`) so results stay deterministic.
     vocab: Vocab,
 }
@@ -602,7 +602,7 @@ impl Default for Model {
     }
 }
 
-/// The pre-P10 on-disk format (SPEC-P4 §2): bincode of { dim, n_texts_seen,
+/// The older on-disk format: bincode of { dim, n_texts_seen,
 /// vocab }. Still read (and converted to a snapshot on the first save).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ModelDisk {
@@ -633,8 +633,8 @@ impl Model {
     /// Write the merged vocabulary as a snapshot at `path` and continue on
     /// top of it (empty overlay).
     ///
-    /// Several servers share one model file (one per session, SPEC-P10
-    /// §19): each saves its own overlay, so before merging, the base is
+    /// Several servers share one model file (one per session):
+    /// each saves its own overlay, so before merging, the base is
     /// rebased onto whatever snapshot is on disk now if another writer got
     /// there first — its terms survive, ours are applied on top (a term
     /// both changed keeps ours; `n_texts_seen` adds our share). Without
@@ -684,7 +684,7 @@ impl Model {
             });
     }
 
-    /// Hub-cut threshold (SPEC-P5 B1): tokens with df strictly above this
+    /// Hub-cut threshold: tokens with df strictly above this
     /// contribute nothing (label or context) at embed/expansion time.
     fn hub_cutoff(&self) -> u64 {
         (self.n_texts_seen * 2 / 5).max(HUB_DF_FLOOR)
@@ -703,7 +703,7 @@ impl Model {
     /// idf — generic central files outrank the distinctive ones. Label
     /// vectors are fixed-magnitude (LABEL_NONZEROS nonzeros) and stay as-is.
     ///
-    /// SPEC-P5 B1 on top of the P4 formula:
+    /// On top of the base formula:
     /// - Hub cut: tokens with df > max(100, 40% n_texts_seen) are skipped
     ///   entirely (label AND context excluded), evaluated at embed time.
     /// - Header field weighting: the text is split at the first '\n' into
@@ -786,7 +786,7 @@ impl Model {
     }
 
     /// [`nearest`](Self::nearest) for several tokens in ONE pass over the
-    /// vocabulary (SPEC-P9): the per-entry work — hub/df gate and the
+    /// vocabulary: the per-entry work — hub/df gate and the
     /// entry's own norm — is paid once for the whole query instead of once
     /// per term, and each query term's norm is computed once, not once per
     /// entry. Results are per input token, in order; unknown tokens or
@@ -807,7 +807,7 @@ impl Model {
         if queries.iter().all(Option::is_none) {
             return vec![Vec::new(); tokens.len()];
         }
-        // Full-vocabulary scan (SPEC-P6 perf: this was ~700 ms per query on
+        // Full-vocabulary scan (this was ~700 ms per query on
         // a 250k-term vocabulary): the overlay shards and ranges of the
         // snapshot in parallel; the final sort makes the result independent
         // of shard/thread order.
@@ -895,7 +895,7 @@ impl Model {
 // RandomIndexingEmbedder
 // ---------------------------------------------------------------------------
 
-/// Random-indexing semantic model + embedder (SPEC-P4 §2, SPEC-P5 B1/B2).
+/// Random-indexing semantic model + embedder.
 /// `model_id() == "rindex-v2"`, `dim() == 2048`.
 /// Model file: `<data_dir>/sem/rindex-v2.rimodel` (bincode, tmp+rename
 /// atomic; corrupt file -> start empty with a tracing::warn; dim mismatch
@@ -906,11 +906,11 @@ pub struct RandomIndexingEmbedder {
     model: RwLock<Model>,
     path: PathBuf,
     cap: usize,
-    /// Thesaurus neighbours per query term (SPEC-P9): `nearest` is a full
+    /// Thesaurus neighbours per query term: `nearest` is a full
     /// vocabulary scan (~10 ms per term on 250k types), and agents repeat
     /// topic words across a session. Cleared whenever the model changes.
     expand_cache: RwLock<HashMap<String, Vec<(String, f32)>>>,
-    /// Lazy persistence (SPEC-P9): a long-lived server observes a few
+    /// Lazy persistence: a long-lived server observes a few
     /// chunks per edit, and serialising the ~250 MB model each time would
     /// dominate the refresh. With `lazy_flush` set, `flush` only writes
     /// when the model changed and the last save is older than the
@@ -946,7 +946,7 @@ impl RandomIndexingEmbedder {
         let path = Self::model_path(data_dir);
         rimodel::reap_parked(&path);
         let model = if path.is_file() && rimodel::is_snapshot(&path) {
-            // SPEC-P10: mapped, nothing read up front
+            // mapped, nothing read up front
             let snap = Snapshot::open(&path)?;
             if snap.dim() as usize != DIM {
                 anyhow::bail!(
@@ -962,7 +962,7 @@ impl RandomIndexingEmbedder {
             match std::fs::read(&path) {
                 Ok(bytes) => match bincode::deserialize::<ModelDisk>(&bytes) {
                     Ok(disk) if disk.dim as usize == DIM => {
-                        // pre-P10 bincode: load it once and convert to a
+                        // older bincode: load it once and convert to a
                         // snapshot, so the next open maps it
                         let mut m = Model::from_disk(disk);
                         match m.save_snapshot(&path) {
@@ -972,7 +972,7 @@ impl RandomIndexingEmbedder {
                         m
                     }
                     Ok(disk) => {
-                        // SPEC-P5 B1: persist+verify dim; a v2 file with the
+                        // persist+verify dim; a v2 file with the
                         // wrong dim is a version mixup, not corruption.
                         anyhow::bail!(
                             "rindex model {} has dim {} != expected {} \
@@ -995,7 +995,7 @@ impl RandomIndexingEmbedder {
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             }
         };
-        // Persisted query expansions (SPEC-P9): the thesaurus scan costs
+        // Persisted query expansions: the thesaurus scan costs
         // ~20 ms per new query word, and sessions repeat vocabulary.
         let expand_cache: HashMap<String, Vec<(String, f32)>> = std::fs::read(Self::expand_path(&path))
             .ok()
@@ -1033,7 +1033,7 @@ impl RandomIndexingEmbedder {
             .len()
     }
 
-    /// SPEC-P5 B2: nearest vocabulary tokens by context-vector cosine,
+    /// nearest vocabulary tokens by context-vector cosine,
     /// sim >= `min_sim`, descending (ties by term). Hub-cut tokens and
     /// `token` itself are excluded.
     pub fn nearest_tokens(&self, token: &str, k: usize, min_sim: f32) -> Vec<(String, f32)> {
@@ -1043,7 +1043,7 @@ impl RandomIndexingEmbedder {
             .nearest(token, k, min_sim)
     }
 
-    /// SPEC-P5 B2: thesaurus query expansion. For each content token of
+    /// thesaurus query expansion. For each content token of
     /// the query (unigram, len >= 3, df >= 2, not hub-cut, not a
     /// stopword), append its top-3 nearest neighbors (min_sim 0.35) once
     /// each, after the original query text. Deterministic.
@@ -1061,8 +1061,8 @@ impl RandomIndexingEmbedder {
             originals.push(t.term);
         }
         let mut out = query.to_string();
-        // Content-token gate (SPEC-P5 B2), then one vocabulary scan for
-        // every term the cache does not know yet (SPEC-P9).
+        // Content-token gate, then one vocabulary scan for
+        // every term the cache does not know yet.
         let eligible: Vec<&String> = originals
             .iter()
             .filter(|term| {
@@ -1124,7 +1124,7 @@ impl RandomIndexingEmbedder {
 
     /// Unconditional save (what `flush` does in eager mode): the overlay
     /// and the snapshot are merged into a new snapshot file, which becomes
-    /// the base (SPEC-P10). Holds the write lock so no observe lands
+    /// the base. Holds the write lock so no observe lands
     /// between the merge and the swap.
     pub fn save_now(&self) -> anyhow::Result<()> {
         let mut m = self.model.write().expect("rindex model lock poisoned");
@@ -1241,7 +1241,7 @@ impl Embedder for RandomIndexingEmbedder {
     /// Eager mode saves here (the CLI's `embed`/`sync`). Lazy mode (the
     /// server) never saves inline: the 250 MB snapshot merge used to land
     /// inside whichever tool call first embedded after the interval — a
-    /// 2.7 s and a 5.7 s `read_span` in one afternoon (SPEC-P10 §30). The
+    /// 2.7 s and a 5.7 s `read_span` in one afternoon. The
     /// server asks [`save_due`](Self::save_due) and runs
     /// [`persist`](Self::persist) on its own thread.
     fn flush(&self) -> anyhow::Result<()> {
@@ -1268,7 +1268,7 @@ impl Embedder for RandomIndexingEmbedder {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (SPEC-P4 §2)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1280,7 +1280,7 @@ mod tests {
         toks.iter().map(|t| (t.term.as_str(), t.weight)).collect()
     }
 
-    /// SPEC-P10 §30: a lazily persisted model is never written inside
+    /// a lazily persisted model is never written inside
     /// `flush`; it reports when a save is due and `persist` writes it.
     #[test]
     fn lazy_flush_defers_the_save_to_persist() {
@@ -1365,7 +1365,7 @@ mod tests {
         assert_ne!(label("database"), label("authentication"));
     }
 
-    /// SPEC-P5 B1: the direction permutations are deterministic, true
+    /// the direction permutations are deterministic, true
     /// permutations of 0..DIM, non-identity, and distinct from each other.
     #[test]
     fn permutations_deterministic_and_distinct() {
@@ -1436,8 +1436,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let e = fresh(tmp.path());
         assert_eq!(e.dim(), DIM);
-        assert_eq!(DIM, 2048, "SPEC-P5 B1: dim 2048");
-        assert_eq!(LABEL_NONZEROS, 8, "SPEC-P5 B1: 8 nonzeros per label");
+        assert_eq!(DIM, 2048, "dim 2048");
+        assert_eq!(LABEL_NONZEROS, 8, "8 nonzeros per label");
         assert_eq!(e.model_id(), "rindex-v2");
         let texts: Vec<String> = CORPUS.iter().map(|s| s.to_string()).collect();
         e.observe(&texts).unwrap();
@@ -1452,7 +1452,7 @@ mod tests {
         assert!(z.iter().all(|&x| x == 0.0));
     }
 
-    /// SPEC-P4 §2 critical test: semantic transfer across chunks with zero
+    /// Critical test: semantic transfer across chunks with zero
     /// lexical overlap. After observing chunks A {login password session},
     /// B {database pool connection}, C {authentication login oauth}, the
     /// query "authentication" must rank A above B even though A shares no
@@ -1567,7 +1567,7 @@ mod tests {
 
     #[test]
     fn two_writers_keep_each_others_terms() {
-        // SPEC-P10 §19: two servers on one data dir observe different
+        // two servers on one data dir observe different
         // texts and save in turn; the second save must not drop the first
         let tmp = tempfile::tempdir().unwrap();
         let a = fresh(tmp.path());
@@ -1631,7 +1631,7 @@ mod tests {
         assert!(df2 >= 40, "df>=2 types retained: {df2}");
     }
 
-    /// Pipeline integration (SPEC-P4 §2): embed_repo on a 2-repo fixture
+    /// Pipeline integration: embed_repo on a 2-repo fixture
     /// with the rindex embedder writes the model file, CAS-dedups shared
     /// chunks, and builds the rindex-v2 vec index.
     #[test]
@@ -1692,7 +1692,7 @@ mod tests {
         assert!(RandomIndexingEmbedder::model_path(tmp.path()).is_file());
         assert!(fresh(tmp.path()).vocab_len() > 0);
 
-        // rindex recomputes instead of caching vectors (SPEC-P10): the
+        // rindex recomputes instead of caching vectors: the
         // shared chunks are misses the cache knows, so they are embedded
         // again but not observed again
         let rep2 = embed_repo(&shards, tmp.path(), "r2", &e).unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // SPEC-P5 B1/B2 tests
+    // v2 model and expansion tests
     // ---------------------------------------------------------------------
 
     /// Bridge corpus: "authentication" and "login" co-occur with shared
@@ -1749,7 +1749,7 @@ mod tests {
         e
     }
 
-    /// SPEC-P5 B1: a token with df > max(100, 40% n_texts_seen) is cut at
+    /// a token with df > max(100, 40% n_texts_seen) is cut at
     /// embed time — its label AND context contribute nothing.
     #[test]
     fn hub_cut_excludes_token_at_embed_time() {
@@ -1802,7 +1802,7 @@ mod tests {
         );
     }
 
-    /// SPEC-P5 B1: header tokens (before the first '\n') weigh 2.5 in the
+    /// header tokens (before the first '\n') weigh 2.5 in the
     /// pooling sum, so a probe term placed in the header aligns
     /// measurably better than the same term placed in the body.
     #[test]
@@ -1840,7 +1840,7 @@ mod tests {
         assert!((dot(&v_body, &v_body).sqrt() - 1.0).abs() < 1e-4);
     }
 
-    /// SPEC-P5 B2: nearest_tokens finds corpus synonyms by context-vector
+    /// nearest_tokens finds corpus synonyms by context-vector
     /// cosine (login <-> authentication over the bridge fixture), filters
     /// by min_sim, and excludes the query token itself and hub-cut tokens.
     #[test]
@@ -1873,7 +1873,7 @@ mod tests {
         assert!(e.nearest_tokens("zzqjv-never-seen", 5, 0.0).is_empty());
     }
 
-    /// SPEC-P5 B2: expand_query appends top-3 nearest neighbors (min_sim
+    /// expand_query appends top-3 nearest neighbors (min_sim
     /// 0.35) of each content token after the original query text, deduped;
     /// stopwords / df<2 / short tokens are not expanded.
     #[test]
@@ -1910,7 +1910,7 @@ mod tests {
         assert!(x2.split_whitespace().any(|w| w == "login"), "{x2:?}");
     }
 
-    /// SPEC-P5 B2 end-to-end: semantic search WITH expansion finds the
+    /// End-to-end: semantic search WITH expansion finds the
     /// zero-lexical-overlap chunk whose only path from the query token is
     /// a 2-hop bridge (query "authentication" -> expansion neighbor
     /// "login" -> chunk "login password session").
@@ -1973,7 +1973,7 @@ mod tests {
         );
     }
 
-    /// SPEC-P5 B2: expansion is bit-for-bit deterministic across fresh
+    /// expansion is bit-for-bit deterministic across fresh
     /// embedders and across flush/reload.
     #[test]
     fn expansion_determinism_bitforbit() {
@@ -1999,7 +1999,7 @@ mod tests {
         assert_eq!(v_before, e3.embed(&[after]).unwrap());
     }
 
-    /// SPEC-P5 B1: open() verifies the persisted dim (2048) and errors on
+    /// open() verifies the persisted dim (2048) and errors on
     /// a mismatch; v1 model files are ignored (clean break).
     #[test]
     fn dim_mismatch_errors_and_v1_ignored() {

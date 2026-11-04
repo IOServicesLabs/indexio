@@ -1,4 +1,4 @@
-//! Chunk-level BM25F sidecar (SPEC-P5 §A1), aligned row-for-row with the
+//! Chunk-level BM25F sidecar, aligned row-for-row with the
 //! vector index of the same namespace (`<dir>/<ns>.cibm25` next to
 //! `<data_dir>/vec/<model_id>.civec`; the pipeline passes
 //! `<data_dir>/bm25`).
@@ -7,7 +7,7 @@
 //! [`HEADER_WEIGHT`]) and **body** (weight 1.0). Tokenizer: the shared
 //! [`crate::rindex::tokenize`] (identifier-aware splitting, lowercasing);
 //! adjacent-bigram terms (terms containing a space) are skipped — bigram
-//! boost scoring is a SPEC-P5 non-goal.
+//! boost scoring is a non-goal.
 //!
 //! On-disk format:
 //! ```text
@@ -20,13 +20,12 @@
 //! | u64 tomb_len | bincode sorted Vec<u32> tombstones
 //! ```
 //!
-//! Documented deviations from SPEC-P5 §A1:
+//! Format notes:
 //! - The file is read with safe `std::fs::read` into owned memory at open
 //!   instead of being mmap'd, keeping this crate `#![forbid(unsafe_code)]`
 //!   (same deviation as the `.civec` index; memmap2 is only sanctioned in
 //!   indexio-index).
-//! - "u32 df-table | u32 avg fields" from the spec header sketch is realized
-//!   as `n_terms` (the df table is the per-list LEB128 df prefix inside the
+//! - The header holds `n_terms` (the df table is the per-list LEB128 df prefix inside the
 //!   postings block) plus `avg_body_len`/`avg_header_len`.
 //! - BM25F is scored with a single weighted term frequency
 //!   `tf' = tf_body + HEADER_WEIGHT * tf_header` normalized by the combined
@@ -44,7 +43,7 @@ use anyhow::{anyhow, ensure, Context};
 use memmap2::Mmap;
 
 /// A byte block that is either owned (a segment being built) or a range of
-/// a memory-mapped file (an opened segment, SPEC-P10: the sidecar used to
+/// a memory-mapped file (an opened segment: the sidecar used to
 /// be read and copied whole at every server start).
 #[derive(Clone)]
 pub enum Bytes {
@@ -71,8 +70,8 @@ use crate::embed::stopwords;
 use crate::rindex::tokenize;
 
 const MAGIC: &[u8; 8] = b"CIBM25 1";
-/// BM25F parameters (SPEC-P5 §A1): short, uniform-length chunks justify the
-/// low b (p5_dim01_lexical table: b in 0.3-0.4 for passage-like docs).
+/// BM25F parameters: short, uniform-length chunks justify the
+/// low b (b in 0.3-0.4 suits passage-like docs).
 const K1: f64 = 1.0;
 const B: f64 = 0.35;
 /// Header (path + scope line) field weight.
@@ -154,7 +153,7 @@ fn unigram_tf(text: &str) -> BTreeMap<String, u32> {
     let mut tf: BTreeMap<String, u32> = BTreeMap::new();
     for t in tokenize(text) {
         if t.term.contains(' ') {
-            continue; // adjacent-bigram term: not indexed (SPEC-P5 non-goal)
+            continue; // adjacent-bigram term: not indexed (a non-goal)
         }
         *tf.entry(t.term).or_insert(0) += 1;
     }
@@ -173,7 +172,7 @@ impl ChunkBm25 {
         Self::create_path(&file_path(dir, ns), rows)
     }
 
-    /// [`create`](Self::create) at an explicit segment path (SPEC-P9 deltas).
+    /// [`create`](Self::create) at an explicit segment path.
     pub fn create_path(path: &Path, rows: &[(String, String)]) -> anyhow::Result<()> {
         let tf_rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> = rows
             .iter()
@@ -273,7 +272,7 @@ impl ChunkBm25 {
     }
 
     /// Open one segment file by path: memory-mapped, the term dictionary
-    /// and postings block are ranges of the mapping (SPEC-P10).
+    /// and postings block are ranges of the mapping.
     ///
     /// # Safety (why the mapping is sound)
     /// `.cibm25` files are written to a temp path and renamed into place,
@@ -420,7 +419,7 @@ impl ChunkBm25 {
     /// BM25F top-k over live rows. Returns `(row, score)` sorted by score
     /// desc (ties by row asc), score > 0 only.
     ///
-    /// Query-side term processing (SPEC-P5 §A1): the shared tokenizer's
+    /// Query-side term processing: the shared tokenizer's
     /// unigram terms, deduped, minus English stopwords
     /// ([`crate::embed::stopwords`]) and minus hub terms with df > 40% of
     /// rows. Scoring: idf = ln(1 + (N - df + 0.5)/(df + 0.5)) with N = all
@@ -517,7 +516,7 @@ impl ChunkBm25 {
         n
     }
 
-    /// Persists tombstones to the `<file>.tomb` side file (SPEC-P9); the
+    /// Persists tombstones to the `<file>.tomb` side file; the
     /// segment itself is never rewritten.
     pub fn save_tombstones(&self) -> anyhow::Result<()> {
         crate::index::write_tomb_side(&self.path, &self.tombstones)
@@ -548,7 +547,7 @@ impl ChunkBm25 {
     }
 }
 
-/// Query-side term processing (SPEC-P5 §A1): the shared tokenizer's
+/// Query-side term processing: the shared tokenizer's
 /// unigram terms, deduped, minus English stopwords.
 pub fn query_terms(query: &str) -> Vec<String> {
     let stop: BTreeSet<&str> = stopwords().iter().copied().collect();
@@ -591,7 +590,7 @@ fn collect_top_where(acc: Vec<f64>, mut touched: Vec<u32>, offset: u32, k: usize
 }
 
 // ---------------------------------------------------------------------------
-// Bm25Set: the segmented sidecar (SPEC-P9), row-aligned with VecSet
+// Bm25Set: the segmented sidecar, row-aligned with VecSet
 // ---------------------------------------------------------------------------
 
 /// Segment files of `ns` in `dir`: the legacy base first, then
@@ -759,7 +758,7 @@ impl Bm25Set {
     }
 
     /// [`search`](Self::search) keeping only the global rows for which
-    /// `keep` holds (SPEC-P10: a repo-scoped leg).
+    /// `keep` holds (a repo-scoped leg).
     pub fn search_where(&self, query: &str, k: usize, keep: &dyn Fn(u32) -> bool) -> Vec<(u32, f32)> {
         if k == 0 || self.is_empty() {
             return Vec::new();
@@ -846,7 +845,7 @@ impl Bm25Set {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (SPEC-P5 §A)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -898,7 +897,7 @@ mod tests {
         assert!(bm2.search("login", 0).is_empty());
     }
 
-    /// Header field boost (SPEC-P5 §A1): a term appearing only in the
+    /// Header field boost: a term appearing only in the
     /// header (weight 3.0) beats the same term appearing only in the body
     /// at the same tf, on equal-length rows.
     #[test]
@@ -1017,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// Row-alignment invariant with VecIndex (SPEC-P5 §A2): built from the
+    /// Row-alignment invariant with VecIndex: built from the
     /// same rows in the same order, the same row-id tombstone predicate
     /// leaves both indexes with identical live sets.
     #[test]

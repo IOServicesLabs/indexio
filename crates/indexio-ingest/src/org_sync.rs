@@ -1,4 +1,4 @@
-//! GitHub organization ingestion (SPEC-P2 §3).
+//! GitHub organization ingestion.
 //!
 //! `sync_org` lists the repos of a GitHub org (paginated REST API), clones or
 //! fast-forward-updates each one into `dest_dir`, then indexes every repo with

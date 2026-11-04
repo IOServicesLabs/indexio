@@ -1,4 +1,4 @@
-//! Sources (SPEC-P7): the one-command onboarding surface.
+//! Sources: the one-command onboarding surface.
 //!
 //! A *source* is something that expands to repositories:
 //!

@@ -1,5 +1,5 @@
 //! HNSW (Hierarchical Navigable Small World) ANN graph over the f32 vectors
-//! already stored in `.civec` (SPEC-P3 §1).
+//! already stored in `.civec`.
 //!
 //! Pure safe Rust, no external dependencies. The graph is a rebuildable
 //! sidecar — deleting `.cihnsw` only costs a rebuild, and `VecIndex` falls
@@ -18,8 +18,7 @@
 //!
 //! Distance: `1 - dot` on L2-normalized vectors (cosine distance; smaller =
 //! better). Neighbor pruning uses the paper's diversity heuristic (algorithm
-//! 4, as in hnswlib's `getNeighborsByHeuristic2`, no backfill) — one of the
-//! two strategies SPEC-P3 §1 allows; see [`select_neighbors`].
+//! 4, as in hnswlib's `getNeighborsByHeuristic2`, no backfill); see [`select_neighbors`].
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -179,7 +178,7 @@ fn dist(q: &[f32], v: &[f32]) -> f32 {
 /// candidates in ascending distance to the query point and keep a candidate
 /// only if it is closer to the query than to every already-selected neighbor
 /// (a selected neighbor "covers" everything behind it). No backfill of
-/// pruned candidates — measured on the SPEC-P3 §1 recall fixture (5,000
+/// pruned candidates — measured on the recall fixture (5,000
 /// random 128-dim vectors), the pruned-connection backfill variant dropped
 /// recall@10 from 0.955 to 0.940, and `extendCandidates` added build time
 /// for zero recall gain, so both are omitted.
@@ -549,7 +548,7 @@ mod tests {
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
-    /// SPEC-P3 §1: recall@10 >= 0.95 vs exact brute force on 5,000 random
+    /// recall@10 >= 0.95 vs exact brute force on 5,000 random
     /// 128-dim L2-normalized vectors, using the production ef = max(k*10, 100).
     #[test]
     fn recall_at_10_vs_brute_force_5000x128() {
@@ -580,7 +579,7 @@ mod tests {
         );
     }
 
-    /// SPEC-P3 §1: save/load round-trip yields identical search results.
+    /// save/load round-trip yields identical search results.
     #[test]
     fn save_load_roundtrip_identical_results() {
         let tmp = tempfile::tempdir().unwrap();

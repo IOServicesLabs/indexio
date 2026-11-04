@@ -1,14 +1,13 @@
 //! indexio-index: immutable single-file shard format — writer, mmap reader,
 //! in-place tombstones, ShardSet fan-out and compaction (merge).
 //!
-//! Byte format contract: docs/SPEC.md, section "indexio-index".
+//! Byte format:
 //!   - magic "CIDXSHD1", 64-byte little-endian header, 24-byte directory
 //!     entries, sections 8-byte aligned, kinds 1..=11.
-//!   - DOCS records: SPEC lists the fields explicitly
+//!   - DOCS records:
 //!     (blob[16], u32 repo_id, u32 path_off, u32 path_len, u16 lang,
 //!     u16 flags, u64 content_off, u32 content_len, u32 raw_len); those
-//!     fields sum to 48 bytes, so DOC_REC_LEN is 48 (SPEC's "40B" label is
-//!     an arithmetic slip; the explicit field list is authoritative).
+//!     fields sum to 48 bytes, so DOC_REC_LEN is 48.
 //!   - content_off in a doc record is relative to the start of the CONTENT
 //!     section. path_off/scope_off/caller_off are relative to the STRINGS
 //!     blob (which starts after the repo table).
@@ -35,7 +34,7 @@ pub use indexio_types::codec::PostingCursor;
 
 use serde::{Deserialize, Serialize};
 
-/// META section payload: UTF-8 JSON (SPEC indexio-index).
+/// META section payload: UTF-8 JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardMeta {
     pub repos: Vec<String>,
@@ -51,7 +50,7 @@ pub struct ShardMeta {
     pub created: String,
 }
 
-/// base64 serde for `Option<Vec<u8>>` (SPEC: zstd_dict is base64 in JSON).
+/// base64 serde for `Option<Vec<u8>>` (zstd_dict is base64 in JSON).
 mod b64_opt {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Deserializer, Serializer};

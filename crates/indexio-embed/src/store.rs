@@ -1,16 +1,16 @@
-//! Embedding CAS — org-wide content-addressed embedding cache (SPEC-P2 §2.2).
+//! Embedding CAS — org-wide content-addressed embedding cache.
 //!
-//! Layout (SPEC-P6 perf revision): one append-only pack per model,
+//! Layout: one append-only pack per model,
 //! `<data_dir>/embcas/<model_id>/pack.bin`, records `[hash 16][dim u32 LE]
 //! [f32 x dim LE]`, plus `pack.idx` with `[hash 16][offset u64 LE][dim u32
 //! LE]` entries so an open costs one small sequential read instead of a
 //! directory walk. Writes are buffered and flushed by `flush()` / `Drop`.
-//! The pre-P6 one-file-per-vector layout (`<hh>/<rest>.bin`, bincode) is
+//! The older one-file-per-vector layout (`<hh>/<rest>.bin`, bincode) is
 //! still READ as a fallback so existing caches keep their hits; new
 //! vectors only ever go to the pack. Single writer per model directory
 //! (as before); the CAS is a cache — a lost put only costs a re-embed.
 //!
-//! Seen-only mode (SPEC-P10): for an embedder whose vectors are cheaper to
+//! Seen-only mode: for an embedder whose vectors are cheaper to
 //! recompute than to read back (the in-process rindex model embeds a chunk
 //! in well under a millisecond; its pack held 8 KB per chunk, 2 GB for 250k
 //! chunks — 40 % of the data dir), the cache keeps only the 16-byte chunk
@@ -76,7 +76,7 @@ impl EmbedCas {
         Self::open_mode(data_dir, model_id, false)
     }
 
-    /// Opens the CAS for `model_id` in seen-only mode (SPEC-P10): only chunk
+    /// Opens the CAS for `model_id` in seen-only mode: only chunk
     /// hashes are kept, `get` never hits, `contains` tells whether the chunk
     /// was already observed. Migrates a vector pack found in the directory.
     pub fn open_seen_only(data_dir: &Path, model_id: &str) -> Self {
@@ -250,7 +250,7 @@ impl EmbedCas {
         bincode::deserialize(&bytes).ok()
     }
 
-    /// Best-effort store (signature per SPEC-P2 returns ()). Appends to the
+    /// Best-effort store (returns ()). Appends to the
     /// pack; failures are logged, not fatal.
     pub fn put(&self, chunk_hash: &[u8; 16], vec: &[f32]) {
         let mut p = self.pack.lock().expect("embcas lock poisoned");

@@ -1,11 +1,11 @@
-//! Posting-list byte codec (SPEC: indexio-types).
+//! Posting-list byte codec (indexio-types).
 //!
 //! Format (little-endian): a posting list is a sequence of blocks of <=128
 //! docs. Per block: `u32 last_docid`, `u32 block_bytes`, then per doc entry:
 //! `varint(doc_delta_from_prev_in_block)`, `varint(pos_count)`,
 //! `pos_count` x `varint(pos_delta)`. varint = unsigned LEB128.
 //!
-//! Since SPEC-P10 the writer emits `pos_count = 0` for every entry
+//! The writer emits `pos_count = 0` for every entry
 //! ([`encode_doc_postings`]): readers only ever needed the docids. Lists
 //! written with positions by older shards still decode.
 

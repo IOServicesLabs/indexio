@@ -1,5 +1,5 @@
 //! `indexio hook bash` — a Claude Code PreToolUse hook for the Bash tool
-//! (SPEC-P9 §17).
+//!.
 //!
 //! Measured on a day of real sessions: two thirds of all tool-result
 //! tokens were `cat` / `sed -n` / `head` / `tail` and `grep` / `rg` run
@@ -824,7 +824,7 @@ fn grep_literal(needle: &str) -> String {
     out
 }
 
-/// Whether this pipeline is work the shell has to do (SPEC-P10 §26). A
+/// Whether this pipeline is work the shell has to do. A
 /// call that contains such work is allowed whole even when another of its
 /// pipelines is a servable lookup: denying it made the model re-run the
 /// work part alone — 22 of 58 Bash denials in a day were `python patch.py
@@ -1381,7 +1381,7 @@ fn bash_rewrite(exe: &Path, data_dir: &Path, command: &str, current: Option<&str
 }
 
 /// The command to run instead of `command`, when the index answers a read
-/// in it (SPEC-P11): `None` = run it as typed.
+/// in it: `None` = run it as typed.
 pub fn rewrite_bash(data_dir: &Path, cwd: &Path, command: &str, exe: &Path) -> Option<String> {
     let served = plan(data_dir, cwd, command);
     if served.is_empty() {
@@ -1740,7 +1740,7 @@ fn without_raw(command: &str) -> String {
     s.trim().to_string()
 }
 
-/// The verdict for one `Read` tool call (SPEC-P10 §16): a file the index
+/// The verdict for one `Read` tool call: a file the index
 /// holds is served by `file_outline` + `read_span` instead — a whole-file
 /// Read of a source file was the largest single result in a session hour
 /// (2,000 lines by default). `offset`/`limit` (1-based line, count) map to
@@ -1985,7 +1985,7 @@ fn repeated_denial(data_dir: &Path, session: &str, command: &str) -> bool {
 }
 
 /// Commands whose output belongs in the runs source rather than in the
-/// model's context (SPEC-P10 §31): scripts and builds that print at
+/// model's context: scripts and builds that print at
 /// length. `cargo`, `git` and the other commands rtk rewrites are left to
 /// it (its rewrite and ours would race on the same call).
 const RUNNERS: &[&str] = &[
@@ -2086,7 +2086,7 @@ fn bash_hook_answered(data_dir: &Path, input: &str) -> anyhow::Result<bool> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
     let Ok(exe) = std::env::current_exe() else { return Ok(false) };
-    // SPEC-P10 §31: a script or build runs through `indexio run`, which
+    // a script or build runs through `indexio run`, which
     // keeps a long output in the runs source and returns a digest
     if let Some(rewritten) = runner_rewrite(&exe, command) {
         println!(
@@ -2101,7 +2101,7 @@ fn bash_hook_answered(data_dir: &Path, input: &str) -> anyhow::Result<bool> {
         );
         return Ok(true);
     }
-    // SPEC-P11: a read the index answers runs as `indexio tool` in place
+    // a read the index answers runs as `indexio tool` in place
     let (dd, cmd) = (data_dir.to_path_buf(), command.to_string());
     let decided = within_budget(move || rewrite_bash(&dd, &cwd, &cmd, &exe));
     if let Some(Some(rewritten)) = decided {
@@ -2412,7 +2412,7 @@ mod tests {
         assert_eq!(without_raw("grep -n foo a.rs | head # raw"), "grep -n foo a.rs | head");
     }
 
-    /// SPEC-P10 §26: a call with a non-lookup pipeline is the shell's.
+    /// a call with a non-lookup pipeline is the shell's.
     #[test]
     fn calls_with_real_work_are_left_to_the_shell() {
         let mixed = |cmd: &str| split(cmd).iter().any(|p| is_other_work(p));
@@ -2428,7 +2428,7 @@ mod tests {
         assert!(!mixed("rtk grep -n foo src"));
     }
 
-    /// SPEC-P10 §31: scripts and builds are routed through `indexio run`;
+    /// scripts and builds are routed through `indexio run`;
     /// pipelines, redirects, rtk-handled and already-wrapped commands are not.
     #[test]
     fn runners_are_routed_through_indexio_run() {

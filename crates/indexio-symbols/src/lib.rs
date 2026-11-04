@@ -1,5 +1,4 @@
 //! indexio-symbols: tree-sitter symbol + call-site extraction.
-//! Contract: docs/SPEC.md "indexio-symbols".
 //!
 //! Strategy: one lazily-compiled `Parser`-less table per language (grammar +
 //! two tree-sitter queries). Definitions are captured as `@name` plus a
@@ -273,7 +272,7 @@ fn extract_inner(spec: &LangSpec, lang: Lang, content: &[u8]) -> (Vec<SymbolRec>
     (symbols, calls)
 }
 
-/// Shared dedup for `extract` and `outline` (SPEC-P6 §1: same symbols, same
+/// Shared dedup for `extract` and `outline` (same symbols, same
 /// lines): drop Go's generic `Type` twin of a Struct/Interface at the same
 /// (name, line), then keep the first (name, kind, line) occurrence.
 fn dedup_symbols(mut symbols: Vec<(SymbolRec, u32)>) -> Vec<(SymbolRec, u32)> {
@@ -291,11 +290,11 @@ fn dedup_symbols(mut symbols: Vec<(SymbolRec, u32)>) -> Vec<(SymbolRec, u32)> {
 }
 
 // ---------------------------------------------------------------------------
-// Outline (SPEC-P6 §1): the same definitions as `extract`, with node ranges
+// Outline: the same definitions as `extract`, with node ranges
 // ---------------------------------------------------------------------------
 
 /// One definition with its full source range (query-time view, never
-/// persisted — SPEC-P6 §1).
+/// persisted).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutlineItem {
     pub name: String,
@@ -308,7 +307,7 @@ pub struct OutlineItem {
     pub end_line: u32,
 }
 
-/// The outline of a markdown document (SPEC-P10 §38): one item per ATX
+/// The outline of a markdown document: one item per ATX
 /// heading (`#` to `######`, outside fenced code), named by its text, kind
 /// `Section`, scoped by its ancestor headings (`Install::Windows`), and
 /// spanning to the line before the next heading of the same or a higher
@@ -428,7 +427,7 @@ pub fn enclosing(items: &[OutlineItem], line: u32) -> Option<&OutlineItem> {
 // ---------------------------------------------------------------------------
 
 /// Definitions with the 1-based last line of their definition node
-/// (SPEC-P6 §1: `extract` drops it, `outline` keeps it).
+/// (`extract` drops it, `outline` keeps it).
 fn collect_symbols(
     spec: &LangSpec,
     lang: Lang,
@@ -761,7 +760,7 @@ fn go_receiver_type(content: &[u8], node: Node) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Chunking (SPEC-P2 §1) — cAST-lite semantic chunker, see src/chunking.rs.
+// Chunking — cAST-lite semantic chunker, see src/chunking.rs.
 // ---------------------------------------------------------------------------
 
 pub mod chunking;

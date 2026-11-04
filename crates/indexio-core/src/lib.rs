@@ -1,12 +1,10 @@
 //! indexio-core: n-gram extraction (sparse grams) and match verification.
-//! Contract: docs/SPEC.md. CommonGrams is fully implemented by the orchestrator;
-//! grams::extract / grams::grams_of / verify::* are implemented by the indexio-core agent.
 #![forbid(unsafe_code)]
 
 pub mod grams {
     use std::collections::HashMap;
 
-    /// Maximum document size that gets n-gram extracted (SPEC: 4 MiB).
+    /// Maximum document size that gets n-gram extracted (4 MiB).
     pub const MAX_DOC_BYTES: usize = 4 * 1024 * 1024;
     /// Maximum gram length (sparse-gram extension cap).
     pub const MAX_GRAM_LEN: usize = 8;
@@ -111,10 +109,10 @@ pub mod grams {
         Some(&text[i..i + len])
     }
 
-    /// Extract the sparse grams of `text`. See docs/SPEC.md (indexio-core).
+    /// Extract the sparse grams of `text`.
     ///
     /// Returns the distinct grams sorted by gram bytes. Positions are not
-    /// kept (SPEC-P10): the query planner intersects document sets and the
+    /// kept: the query planner intersects document sets and the
     /// verifier rescans the content, so per-occurrence offsets were never
     /// read — they only doubled the extraction work and made up 80 % of
     /// the shard and 90 % of the extraction cache. Documents larger than

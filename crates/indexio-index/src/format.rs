@@ -1,4 +1,4 @@
-//! On-disk layout constants and header encode/decode (SPEC indexio-index).
+//! On-disk layout constants and header encode/decode.
 
 use std::io;
 
@@ -9,10 +9,10 @@ pub const VERSION: u32 = 1;
 pub const HEADER_LEN: usize = 64;
 pub const DIR_ENTRY_LEN: usize = 24;
 pub const SECTION_ALIGN: u64 = 8;
-/// TOMBSTONES section is pre-sized to 64KiB (SPEC).
+/// TOMBSTONES section is pre-sized to 64KiB.
 pub const TOMBSTONES_LEN: usize = 64 * 1024;
 
-/// Section kinds (SPEC).
+/// Section kinds.
 pub mod kind {
     pub const DOCS: u32 = 1;
     pub const STRINGS: u32 = 2;
@@ -29,7 +29,7 @@ pub mod kind {
     pub const COUNT: usize = 12;
 }
 
-/// Doc record size. SPEC's explicit field list
+/// Doc record size. The field list
 /// (16+4+4+4+2+2+8+4+4) sums to 48 bytes; see crate docs.
 pub const DOC_REC_LEN: usize = 48;
 

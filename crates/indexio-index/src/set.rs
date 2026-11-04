@@ -722,7 +722,7 @@ impl ShardSet {
 
             // Invert NGRAM postings for kept docs (docids only; positions
             // an older shard may still carry are dropped here, so a
-            // compaction also shrinks pre-P10 shards).
+            // compaction also shrinks older shards).
             for (gram, off) in shard.fst_entries(kind::NGRAM_FST) {
                 let Some(payload) = shard.posting_payload(kind::NGRAM_POST, off) else {
                     continue;

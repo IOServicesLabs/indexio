@@ -1,5 +1,5 @@
 //! Secret redaction for the two sources that record what an agent saw
-//! (SPEC-P10 §39): rendered session transcripts and stored command output.
+//!: rendered session transcripts and stored command output.
 //! A session that prints its environment or a connection string puts the
 //! values into the recall index otherwise. The rules are deliberately
 //! shape-based and conservative: an assignment to a secret-looking key

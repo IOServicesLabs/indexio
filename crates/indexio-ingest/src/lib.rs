@@ -1,7 +1,5 @@
 //! indexio-ingest: git crawl (gix), global CAS, and delta re-indexing.
 //!
-//! Contract: docs/SPEC.md, section "indexio-ingest".
-//!
 //! Data dir layout:
 //!   <data_dir>/shards/           immutable shard files (indexio-index)
 //!   <data_dir>/cas/              global content-addressed store
@@ -60,11 +58,11 @@ pub struct RepoState {
     /// ISO-8601 UTC timestamp of the last successful index run.
     pub indexed_at: String,
     /// True for a plain directory (no git): indexed from the filesystem,
-    /// delta by content hash instead of by commit (SPEC-P7).
+    /// delta by content hash instead of by commit.
     #[serde(default)]
     pub plain: bool,
     /// True when the visible docs were last taken from the WORKING TREE
-    /// (SPEC-P9 `reindex_worktree`) and may differ from `last_commit`'s
+    /// (`reindex_worktree`) and may differ from `last_commit`'s
     /// tree; the next HEAD-based `reindex_repo` then reconciles by content
     /// hash instead of by tree diff.
     #[serde(default)]
@@ -98,11 +96,11 @@ pub struct IndexReport {
     pub bytes_indexed: u64,
     pub elapsed_ms: u64,
     /// Repo-relative paths whose docs were added, replaced or deleted by
-    /// this run (SPEC-P9): what the semantic plane has to re-embed.
+    /// this run: what the semantic plane has to re-embed.
     pub changed_paths: Vec<String>,
 }
 
-/// Cap for [`Lang::Text`] files (SPEC-P9): a data dump or generated
+/// Cap for [`Lang::Text`] files: a data dump or generated
 /// document larger than this is noise, not something a session looks up.
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 
@@ -211,7 +209,7 @@ fn is_binary(content: &[u8]) -> bool {
 }
 
 /// Extract (CAS-first) all candidate files in parallel (rayon, 2 threads).
-/// Skip rules (SPEC): unknown lang, binary (NUL in first 8KiB), >4MiB.
+/// Skip rules: unknown lang, binary (NUL in first 8KiB), >4MiB.
 fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
@@ -329,7 +327,7 @@ fn load_state(data_dir: &Path, name: &str) -> io::Result<RepoState> {
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Read a registered repo's state (SPEC-P6: surfaces resolve a repo name
+/// Read a registered repo's state (surfaces resolve a repo name
 /// to its working-tree path for `impact --diff`).
 pub fn repo_state(data_dir: &Path, name: &str) -> io::Result<RepoState> {
     load_state(data_dir, name)
@@ -385,7 +383,7 @@ fn iso_now() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// public API (SPEC indexio-ingest)
+// public API
 // ---------------------------------------------------------------------------
 
 /// Full index of a local git repo at HEAD (commit-deterministic: blobs are
@@ -409,7 +407,7 @@ pub fn index_repo(
 
     let repo = match gix::open(repo_path) {
         Ok(r) => r,
-        // Not a git repository: index the directory tree as-is (SPEC-P7).
+        // Not a git repository: index the directory tree as-is.
         Err(_) if repo_path.is_dir() && !repo_path.join(".git").exists() => {
             return index_dir(repo_path, name, data_dir, cas)
         }
@@ -489,7 +487,7 @@ fn is_unborn(repo: &gix::Repository) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Plain directories (no git) — SPEC-P7
+// Plain directories (no git)
 // ---------------------------------------------------------------------------
 
 /// Directory names never descended into when indexing a plain tree (build
@@ -503,7 +501,7 @@ pub const SKIP_DIRS: &[&str] = &[
 
 /// Hidden directories that hold what an agent asks about — CI workflows,
 /// cargo and editor configuration, dev containers — and are indexed like
-/// any other folder (SPEC-P10 §36). Every other dot-directory (`.git`,
+/// any other folder. Every other dot-directory (`.git`,
 /// `.venv`, `.idea`, `.next`, `.cache` …) is skipped.
 pub const KEEP_DOT_DIRS: &[&str] = &[
     ".github", ".gitlab", ".circleci", ".cargo", ".devcontainer", ".vscode", ".config",
@@ -529,7 +527,7 @@ pub fn under_skipped_dir(rel: &str) -> bool {
 }
 
 /// Whether `dir` is a cache/build-output directory by its own declaration
-/// (SPEC-P10 §24): cargo stamps every target directory — `target/`,
+///: cargo stamps every target directory — `target/`,
 /// `--target-dir target-bench-B`, `CARGO_TARGET_DIR=…` — with a
 /// `CACHEDIR.TAG` file, as do pip, pytest, Gradle and other cache writers.
 /// [`SKIP_DIRS`] only knows the conventional names: one checkout had
@@ -776,7 +774,7 @@ fn read_plain_tree(root: &Path, skip: &[String], pdf_text: bool, within: &[Strin
 
 /// The indexable files of a plain tree as [`WtFile`]s, with a
 /// [`WorktreeCache`] so a file whose mtime and length are unchanged since
-/// the last pass is only stat'ed (SPEC-P10: the `sessions` folder and
+/// the last pass is only stat'ed (the `sessions` folder and
 /// plain-folder repos were re-read and re-hashed whole on every refresh).
 fn read_plain_tree_cached(
     root: &Path,
@@ -1000,7 +998,7 @@ impl WtFile {
 }
 
 /// Per-file `(mtime, len, blob)` remembered between working-tree passes of
-/// one long-lived process (the MCP server's auto-refresh, SPEC-P9): a file
+/// one long-lived process (the MCP server's auto-refresh): a file
 /// whose mtime and length are unchanged is not re-read or re-hashed.
 #[derive(Default)]
 pub struct WorktreeCache {
@@ -1106,8 +1104,8 @@ impl WorktreeCache {
     }
 }
 
-/// Delta re-index against whatever `current` files say (SPEC-P7 plain
-/// folders, SPEC-P9 working trees and post-worktree reconciliation): a file
+/// Delta re-index against whatever `current` files say (plain
+/// folders, working trees and post-worktree reconciliation): a file
 /// whose blake3 hash equals the visible doc's blob is unchanged; changed
 /// and added files go into a new shard; deleted and superseded docs are
 /// tombstoned. `next` is the state to save on success.
@@ -1136,7 +1134,7 @@ fn delta_by_content_in(
 ) -> anyhow::Result<IndexReport> {
     let t0 = Instant::now();
     let name = state.name.as_str();
-    // One writer per repo at a time (SPEC-P9 §23): a session's auto-refresh,
+    // One writer per repo at a time: a session's auto-refresh,
     // the Bash hook's freshen and the CLI can all delta the same repo
     // within the same second; two concurrent passes would each add the
     // changed doc and leave a duplicate live. A writer still busy when the
@@ -1282,7 +1280,7 @@ fn delta_by_content_in(
 }
 
 /// Whether a registered git repo's HEAD differs from the commit its index
-/// was built from (SPEC-P10 §21): a ref resolve, no tree walk. `false` for
+/// was built from: a ref resolve, no tree walk. `false` for
 /// plain folders, repos indexed from their working tree (another server's
 /// auto-refresh owns those), unreadable repos and unchanged HEADs — the
 /// cases a background sync should leave alone.
@@ -1299,7 +1297,7 @@ pub fn head_moved(data_dir: &Path, name: &str) -> bool {
 }
 
 /// Cross-process lock for the background sync of every registered repo
-/// (SPEC-P10 §21): `<data_dir>/sync.lock`, created exclusively; a lock older
+///: `<data_dir>/sync.lock`, created exclusively; a lock older
 /// than [`SYNC_LOCK_STALE_SECS`] is assumed abandoned. Dropping releases it.
 pub struct SyncLock {
     path: PathBuf,
@@ -1490,7 +1488,7 @@ fn read_worktree(root: &Path, mut cache: Option<&mut WorktreeCache>) -> anyhow::
     Ok(files)
 }
 
-/// Re-index a registered repo from its WORKING TREE (SPEC-P9): what the
+/// Re-index a registered repo from its WORKING TREE: what the
 /// agent is editing right now, uncommitted changes included, delta by
 /// content hash against the visible docs. The saved state keeps
 /// `last_commit` and sets `worktree: true` so a later HEAD-based
@@ -1510,7 +1508,7 @@ pub fn reindex_worktree_cached(
     cache: Option<&mut WorktreeCache>,
 ) -> anyhow::Result<IndexReport> {
     // a fresh cache starts from the one the last process saved, and a pass
-    // that changed it saves it for the next (SPEC-P10 stat caches were
+    // that changed it saves it for the next (stat caches were
     // per process: every new server re-hashed whole trees, 65 MB of
     // transcripts included)
     let mut cache = cache;
@@ -2183,7 +2181,7 @@ mod tests {
             ("src/main.rs", MAIN_RS),
             ("src/lib.rs", LIB_RS),
             ("util.py", UTIL_PY),
-            ("README.md", b"# readme\n"),              // text: indexed (SPEC-P9)
+            ("README.md", b"# readme\n"),              // text: indexed
             ("logo.png", b"PNG\n"),                    // unknown lang: skipped
             ("bin.py", b"def f():\x00 pass\n"),        // binary: skipped
         ]);
@@ -2333,7 +2331,7 @@ mod tests {
         );
     }
 
-    /// SPEC-P10 §24: an untracked cargo target dir under a custom name is
+    /// an untracked cargo target dir under a custom name is
     /// build output (it carries `CACHEDIR.TAG`), not source — for the
     /// working-tree listing and the plain-tree walk alike.
     #[test]

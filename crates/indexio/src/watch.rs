@@ -1,4 +1,4 @@
-//! Filesystem watch on the session's repo (SPEC-P9 auto-refresh).
+//! Filesystem watch on the session's repo.
 //!
 //! The MCP server starts one recursive watcher on the current repo's
 //! folder. Events for source files (known language, outside `.git`, build
@@ -132,7 +132,7 @@ fn interesting(p: &Path) -> bool {
         return false;
     }
     // a build writing thousands of dep-info files into a custom target dir
-    // is not an edit (SPEC-P10 §24); one stat per ancestor, events are rare
+    // is not an edit; one stat per ancestor, events are rare
     // outside builds and builds are exactly what this filters
     !p.ancestors().skip(1).any(indexio_ingest::is_cache_dir)
 }
@@ -150,7 +150,7 @@ mod tests {
         assert!(!interesting(Path::new("/r/node_modules/a/b.js")));
         assert!(!interesting(Path::new("/r/src/.main.rs.swp")));
         assert!(!interesting(Path::new("/r/src/main.rs~")));
-        assert!(interesting(Path::new("/r/README")), "text files are indexed too (SPEC-P9)");
+        assert!(interesting(Path::new("/r/README")), "text files are indexed too");
         assert!(!interesting(Path::new("/r/logo.png")));
         assert!(!interesting(Path::new("/r/package-lock.json")));
     }

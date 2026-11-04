@@ -1,4 +1,4 @@
-//! cAST-lite chunking (SPEC-P2 §1): split files at syntax boundaries using the
+//! cAST-lite chunking: split files at syntax boundaries using the
 //! same tree-sitter grammars and def-node queries as `extract`.
 //!
 //! Strategy:
@@ -592,7 +592,7 @@ fn window_split(
         let overlap = count.div_ceil(10).min(count - 1);
         i = (j + 1 - overlap).max(i + 1);
     }
-    // SPEC-P9: a tail window that adds nothing but closing brackets and
+    // a tail window that adds nothing but closing brackets and
     // blank lines beyond the overlap (a split that landed just before a
     // function's final `}`) is folded into the previous window instead of
     // becoming a chunk of its own — such chunks embed as their path header

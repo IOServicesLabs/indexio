@@ -1,4 +1,4 @@
-//! End-to-end CLI test for SPEC-P6: a real git repo is created and
+//! End-to-end CLI test for impact analysis: a real git repo is created and
 //! indexed (`indexio index`), a function body is edited in the working tree,
 //! and `indexio impact --diff` must map the uncommitted change to the edited
 //! definition and list its callers. Also covers `indexio outline`, `indexio span`,

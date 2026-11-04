@@ -1,7 +1,5 @@
 //! indexio: binary crate — CLI (clap), HTTP server (axum) and MCP server
 //! (stdio JSON-RPC) for the indexio engine.
-//!
-//! Contract: docs/SPEC.md, section "indexio — binary".
 
 #![allow(clippy::type_complexity)]
 
@@ -142,8 +140,8 @@ enum Commands {
         #[arg(long, default_value = "lexical")]
         mode: String,
         /// Rerank the hybrid results. Only valid with
-        /// --mode hybrid; reranker = INDEXIO_RERANK_BASE HttpReranker when set,
-        /// else the offline OverlapReranker.
+        /// --mode hybrid; uses the INDEXIO_RERANK_BASE endpoint, and without one
+        /// leaves the fused order as it is.
         #[arg(long)]
         rerank: bool,
         /// Fusion algorithm for --mode hybrid: rrf
@@ -433,7 +431,7 @@ enum Commands {
     },
 }
 
-/// Exactly one impact target must be selected (SPEC-P6 §3).
+/// Exactly one impact target must be selected.
 pub(crate) fn validate_impact_target(
     symbols: &[String],
     diff: Option<&str>,
@@ -457,7 +455,7 @@ pub(crate) fn validate_impact_target(
 /// `setup claude --team-sync`: materialise the worktree-sync hook script in
 /// the Claude config dir and print the PreToolUse settings.json entry that
 /// runs it before every indexio MCP tool call, so the shared server always
-/// sees the caller's uncommitted work (team overlays, SPEC-P11).
+/// sees the caller's uncommitted work (team overlays).
 fn install_team_sync_hook(print_only: bool) -> anyhow::Result<()> {
     // `*.sh` is `eol=lf` in .gitattributes, so this embeds LF line endings.
     const SCRIPT: &str = include_str!("../../../integrations/claude-code/indexio-team-sync.sh");
@@ -691,7 +689,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             embedder: embedder_flag,
         } => {
             if mode == "bm25" {
-                // evaluation aid (SPEC-P10 §14): the chunk-BM25 leg alone
+                // evaluation aid: the chunk-BM25 leg alone
                 let engine = Engine::open(&data_dir)
                     .with_context(|| format!("opening index at {}", data_dir.display()))?;
                 let embedder = select_embedder(embedder_flag.as_deref(), &data_dir)?;
@@ -778,7 +776,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let embedder = select_embedder(embedder_flag.as_deref(), &data_dir)?;
             let embedder = if rebuild_model {
-                // SPEC-P4 §2: wipe the on-disk semantic model and this
+                // wipe the on-disk semantic model and this
                 // model's embcas namespace, then re-observe ALL chunks
                 // (with the CAS gone, every chunk is a miss, so the
                 // pipeline observes all of them). Drift note: incremental
@@ -798,7 +796,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     std::fs::remove_dir_all(&cas_dir)
                         .with_context(|| format!("removing {}", cas_dir.display()))?;
                 }
-                // SPEC-P9: the incremental embed carries rows of unchanged
+                // the incremental embed carries rows of unchanged
                 // files, which would keep the OLD model's vectors.
                 indexio_embed::pipeline::clear_segments(&data_dir, embedder.model_id());
                 // Re-open so no stale in-memory model state survives.
@@ -1022,7 +1020,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 println!("nothing to compact ({before} shards, max {max_shards})");
             }
-            // semantic plane (SPEC-P9): fold delta segments / purge tombstones
+            // semantic plane: fold delta segments / purge tombstones
             let model = select_embedder(None, &data_dir).map(|e| e.model_id().to_string());
             if let Ok(model) = model {
                 let _lock = indexio_embed::pipeline::CompactLock::try_acquire(&data_dir);
@@ -1252,7 +1250,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Embedder selection (SPEC-P2 §4 + SPEC-P4 §2), in precedence order:
+/// Embedder selection, in precedence order:
 /// 1. INDEXIO_EMBED_BASE set -> `HttpEmbedder::from_env()` (production:
 ///    OpenAI-compatible /v1/embeddings); overrides `--embedder`.
 /// 2. `--embedder hash` -> deterministic offline `HashEmbedder::new(512)`
@@ -1290,11 +1288,11 @@ pub(crate) fn select_embedder_or_fallback(data_dir: &Path) -> Arc<dyn Embedder> 
     }
 }
 
-/// Reranker selection (SPEC-P3 §2): `HttpReranker::from_env()` when
+/// Reranker selection: `HttpReranker::from_env()` when
 /// INDEXIO_RERANK_BASE is set (production: TEI/vLLM/Jina-style /rerank), else
 /// a no-op. The offline `OverlapReranker` used to be the fallback; on 80
 /// model-written questions over the registered repos it halved hybrid
-/// recall@5 (67.5 → 35 %, SPEC-P10 §15), so `rerank` without a configured
+/// recall@5 (67.5 → 35 %), so `rerank` without a configured
 /// reranker now leaves the fused order alone.
 pub(crate) fn select_reranker() -> anyhow::Result<Arc<dyn Reranker>> {
     if let Some(r) = HttpReranker::from_env()? {
@@ -1317,7 +1315,7 @@ pub(crate) fn select_reranker_or_fallback() -> Arc<dyn Reranker> {
     }
 }
 
-/// `--rerank` is only valid with `--mode hybrid` (SPEC-P3 §2). Clap cannot
+/// `--rerank` is only valid with `--mode hybrid`. Clap cannot
 /// express "flag valid only for one value of another arg" declaratively,
 /// so this check runs right after parsing, before any index is opened.
 pub(crate) fn validate_rerank_flag(mode: SearchMode, rerank: bool) -> anyhow::Result<()> {
@@ -1327,7 +1325,7 @@ pub(crate) fn validate_rerank_flag(mode: SearchMode, rerank: bool) -> anyhow::Re
     Ok(())
 }
 
-/// Serve auth selection (SPEC-P3 §3, SPEC-P12 §2): --oidc-issuer supersedes
+/// Serve auth selection: --oidc-issuer supersedes
 /// --acl-file, which supersedes --auth-token; --auth-token falls back to
 /// $INDEXIO_AUTH_TOKEN; neither -> open.
 pub(crate) fn resolve_auth_config(
@@ -1368,7 +1366,7 @@ pub(crate) fn resolve_auth_config(
 }
 
 /// `indexio usage`: per-tool and per-repo aggregates of the MCP usage log,
-/// including the built-in-tool comparison (SPEC-P10 §22).
+/// including the built-in-tool comparison.
 fn print_usage(data_dir: &Path, days: u64, as_json: bool) -> anyhow::Result<()> {
     let r = usage::aggregate(data_dir, days);
     if as_json {
@@ -1529,8 +1527,8 @@ fn print_embed_reports(reports: &[EmbedReport]) {
     }
 }
 
-/// `indexio add` / `indexio sync`: embed what the sync changed (SPEC-P10
-/// §28) — the repos whose docs were added or deleted, incrementally into a
+/// `indexio add` / `indexio sync`: embed what the sync changed
+/// — the repos whose docs were added or deleted, incrementally into a
 /// delta segment — and rebuild the whole plane only when there is none yet.
 /// (Before: every `add` of one folder rebuilt every repo's vectors, 25 s
 /// and a 500 MB segment that every running server had to reopen.)
@@ -1662,12 +1660,12 @@ mod tests {
                 assert!(json);
                 assert_eq!(mode, "lexical");
                 assert!(!rerank);
-                assert_eq!(fusion, "rrf"); // SPEC-P5 §A3 default
+                assert_eq!(fusion, "rrf"); // the default
                 assert!(embedder.is_none());
             }
             _ => panic!("expected search"),
         }
-        // --embedder flag parses on search (SPEC-P4 §2).
+        // --embedder flag parses on search.
         let cli =
             Cli::try_parse_from(["indexio", "search", "foo", "--mode", "semantic", "--embedder", "hash"])
                 .unwrap();
@@ -1704,7 +1702,7 @@ mod tests {
             }
             _ => panic!("expected search"),
         }
-        // SPEC-P5 §A3: --fusion parses; value validation is post-parse.
+        // --fusion parses; value validation is post-parse.
         let cli = Cli::try_parse_from([
             "indexio", "search", "foo", "--mode", "hybrid", "--fusion", "combmnz",
         ])
@@ -1724,7 +1722,7 @@ mod tests {
 
     #[test]
     fn rerank_flag_requires_hybrid_mode() {
-        // SPEC-P3 §2: --rerank is only valid with --mode hybrid.
+        // --rerank is only valid with --mode hybrid.
         assert!(validate_rerank_flag(SearchMode::Hybrid, true).is_ok());
         assert!(validate_rerank_flag(SearchMode::Hybrid, false).is_ok());
         assert!(validate_rerank_flag(SearchMode::Lexical, false).is_ok());
@@ -1825,7 +1823,7 @@ mod tests {
 
     #[test]
     fn resolve_auth_config_precedence() {
-        // acl-file supersedes --auth-token (SPEC-P3 §3)
+        // acl-file supersedes --auth-token
         let tmp = tempfile::tempdir().unwrap();
         let acl = tmp.path().join("acl.json");
         std::fs::write(&acl, r#"{"tokens":{"t":{"allow":["*"]}}}"#).unwrap();
@@ -1872,7 +1870,7 @@ mod tests {
             }
             _ => panic!("expected embed"),
         }
-        // --embedder + --rebuild-model parse on embed (SPEC-P4 §2).
+        // --embedder + --rebuild-model parse on embed.
         let cli =
             Cli::try_parse_from(["indexio", "embed", "--embedder", "rindex", "--rebuild-model"])
                 .unwrap();
@@ -2001,7 +1999,7 @@ mod tests {
         assert_eq!(expand_tilde(Path::new("/abs")), PathBuf::from("/abs"));
     }
 
-    /// SPEC-P4 §2: embedder selection precedence + the random-indexing
+    /// embedder selection precedence + the random-indexing
     /// embedder wired end-to-end through the pipeline and Engine.
     #[test]
     fn embedder_selection_and_rindex_end_to_end() {
@@ -2090,7 +2088,7 @@ mod tests {
         }
     }
 
-    /// SPEC-P6 §3: impact/outline/span parse; exactly one impact target.
+    /// impact/outline/span parse; exactly one impact target.
     #[test]
     fn parse_impact_outline_span() {
         let cli = Cli::try_parse_from([
@@ -2152,7 +2150,7 @@ mod tests {
         assert!(Cli::try_parse_from(["indexio", "span", "core:src/a.rs"]).is_err());
     }
 
-    /// SPEC-P7: add / sync / sources / remove parse.
+    /// add / sync / sources / remove parse.
     #[test]
     fn parse_add_sync_sources_remove() {
         let cli = Cli::try_parse_from([

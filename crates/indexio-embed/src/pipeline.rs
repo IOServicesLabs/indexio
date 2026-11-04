@@ -1,8 +1,8 @@
-//! Embed pipeline (SPEC-P2 §2.4, rebuilt for throughput in SPEC-P6): chunk
+//! Embed pipeline: chunk
 //! visible docs, embed CAS misses, rebuild the vec index with repo-scoped
 //! replace.
 //!
-//! Throughput design (measured: the P5 pipeline spent ~3 ms/chunk in the
+//! Throughput design (measured: the earlier pipeline spent ~3 ms/chunk in the
 //! model's observe and ~1.8 ms/chunk in embed + a file-per-vector CAS, and
 //! rebuilt the WHOLE vec/BM25 index once per repo):
 //!   * chunking is parallel per doc (rayon), order preserved;
@@ -29,7 +29,7 @@ use crate::embed::Embedder;
 use crate::index::{VecIndex, VecRowMeta, VecSet};
 use crate::store::{chunk_hash, EmbedCas};
 
-/// Chunk size cap per SPEC-P2 §2.4.
+/// Chunk size cap.
 pub const MAX_CHARS: usize = 1200;
 /// Max texts per `Embedder::embed` call.
 const EMBED_BATCH: usize = 64;
@@ -40,12 +40,12 @@ pub struct EmbedReport {
     pub chunks: u64,
     pub cas_hits: u64,
     pub cas_misses: u64,
-    /// Misses the seen-only cache (SPEC-P10) recognised as already observed:
+    /// Misses the seen-only cache recognised as already observed:
     /// re-embedded without being fed to the model again.
     pub cas_known: u64,
     pub embedded: u64,
-    /// Chunks of files whose rows were already up to date (SPEC-P9
-    /// incremental embed): neither looked up nor rewritten.
+    /// Chunks of files whose rows were already up to date
+    /// (incremental embed): neither looked up nor rewritten.
     pub carried: u64,
     /// Wall time of this repo's own phases (chunk, CAS, observe, embed).
     pub elapsed_ms: u128,
@@ -63,7 +63,7 @@ fn bm25_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Split chunk text (`header + "\n" + body`, see indexio_symbols::chunking) into
-/// the (header, body) pair indexed by the BM25F sidecar (SPEC-P5 §A1).
+/// the (header, body) pair indexed by the BM25F sidecar.
 pub(crate) fn split_header_body(text: &str) -> (String, String) {
     match text.split_once('\n') {
         Some((h, b)) => (h.to_string(), b.to_string()),
@@ -83,7 +83,7 @@ fn doc_repo(shards: &ShardSet, si: usize, repo_id: u32) -> String {
 struct Work {
     meta: VecRowMeta,
     text: String,
-    /// (header, body) of the chunk, for the BM25F sidecar (SPEC-P5 §A2).
+    /// (header, body) of the chunk, for the BM25F sidecar.
     bm25_row: (String, String),
     hash: [u8; 16],
 }
@@ -146,7 +146,7 @@ fn embed_works(
 ) -> anyhow::Result<Vec<Vec<f32>>> {
     let mut vecs: Vec<Option<Vec<f32>>> = (0..works.len()).map(|_| None).collect();
     let mut miss_all: Vec<usize> = Vec::new();
-    // A seen-only cache (SPEC-P10) misses every chunk but still knows which
+    // A seen-only cache misses every chunk but still knows which
     // ones the model observed before: those are re-embedded, not re-observed.
     let mut known: Vec<bool> = vec![false; works.len()];
     for (i, w) in works.iter().enumerate() {
@@ -167,9 +167,9 @@ fn embed_works(
         .filter(|&i| seen.insert(works[i].hash))
         .collect();
 
-    // Stateful embedders (SPEC-P4 §1): ingest the new chunk texts into the
-    // model BEFORE embedding them — except transcript chunks (SPEC-P10
-    // §18): the `sessions` source is re-rendered every few minutes and its
+    // Stateful embedders: ingest the new chunk texts into the
+    // model BEFORE embedding them — except transcript chunks:
+    // the `sessions` source is re-rendered every few minutes and its
     // text (tool output, JSON, paths) kept drifting the vocabulary away
     // from the code rows embedded earlier. Transcripts are embedded with
     // the model as it is; only code trains it.
@@ -205,7 +205,7 @@ fn embed_works(
     let mut k = 0usize;
     // vectors computed in this pass, by hash: duplicate misses (the same
     // chunk text in two files) take theirs from here — the seen-only cache
-    // (SPEC-P10 §5) never hands vectors back
+    // never hands vectors back
     let mut computed: HashMap<[u8; 16], Vec<f32>> = HashMap::new();
     for batch in batches {
         for v in batch? {
@@ -230,11 +230,11 @@ fn embed_works(
 }
 
 /// Source whose chunks are embedded but never fed to a stateful embedder's
-/// model (the rendered session transcripts, SPEC-P10 §18).
+/// model (the rendered session transcripts).
 pub const NO_OBSERVE_REPO: &str = "sessions";
 
 /// `<vec>/<model>.built`: the model's text count when the plane was last
-/// rebuilt whole (SPEC-P10 §20). Written by [`rebuild_all`].
+/// rebuilt whole. Written by [`rebuild_all`].
 pub fn built_stamp_path(vec_dir: &Path, model_id: &str) -> PathBuf {
     vec_dir.join(format!("{model_id}.built"))
 }
@@ -253,10 +253,10 @@ pub const REEMBED_GROWTH: f64 = 1.25;
 pub const REEMBED_MIN_AGE: Duration = Duration::from_secs(6 * 3600);
 
 /// Whether the semantic plane should be rebuilt whole because the model has
-/// drifted from the state its rows were embedded with (SPEC-P10 §20): a
+/// drifted from the state its rows were embedded with: a
 /// stamp exists, the model has grown by [`REEMBED_GROWTH`] since, and the
 /// stamp is older than [`REEMBED_MIN_AGE`]. Without a stamp (a plane built
-/// before P10, or by a stateless embedder) nothing is due.
+/// by an older version, or by a stateless embedder) nothing is due.
 pub fn reembed_due(data_dir: &Path, model_id: &str, texts_seen: Option<u64>) -> bool {
     let Some(now) = texts_seen else { return false };
     let p = built_stamp_path(&vec_dir(data_dir), model_id);
@@ -389,7 +389,7 @@ pub fn clear_segments(data_dir: &Path, model_id: &str) {
     }
 }
 
-/// Embed `repos` INCREMENTALLY (SPEC-P9): every visible doc of each repo is
+/// Embed `repos` INCREMENTALLY: every visible doc of each repo is
 /// chunked; a file whose chunk hashes equal its live rows' is left alone;
 /// changed and new files get their old rows tombstoned and their chunks
 /// embedded (CAS first) into ONE new delta segment (vec + aligned BM25);
@@ -447,7 +447,7 @@ pub fn embed_docs(
     embed_incremental(shards, data_dir, &repos, Some(&paths), embedder, max_chars)
 }
 
-/// Embed only `paths` of `repo` (SPEC-P9 auto-refresh): the docs at those
+/// Embed only `paths` of `repo` (auto-refresh): the docs at those
 /// paths are chunked and diffed against their live rows; paths without a
 /// visible doc are treated as deleted. Files not named are untouched.
 pub fn embed_paths(
@@ -726,7 +726,7 @@ pub fn rebuild_all(
         crate::index::remove_or_park(p)?;
     }
     embedder.flush()?;
-    // the model state every row was embedded with (SPEC-P10 §20)
+    // the model state every row was embedded with
     if let Some(n) = embedder.texts_seen() {
         write_built_stamp(&vec_dir(data_dir), &model_id, n);
     }
@@ -743,7 +743,7 @@ pub fn rebuild_all(
     Ok(reports)
 }
 
-/// Fold segments together (SPEC-P9): with more than [`MAX_SEGMENTS`]
+/// Fold segments together: with more than [`MAX_SEGMENTS`]
 /// segments, every segment but the largest is merged into one; with more
 /// than [`MAX_DEAD_FRACTION`] tombstoned rows, all of them are. Vectors
 /// are carried as they are and BM25 rows are recovered from the inverted
@@ -755,7 +755,7 @@ pub fn compact_vectors(data_dir: &Path, model_id: &str) -> anyhow::Result<bool> 
 }
 
 /// [`compact_vectors`] with `force`: merge every segment into one regardless
-/// of the thresholds (re-encodes pre-P10 f32 segments as int8).
+/// of the thresholds (re-encodes older f32 segments as int8).
 pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> anyhow::Result<bool> {
     crate::index::reap_stale(&vec_dir(data_dir));
     crate::index::reap_stale(&bm25_dir(data_dir));
@@ -810,7 +810,7 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
         }
     }
     // group rows by repo (then path, line) so a repo-scoped search scans
-    // one run of the merged segment (SPEC-P10 §11); BM25 rows and origins
+    // one run of the merged segment; BM25 rows and origins
     // follow the same permutation (rows are aligned across the sidecars)
     {
         let mut order: Vec<usize> = (0..rows.len()).collect();
@@ -883,7 +883,7 @@ fn vset_offset(v: &VecSet, i: usize) -> u32 {
     v.segments()[..i].iter().map(|s| s.raw_len() as u32).sum()
 }
 
-/// Cross-process compaction lock (SPEC-P9): `<data_dir>/compact.lock`,
+/// Cross-process compaction lock: `<data_dir>/compact.lock`,
 /// created exclusively; a lock older than [`LOCK_STALE_SECS`] is assumed
 /// to belong to a dead process and is taken over. Dropping releases it.
 pub struct CompactLock {
@@ -928,7 +928,7 @@ impl Drop for CompactLock {
     }
 }
 
-/// Whether a semantic plane for `model_id` exists at all (SPEC-P10 §28):
+/// Whether a semantic plane for `model_id` exists at all:
 /// the one case a sync should rebuild whole rather than append.
 pub fn plane_exists(data_dir: &Path, model_id: &str) -> bool {
     !crate::index::segment_paths(&vec_dir(data_dir), model_id).is_empty()
@@ -951,7 +951,7 @@ pub fn embed_repo(
     embed_repo_with(shards, data_dir, repo, embedder, MAX_CHARS)
 }
 
-/// `embed_repo` with a caller-chosen chunk size cap (SPEC-P2 §4 CLI
+/// `embed_repo` with a caller-chosen chunk size cap (CLI
 /// `--max-chars`; the library default stays [`MAX_CHARS`]).
 pub fn embed_repo_with(
     shards: &ShardSet,
@@ -1066,7 +1066,7 @@ mod tests {
         assert!(rep1.embedded > 0);
 
         // HashEmbedder is cheap to recompute: the cache is seen-only, so
-        // the shared file is a miss the cache recognises (SPEC-P10)
+        // the shared file is a miss the cache recognises
         let rep2 = embed_repo(&shards, tmp.path(), "r2", &e).unwrap();
         assert_eq!(rep2.cas_hits, 0, "seen-only cache never serves vectors: {rep2:?}");
         assert!(rep2.cas_known > 0, "shared file is known to the cache: {rep2:?}");
@@ -1074,7 +1074,7 @@ mod tests {
         // every miss is embedded (unique hashes at least once)
         assert!(rep2.embedded > 0 && rep2.embedded <= rep2.cas_misses);
 
-        // Re-embedding an unchanged repo carries every row (SPEC-P9): no
+        // Re-embedding an unchanged repo carries every row: no
         // CAS lookups, nothing embedded, nothing rewritten.
         let rep1b = embed_repo(&shards, tmp.path(), "r1", &e).unwrap();
         assert_eq!(rep1b.carried, rep1b.chunks, "{rep1b:?}");
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn duplicate_chunks_in_one_pass_all_get_vectors() {
-        // SPEC-P10 §5 regression: the seen-only cache never returns
+        // Regression: the seen-only cache never returns
         // vectors, so a chunk text that occurs twice in one pass (the same
         // file in two places) must take its vector from the pass itself
         let tmp = tempfile::tempdir().unwrap();
@@ -1333,7 +1333,7 @@ mod tests {
         idx.raw_len()
     }
 
-    /// SPEC-P5 §A2: embed_repo writes a BM25F sidecar aligned row-for-row
+    /// embed_repo writes a BM25F sidecar aligned row-for-row
     /// with the vec index; re-embedding a repo replaces only that repo's
     /// rows in BOTH indexes, and carried-over other-repo rows keep their
     /// (header, body) text (recovered by chunk_hash).

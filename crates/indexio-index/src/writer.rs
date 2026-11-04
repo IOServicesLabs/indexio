@@ -15,9 +15,9 @@ use crate::format::{self, kind, put_u16, put_u32, put_u64, DOC_REC_LEN, TOMBSTON
 use crate::ShardMeta;
 
 const ZSTD_LEVEL: i32 = 3;
-/// Docs threshold above which a zstd dictionary is trained (SPEC).
+/// Docs threshold above which a zstd dictionary is trained.
 const DICT_MIN_DOCS: usize = 100;
-/// Target dictionary size (SPEC: 112 KiB), clamped to what the sample set
+/// Target dictionary size (112 KiB), clamped to what the sample set
 /// can support so training does not fail on small corpora.
 const DICT_TARGET: usize = 112 * 1024;
 const GRAM_STATS_TOP: usize = 10_000;
@@ -357,7 +357,7 @@ fn build_ngram_index(map: &BTreeMap<Vec<u8>, Vec<u32>>) -> io::Result<(Vec<u8>, 
 }
 
 /// SYM payload per entry: varint(doc_delta), varint(line), u8 kind,
-/// varint(scope_off into STRINGS blob) — SPEC.
+/// varint(scope_off into STRINGS blob).
 fn build_sym_index(
     map: &BTreeMap<Vec<u8>, Vec<(u32, u32, u8, u32)>>,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
@@ -382,7 +382,7 @@ fn build_sym_index(
 }
 
 /// CALL payload per entry: varint(doc_delta), varint(caller_off into
-/// STRINGS blob), varint(line) — SPEC.
+/// STRINGS blob), varint(line).
 fn build_call_index(
     map: &BTreeMap<Vec<u8>, Vec<(u32, u32, u32)>>,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {

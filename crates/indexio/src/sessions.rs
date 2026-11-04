@@ -1,4 +1,4 @@
-//! Session transcripts as an indexed source (SPEC-P9 §16, "recall").
+//! Session transcripts as an indexed source ("recall").
 //!
 //! Claude Code writes every session to
 //! `<claude dir>/projects/<project slug>/<session id>.jsonl`, one JSON
@@ -30,7 +30,7 @@ const TEXT_CAP: usize = 4000;
 const TOOL_INPUT_CAP: usize = 300;
 const TOOL_RESULT_CAP: usize = 400;
 const TOOL_RESULT_LINES: usize = 6;
-/// Thinking blocks (SPEC-P10): the harness does not always persist the
+/// Thinking blocks: the harness does not always persist the
 /// assistant's visible text, but a short narration of each turn lands in
 /// its thinking block — the decisions `recall` is asked about.
 const THINK_CAP: usize = 400;
@@ -42,7 +42,7 @@ pub struct ImportReport {
     pub parts_written: usize,
     pub bytes_written: u64,
     /// Transcripts idle longer than the retention window whose rendered
-    /// parts were removed (SPEC-P10 §31).
+    /// parts were removed.
     pub sessions_rolled_off: usize,
 }
 
@@ -92,7 +92,7 @@ pub fn index_sessions(
         return indexio_ingest::index_repo(&out, REPO, data_dir, cas);
     }
     // a plain folder: with the server's cache, unchanged parts are stat'ed,
-    // not re-read (SPEC-P10)
+    // not re-read
     indexio_ingest::reindex_worktree_cached(REPO, data_dir, cas, cache)
 }
 
@@ -183,7 +183,7 @@ pub fn import(claude_dir: &Path, out_dir: &Path, only_slug: Option<&str>) -> any
             let stamp = (meta.len(), mtime_ms(&meta));
             let key = path.to_string_lossy().into_owned();
             let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session").to_string();
-            // SPEC-P10 §31: a transcript idle longer than the retention
+            // a transcript idle longer than the retention
             // window rolls off — its rendered parts are removed and it is
             // not rendered again until it changes
             if cutoff_ms.is_some_and(|c| stamp.1 < c) {
@@ -500,7 +500,7 @@ fn render_full(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Rend
                                         _ => String::new(),
                                     };
                                     // noise lines a Windows shell adds to every result
-                                    // (SPEC-P10 §21): they carry no recall value and
+                                    //: they carry no recall value and
                                     // used to crowd out the result's real first lines
                                     let head: Vec<&str> = text.lines().filter(|l| !is_noise_line(l)).take(TOOL_RESULT_LINES).collect();
                                     let head = cap(&head.join("\n"), TOOL_RESULT_CAP);
@@ -522,7 +522,7 @@ fn render_full(path: &Path, slug: &str, session_id: &str) -> anyhow::Result<Rend
                     _ => {}
                 }
                 if !body.trim().is_empty() {
-                    // what the agent saw may include what it must not keep (§39)
+                    // what the agent saw may include what it must not keep
                     let body = crate::redact::redact(&body);
                     entries.push(format!("## {ts} {role}{side}\n{body}"));
                 }
@@ -752,7 +752,7 @@ mod tests {
         assert!(!is_noise_line("warning: unused variable"));
     }
 
-    /// SPEC-P10 §31: a transcript older than the retention window has its
+    /// a transcript older than the retention window has its
     /// rendered parts removed and is not re-rendered; a fresh one is kept.
     #[test]
     fn old_transcripts_roll_off() {
@@ -885,7 +885,7 @@ mod tests {
         assert!(p1.starts_with("# session s1 — Retry policy\nproject: C:\\x (C--x)"), "{p1}");
         assert!(p1.contains("should we retry uploads?") && !p1.contains("ignore"));
         assert!(p1.contains("Yes: exponential backoff"));
-        assert!(p1.contains("~ secret"), "thinking is rendered, capped (SPEC-P10)");
+        assert!(p1.contains("~ secret"), "thinking is rendered, capped");
         assert!(p1.contains("-> read_span {\"path\":\"a.rs\""));
         assert!(p1.contains("<- line1\nline2") && !p1.contains("line7"));
         assert!(p1.contains("## compaction summary\nWe chose backoff."));

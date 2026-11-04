@@ -1,4 +1,4 @@
-//! End-to-end CLI test for the semantic plane (SPEC-P2 §5, SPEC-P4 §2):
+//! End-to-end CLI test for the semantic plane:
 //! build a 2-repo shard fixture (ShardWriter, no git needed), run
 //! `indexio embed --all`, then `indexio search --mode hybrid --json` and assert
 //! exit 0 + non-empty hits. Offline: the default self-contained

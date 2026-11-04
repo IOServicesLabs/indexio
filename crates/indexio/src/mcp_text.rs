@@ -42,7 +42,7 @@ const COLLAPSE_DIRECT_ABOVE: usize = 30;
 
 /// Definitions listed in full; past this the session's repo keeps its rows
 /// (up to [`MAX_DEFS_SHOWN`]) and other repos collapse to per-repo counts
-/// (SPEC-P9 §20: `main` had 305 definitions across 41 repos).
+/// (`main` had 305 definitions across 41 repos).
 const COLLAPSE_DEFS_ABOVE: usize = 12;
 /// Changed definitions an `impact_of_diff` lists with their lines; the
 /// rest are counted per file (a 158-file diff listed 935, 84 KB, a recap of
@@ -151,7 +151,7 @@ pub fn hits_with_ends(
 }
 
 /// Call-site rows per file are capped at this many; the rest of a file's
-/// sites are listed as bare line numbers (SPEC-P10: `register` had 16
+/// sites are listed as bare line numbers (`register` had 16
 /// near-identical `Registry.register(...)` rows in one file — the
 /// locations matter, the repeated text does not).
 const MAX_CALL_ROWS_PER_FILE: usize = 6;
@@ -310,7 +310,7 @@ pub fn span(repo: &str, path: &str, start: u32, last: u32, text: &str) -> String
     let body = text.strip_suffix('\n').unwrap_or(text);
     if last >= start {
         // Every line is `N<TAB>text`? No: the number is a fifth of the
-        // tokens of a short line (SPEC-P9 §21), so only the first, the
+        // tokens of a short line, so only the first, the
         // last and every multiple of [`SPAN_NUMBER_EVERY`] carry it; the
         // other rows start with the tab alone (columns stay aligned, a row
         // never starts with digits by accident).
@@ -346,7 +346,7 @@ pub fn stats(stats: &EngineStats, detail: &[(String, String, String, String, boo
         }
         return out;
     }
-    // SPEC-P10 §25: one line per sync day listing the repo names (`*` =
+    // one line per sync day listing the repo names (`*` =
     // plain folder), and one line for the repos whose folder is not
     // `<root>/<name>` — the root being the folder most repos share. The
     // commit hashes are in the JSON payload; a session start does not
@@ -446,7 +446,7 @@ fn line_ranges(lines: &[u32]) -> String {
     out.join(",")
 }
 
-/// Impact report (SPEC-P9): the changed definitions, the roots'
+/// Impact report: the changed definitions, the roots'
 /// definitions, then the DIRECT call sites grouped per file (at most
 /// [`MAX_SITES_PER_FILE`] each, with the enclosing caller), then the
 /// transitive hops. Transitive sites are listed like direct ones while they

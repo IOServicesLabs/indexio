@@ -1,4 +1,4 @@
-//! Reranker stage (SPEC-P3 §2): a pluggable second-pass ranker applied
+//! Reranker stage: a pluggable second-pass ranker applied
 //! after hybrid RRF fusion.
 //!
 //! Three implementations:

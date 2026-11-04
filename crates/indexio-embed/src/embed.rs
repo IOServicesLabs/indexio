@@ -1,4 +1,4 @@
-//! Embedders (SPEC-P2 §2.1).
+//! Embedders.
 
 use anyhow::{anyhow, Context};
 
@@ -11,7 +11,7 @@ pub trait Embedder: Send + Sync {
     /// Embed a batch of texts; returns one L2-normalized vector per input.
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
     /// Stateful embedders ingest new texts into their model before
-    /// embedding (SPEC-P4 §1). Default no-op (stateless embedders). Called
+    /// embedding. Default no-op (stateless embedders). Called
     /// by the pipeline with each repo's new (CAS-miss) chunk texts, or ALL
     /// chunk texts on a model rebuild.
     fn observe(&self, _texts: &[String]) -> anyhow::Result<()> {
@@ -24,7 +24,7 @@ pub trait Embedder: Send + Sync {
         Ok(())
     }
     /// Whether a lazily persisted model has unsaved changes older than its
-    /// interval (SPEC-P10 §30): the owner runs [`persist`](Self::persist)
+    /// interval: the owner runs [`persist`](Self::persist)
     /// on a background thread instead of paying the save inside a call.
     fn save_due(&self) -> bool {
         false
@@ -35,19 +35,19 @@ pub trait Embedder: Send + Sync {
     }
     /// True when re-embedding a chunk is cheaper than reading its cached
     /// vector back from disk (in-process models): the embedding cache then
-    /// keeps only chunk hashes (SPEC-P10). Default false (remote / paid
+    /// keeps only chunk hashes. Default false (remote / paid
     /// embedders keep their vectors).
     fn recompute_is_cheap(&self) -> bool {
         false
     }
-    /// Thesaurus query expansion (SPEC-P5 B2): stateful embedders with a
+    /// Thesaurus query expansion: stateful embedders with a
     /// learned vocabulary may append nearest-neighbor terms; the default
     /// returns the query unchanged (stateless embedders).
     fn expand_query(&self, q: &str) -> String {
         q.to_string()
     }
     /// How many texts a stateful embedder's model has learned from
-    /// (SPEC-P10 §20): rows embedded long before the model's current state
+    ///: rows embedded long before the model's current state
     /// drift away from it; `None` for stateless embedders.
     fn texts_seen(&self) -> Option<u64> {
         None
@@ -56,7 +56,7 @@ pub trait Embedder: Send + Sync {
 
 /// English function words dropped from QUERY text (never from indexed
 /// content) by the BM25F leg (crate::bm25) and the indexio-query semantic path
-/// (SPEC-P5 §A4). ~40 words; query-side only — the conjunctive lexical mode
+///. ~40 words; query-side only — the conjunctive lexical mode
 /// is untouched on purpose (precision is a feature there).
 pub fn stopwords() -> &'static [&'static str] {
     &STOPWORDS
@@ -90,7 +90,7 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
 // HashEmbedder — deterministic, offline
 // ---------------------------------------------------------------------------
 
-/// Deterministic offline embedder (SPEC-P2 §2.1): tokenize on
+/// Deterministic offline embedder: tokenize on
 /// non-alphanumerics, lowercase, hash each token and each token bigram via
 /// blake3[..8] into `dim` buckets with signed hashing (+1/-1 from a second
 /// hash bit — byte 8 of the same 32-byte blake3 digest), L2-normalize.

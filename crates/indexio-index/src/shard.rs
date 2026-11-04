@@ -246,7 +246,7 @@ impl Shard {
     }
 
     /// Byte length of the posting payload for `gram` (0 when absent): a
-    /// decode-free proxy for its document frequency (SPEC-P9 planner).
+    /// decode-free proxy for its document frequency.
     pub fn posting_bytes(&self, gram: &[u8]) -> usize {
         let Some(off) = self.fst_get(kind::NGRAM_FST, gram) else {
             return 0;

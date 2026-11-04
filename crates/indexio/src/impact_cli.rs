@@ -1,4 +1,4 @@
-//! Shared helpers for the SPEC-P6 surfaces (CLI, HTTP, MCP): repo-name →
+//! Shared helpers for the impact surfaces (CLI, HTTP, MCP): repo-name →
 //! working-tree resolution, `git diff` capture, target parsing and the
 //! human-readable impact printer.
 

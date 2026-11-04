@@ -1,6 +1,6 @@
 //! HTTP server (axum 0.8, tokio): JSON query API + admin reload.
 //!
-//! Routes (contract: docs/SPEC.md + SPEC-P2 §4, section "indexio — binary"):
+//! Routes:
 //!   GET  /health                 -> {"ok":true}
 //!   GET  /stats                  -> EngineStats (merged with CAS stats)
 //!   GET  /search?q=&limit=&mode=&rerank=&fusion= -> {"hits":[...]} (mode: lexical|semantic|hybrid,
@@ -11,7 +11,7 @@
 //!   POST /admin/reload           -> reopen the Engine (drops mmap'd shards)
 //!   POST /admin/embed            -> embed all repos, returns {"reports":[EmbedReport...]}
 //!   GET  /embcas/stats           -> {"model_id":...,"entries":u64,"bytes":u64}
-//!   GET  /impact/symbol?name=a,b&depth=&max_sites= -> ImpactReport (SPEC-P6 §3)
+//!   GET  /impact/symbol?name=a,b&depth=&max_sites= -> ImpactReport
 //!   POST /impact/diff {"repo","diff","depth"?,"max_sites"?} -> ImpactReport + "changed"
 //!   GET  /outline?repo=&path=    -> {"repo","path","items":[OutlineItem...]}
 //!   GET  /span?repo=&path=&start=&end= -> {"repo","path","start","end","text"}
@@ -33,7 +33,7 @@
 //! Bound to 127.0.0.1 unless `--bind` names another address, which the
 //! CLI only allows together with a bearer token or an ACL file.
 //!
-//! Auth + repo-level ACLs (SPEC-P3 §3): with `--auth-token`/INDEXIO_AUTH_TOKEN
+//! Auth + repo-level ACLs: with `--auth-token`/INDEXIO_AUTH_TOKEN
 //! every route except `GET /health` requires `Authorization: Bearer T`
 //! (else 401 `{"error":"unauthorized"}`). `--acl-file` supersedes it: a
 //! per-token repo allowlist map; unknown tokens get 401, search/symbol/calls
@@ -73,7 +73,7 @@ use indexio_types::SearchHit;
 const DEFAULT_LIMIT: usize = 50;
 
 // ---------------------------------------------------------------------------
-// Auth + repo ACLs (SPEC-P3 §3)
+// Auth + repo ACLs
 // ---------------------------------------------------------------------------
 
 /// Server-side auth configuration (selected once at startup).
@@ -87,7 +87,7 @@ pub enum AuthConfig {
     Acl(Arc<HashMap<String, Vec<String>>>),
     /// OIDC SSO: JWT bearer tokens validated against the identity
     /// provider's JWKS; the ACL file's "users" section maps identities to
-    /// allow patterns (SPEC-P12).
+    /// allow patterns.
     Oidc(Arc<OidcAuth>),
 }
 
@@ -101,7 +101,7 @@ pub struct OidcUser {
     pub user: Option<String>,
 }
 
-/// Identity -> allow patterns for OIDC mode (SPEC-P12 §2).
+/// Identity -> allow patterns for OIDC mode.
 pub fn load_acl_oidc_users(
     path: &std::path::Path,
 ) -> anyhow::Result<HashMap<String, OidcUser>> {
@@ -141,7 +141,7 @@ pub fn load_acl_oidc_users(
     Ok(map)
 }
 
-/// OIDC bearer-token validation (SPEC-P12 §2): discovery at
+/// OIDC bearer-token validation: discovery at
 /// `<issuer>/.well-known/openid-configuration`, JWKS cached and refetched on
 /// `kid` miss, RS256 only, issuer/audience/expiry enforced, identity must be
 /// in the users map (fail closed). Plain blocking HTTP — call through
@@ -341,7 +341,7 @@ pub fn load_acl_users(path: &std::path::Path) -> anyhow::Result<HashMap<String, 
 #[derive(Clone)]
 pub struct TeamUser(pub String);
 
-/// Repo allow-pattern match (SPEC-P3 §3): `*` matches anything; `prefix-*`
+/// Repo allow-pattern match: `*` matches anything; `prefix-*`
 /// is a prefix glob; `*-suffix` a suffix glob; `*mid*` contains; anything
 /// else is an exact match. Hand-rolled — no glob crate.
 pub fn repo_allowed(patterns: &[String], repo: &str) -> bool {
@@ -484,9 +484,9 @@ struct AppState {
     /// the same RwLock pattern as the engine so it can be swapped later.
     embedder: Arc<RwLock<Arc<dyn Embedder>>>,
     /// Reranker for `/search?...&rerank=1`, selected once at startup
-    /// (SPEC-P3 §2: HttpReranker::from_env() if Some, else OverlapReranker).
+    /// (HttpReranker::from_env() if Some, else OverlapReranker).
     reranker: Arc<dyn Reranker>,
-    /// Auth/ACL configuration (SPEC-P3 §3).
+    /// Auth/ACL configuration.
     auth: Arc<AuthConfig>,
     data_dir: Arc<PathBuf>,
     /// ACL token -> team user (ACL entries with a `"user"`).
@@ -799,7 +799,7 @@ struct SearchParams {
     limit: Option<usize>,
     mode: Option<String>,
     rerank: Option<String>,
-    /// SPEC-P5 §A3: fusion algorithm for mode=hybrid (rrf|combmnz,
+    /// fusion algorithm for mode=hybrid (rrf|combmnz,
     /// default rrf).
     fusion: Option<String>,
 }
@@ -809,7 +809,7 @@ pub fn hit_to_json(h: &SearchHit) -> Value {
     serde_json::to_value(h).expect("SearchHit is Serialize")
 }
 
-/// Serialize a fused hybrid hit (SPEC-P2 §4 + P3 §2 `rerank_score`;
+/// Serialize a fused hybrid hit (with `rerank_score`;
 /// shared by HTTP, CLI and MCP).
 pub fn hybrid_hit_to_json(h: &HybridHit) -> Value {
     json!({
@@ -893,7 +893,7 @@ async fn search(
     if rerank && mode != SearchMode::Hybrid {
         return Err(bad_request("rerank=1 requires mode=hybrid"));
     }
-    // SPEC-P5 §A3: optional fusion algorithm (hybrid mode only).
+    // optional fusion algorithm (hybrid mode only).
     let fusion = match &params.fusion {
         None => FusionAlgo::Rrf,
         Some(f) => FusionAlgo::parse(f).map_err(bad_request)?,
@@ -1035,7 +1035,7 @@ async fn embcas_stats(State(state): State<AppState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// SPEC-P6 §3: impact / outline / span
+// impact / outline / span
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -1324,11 +1324,11 @@ pub async fn run_server(
     indexio_query::set_content_cache(cache_mb << 20, true);
     let engine = Engine::open(&data_dir)
         .with_context(|| format!("opening index at {}", data_dir.display()))?;
-    // Embedder selection (SPEC-P4 §2): HTTP when INDEXIO_EMBED_BASE is set,
+    // Embedder selection: HTTP when INDEXIO_EMBED_BASE is set,
     // else the self-contained RandomIndexingEmbedder on <data_dir>/sem;
     // falls back to HashEmbedder (with a warning) if init fails.
     let embedder = crate::select_embedder_or_fallback(&data_dir);
-    // Reranker selection (SPEC-P3 §2): HttpReranker::from_env() when
+    // Reranker selection: HttpReranker::from_env() when
     // INDEXIO_RERANK_BASE is set, else the offline OverlapReranker.
     let reranker = crate::select_reranker_or_fallback();
     let state = AppState {
@@ -1431,7 +1431,7 @@ mod tests {
         assert_eq!(v["bm25_rank"], Value::Null);
         assert_eq!(v["sem_rank"], Value::Null);
         assert_eq!(v["rerank_score"], Value::Null);
-        // rerank_score surfaces when a reranker ran (SPEC-P3 §2).
+        // rerank_score surfaces when a reranker ran.
         let h2 = indexio_query::HybridHit {
             rerank_score: Some(0.75),
             ..h
@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // SPEC-P3 §3: auth + ACLs
+    // auth + ACLs
     // ------------------------------------------------------------------
 
     #[test]
@@ -1552,7 +1552,7 @@ mod tests {
         tmp
     }
 
-    /// SPEC-P6 fixture: real tree-sitter extraction so call edges exist.
+    /// Fixture: real tree-sitter extraction so call edges exist.
     /// core/src/config.rs defines parse_config + load (load calls
     /// parse_config); app/src/svc.rs calls load and imports config.
     fn fixture_impact_dir() -> tempfile::TempDir {
@@ -1775,7 +1775,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // SPEC-P6 §3: impact / outline / span routes
+    // impact / outline / span routes
     // ------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2080,7 +2080,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SPEC-P12: enterprise SSO (OIDC) over the whole surface
+    // enterprise SSO (OIDC) over the whole surface
     // -----------------------------------------------------------------------
 
     /// Static 2048-bit RSA test key (PKCS#1); the mock provider serves the

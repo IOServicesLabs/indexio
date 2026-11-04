@@ -1,4 +1,4 @@
-//! Command output kept out of the model's context (SPEC-P10 §31).
+//! Command output kept out of the model's context.
 //!
 //! `indexio run -- <command>` runs the command through the shell and, when
 //! the output is long, stores the whole of it under
@@ -216,7 +216,7 @@ pub fn run(data_dir: &Path, cwd: &Path, command: &str) -> anyhow::Result<i32> {
     Ok(exit)
 }
 
-/// Delete run logs older than `days` (SPEC-P10 §31); returns how many.
+/// Delete run logs older than `days`; returns how many.
 pub fn retain(data_dir: &Path, days: u64) -> usize {
     if days == 0 {
         return 0;

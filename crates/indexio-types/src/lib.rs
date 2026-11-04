@@ -1,6 +1,5 @@
 //! indexio-types: shared types and the posting-list byte codec.
-//! This crate is the contract layer — see docs/SPEC.md. Do not modify
-//! public items without updating SPEC.md.
+//! This crate is the contract layer between the other crates.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +49,7 @@ pub enum Lang {
     Java = 5,
     Cpp = 6,
     /// Any other text a session may search — docs, configs, scripts,
-    /// SQL, markup, code in languages without a grammar here (SPEC-P9).
+    /// SQL, markup, code in languages without a grammar here.
     /// Lexical index + window chunks; no symbols, calls or outline.
     Text = 7,
 }
@@ -97,7 +96,7 @@ impl Lang {
         }
     }
     /// Files that carry credentials or key material and are never indexed,
-    /// whatever their extension says (SPEC-P10 §39): environment files,
+    /// whatever their extension says: environment files,
     /// private keys and certificates, keystores, PGP material, Terraform
     /// state, netrc. Matched on the file name only.
     pub fn is_secret_path(path: &str) -> bool {
@@ -235,7 +234,7 @@ pub enum SymbolKind {
     Method = 9,
     Var = 10,
     Interface = 11,
-    /// A markdown heading (SPEC-P10 §38): the outline of a document.
+    /// A markdown heading: the outline of a document.
     Section = 12,
 }
 
@@ -300,7 +299,7 @@ pub struct CallRec {
 /// The unit cached in the CAS and consumed by the index writer.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExtractedArtifact {
-    /// Sorted unique grams (3..=8 bytes). No positions (SPEC-P10): the
+    /// Sorted unique grams (3..=8 bytes). No positions: the
     /// planner works on document sets and the verifier rescans content.
     pub ngrams: Vec<Vec<u8>>,
     pub symbols: Vec<SymbolRec>,

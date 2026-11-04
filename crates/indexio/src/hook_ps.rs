@@ -596,7 +596,7 @@ fn ps_quote(s: &str) -> String {
 }
 
 /// The command to run instead of `command` when the index answers a read
-/// in it (SPEC-P11): each answered statement becomes an `indexio tool`
+/// in it: each answered statement becomes an `indexio tool`
 /// call, with the statement itself as the fallback. `None` = as typed.
 pub fn rewrite(data_dir: &Path, cwd: &Path, command: &str, exe: &Path) -> Option<String> {
     if command.contains("INDEXIO_RAW") || command.contains("# raw") {

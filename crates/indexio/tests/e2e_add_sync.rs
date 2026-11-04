@@ -1,4 +1,4 @@
-//! End-to-end test for SPEC-P7 onboarding: `indexio add <folder>` discovers git
+//! End-to-end test for onboarding: `indexio add <folder>` discovers git
 //! repos at any depth (plus a plain folder), `indexio sync` delta re-indexes
 //! after commits and plain-file edits, `indexio sources` / `indexio remove` manage
 //! the sources file. Requires `git` on PATH. Fully offline.

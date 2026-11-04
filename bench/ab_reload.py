@@ -3,7 +3,7 @@ an external shard write, e.g. another session's transcript import)."""
 import json, os, subprocess, sys, time
 DATA = os.path.expanduser("~/.indexio")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # this checkout, registered as "indexio"
-MARKF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "SPEC-P9.md")
+MARKF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "CONTRIBUTING.md")
 
 def server(exe):
     p = subprocess.Popen([exe, "mcp", "--data-dir", DATA], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=REPO)

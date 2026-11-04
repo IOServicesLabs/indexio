@@ -11,7 +11,10 @@ Thumbs.db
 .vscode/
 .idea/
 __pycache__/
-# release packaging output (tools/release-assets.sh)
+# local-only maintainer notes and scripts
+/docs/
+/tools/
+# release packaging output
 /dist/
 /npm/vendor/
 /npm/node_modules/

@@ -74,7 +74,7 @@ jobs:
             fi
             # the CHANGELOG.md section of this version (A/B results and all),
             # then the generated list of merged changes
-            bash tools/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"
+            bash .github/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"
             gh release create "$tag" --target "$GITHUB_SHA" --title "indexio $version" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "released $tag"

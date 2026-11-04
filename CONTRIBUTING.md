@@ -16,8 +16,6 @@ query. Do not include tokens or private code.
 4. Write the commit message in the imperative: what the change does and why.
 5. Open a pull request. CI checks the manifests, the scripts and the workflows.
 
-`docs/DEVELOPMENT.md` explains the crates, the benchmarks and the data layout.
-
 ## License
 
 By contributing you agree that your contribution is licensed under the Apache License 2.0,

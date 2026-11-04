@@ -4,7 +4,7 @@
 # paragraphs and list items joined into single lines: a GitHub release page
 # shows every newline as a line break. Prints nothing when the version has
 # no section. Used by the release workflow.
-#   tools/release-notes.sh 0.1.9
+#   .github/release-notes.sh 0.1.9
 version="$1"
 cd "$(dirname "$0")/.." || exit 0
 [ -n "$version" ] && [ -f CHANGELOG.md ] || exit 0

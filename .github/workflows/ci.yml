@@ -20,8 +20,8 @@ jobs:
         run: |
           timeout --signal=KILL 90 bash -eo pipefail -c '
             cargo metadata --no-deps --format-version 1 --locked > /dev/null  # also fails on a stale Cargo.lock
-            python3 -m py_compile bench/*.py tools/*.py pypi/src/indexio_cli/*.py
-            bash -n install.sh tools/*.sh
+            python3 -m py_compile bench/*.py pypi/src/indexio_cli/*.py
+            bash -n install.sh .github/release-notes.sh
             node --check npm/install.js npm/bin/indexio.js
             node -e "JSON.parse(require(\"fs\").readFileSync(\"npm/package.json\"))"
             for f in .github/workflows/*.yml docker-compose.yml; do

@@ -4,7 +4,7 @@ for the edited path afterwards: 1 is right, 2 is a duplicate."""
 import os
 import json, subprocess, sys, time, threading
 DATA = os.path.expanduser("~/.indexio")
-MARKF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "SPEC-P9.md")
+MARKF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "CONTRIBUTING.md")
 EXE = sys.argv[1]
 def reindex():
     subprocess.run([EXE, "reindex", "--data-dir", DATA, "--repo", "indexio", "--worktree"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

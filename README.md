@@ -1190,15 +1190,14 @@ prescan gave no speed-up. These stay off by default.
 ```
 cargo test --workspace                  # every crate
 cargo clippy --workspace --all-targets
-tools/build-release.sh                  # release build; remaps local paths out of the binary
+cargo build --release
 ```
 
 Crates: `indexio-types` (shared types, posting codec), `indexio-core` (n-grams, verification,
 query literals), `indexio-index` (shards, merge, tombstones), `indexio-symbols` (tree-sitter
 symbols, calls and chunks for 6 languages), `indexio-ingest` (git delta, content store,
 sources), `indexio-embed` (embedders, embedding store, vector index, pipeline),
-`indexio-query` (planner, ranking, fusion, impact), `indexio` (CLI, HTTP, MCP, hooks). 
-`docs/DEVELOPMENT.md` is the operator manual.
+`indexio-query` (planner, ranking, fusion, impact), `indexio` (CLI, HTTP, MCP, hooks).
 
 CI (`.github/workflows/ci.yml`) runs on each push and pull request. It checks that the
 manifests parse, the scripts compile and the workflows are valid. It is killed after 90
@@ -1215,9 +1214,6 @@ Releases (`.github/workflows/release.yml`) come from `main`:
    package when the `NPM_TOKEN` secret exists, and publishes the `indexio-cli` wheels to
    PyPI when the `PYPI_API_TOKEN` secret exists. These jobs compile Rust and take some
    minutes.
-
-`tools/release-assets.sh` builds and attaches one asset from a maintainer machine, for a
-platform the workflow does not cover.
 
 ## License
 

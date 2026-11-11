@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.14
+
+Fixes a deadlock that left a long-running MCP server silent until it was
+restarted. No change to search results or tool output.
+
+- A background embed (a transcript import, a sync of other repos) that
+  overlapped an edit's embed or the periodic model save could block every
+  worker thread on the semantic model's lock while the holder of that lock
+  waited for those same threads. The server then used no CPU and answered no
+  further tool call; the harness gave up on each one after its 30 minute idle
+  timeout. Work done under the model lock now runs on its own thread pool, the
+  write lock is held per batch, and the server's call path no longer takes the
+  lock at all.
+- The per-repo write lock gives up at its deadline when the lock file can be
+  neither created nor removed, instead of retrying without a pause.
+- A/B against 0.1.12 on copies of a live data dir: 102 MCP calls with the same
+  answers, median 29.0 → 31.6 ms, and a full `embed --rebuild-model` that
+  writes a byte-identical model.
+
 ## 0.1.13
 
 Cleanup of the CLI help and the docs, plus an rtk hook fix. No change to search

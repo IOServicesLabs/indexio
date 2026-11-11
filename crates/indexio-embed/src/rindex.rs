@@ -673,15 +673,23 @@ impl Model {
             }
         }
         let base = self.vocab.base.as_deref().map(|b| (b, &self.vocab.removed));
-        self.vocab
-            .shards
-            .par_iter_mut()
-            .zip(per_shard.into_par_iter())
-            .for_each(|(shard, items)| {
+        let shards = &mut self.vocab.shards;
+        if updates.len() < PAR_MIN {
+            for (shard, items) in shards.iter_mut().zip(per_shard) {
                 for (term, summed) in items {
                     apply_term(shard, base, term, summed);
                 }
-            });
+            }
+            return;
+        }
+        // the caller holds the write lock: never the global pool here
+        under_model_lock(|| {
+            shards.par_iter_mut().zip(per_shard.into_par_iter()).for_each(|(shard, items)| {
+                for (term, summed) in items {
+                    apply_term(shard, base, term, summed);
+                }
+            })
+        });
     }
 
     /// Hub-cut threshold: tokens with df strictly above this
@@ -830,38 +838,42 @@ impl Model {
                 }
             }
         };
-        let mut per_shard: Vec<Vec<Vec<(f32, String)>>> = self
-            .vocab
-            .shards
-            .par_iter()
-            .map(|shard| {
-                let mut out: Vec<Vec<(f32, String)>> = vec![Vec::new(); queries.len()];
-                for (term, e) in shard.iter() {
-                    score_one(term, EntryRef { df: e.df, ctx: &e.ctx }, &mut out);
-                }
-                out
-            })
-            .collect();
-        if let Some(b) = &self.vocab.base {
-            const RANGE: usize = 8192;
-            let n = b.len();
-            let ranges: Vec<(usize, usize)> = (0..n).step_by(RANGE).map(|s| (s, (s + RANGE).min(n))).collect();
-            let vocab = &self.vocab;
-            // a read-only server never touches the overlay: skip the two
-            // hash probes per entry then
-            let shadowed = !vocab.removed.is_empty() || vocab.shards.iter().any(|m| !m.is_empty());
-            per_shard.par_extend(ranges.into_par_iter().map(|(lo, hi)| {
-                let mut out: Vec<Vec<(f32, String)>> = vec![Vec::new(); queries.len()];
-                for i in lo..hi {
-                    let (term, df, ctx) = b.entry(i);
-                    if shadowed && (vocab.removed.contains(term) || vocab.shards[Vocab::shard_of(term)].contains_key(term)) {
-                        continue;
+        // (the caller holds the read lock: never the global pool here)
+        let per_shard: Vec<Vec<Vec<(f32, String)>>> = under_model_lock(|| {
+            let mut per_shard: Vec<Vec<Vec<(f32, String)>>> = self
+                .vocab
+                .shards
+                .par_iter()
+                .map(|shard| {
+                    let mut out: Vec<Vec<(f32, String)>> = vec![Vec::new(); queries.len()];
+                    for (term, e) in shard.iter() {
+                        score_one(term, EntryRef { df: e.df, ctx: &e.ctx }, &mut out);
                     }
-                    score_one(term, EntryRef { df, ctx }, &mut out);
-                }
-                out
-            }));
-        }
+                    out
+                })
+                .collect();
+            if let Some(b) = &self.vocab.base {
+                const RANGE: usize = 8192;
+                let n = b.len();
+                let ranges: Vec<(usize, usize)> = (0..n).step_by(RANGE).map(|s| (s, (s + RANGE).min(n))).collect();
+                let vocab = &self.vocab;
+                // a read-only server never touches the overlay: skip the two
+                // hash probes per entry then
+                let shadowed = !vocab.removed.is_empty() || vocab.shards.iter().any(|m| !m.is_empty());
+                per_shard.par_extend(ranges.into_par_iter().map(|(lo, hi)| {
+                    let mut out: Vec<Vec<(f32, String)>> = vec![Vec::new(); queries.len()];
+                    for i in lo..hi {
+                        let (term, df, ctx) = b.entry(i);
+                        if shadowed && (vocab.removed.contains(term) || vocab.shards[Vocab::shard_of(term)].contains_key(term)) {
+                            continue;
+                        }
+                        score_one(term, EntryRef { df, ctx }, &mut out);
+                    }
+                    out
+                }));
+            }
+            per_shard
+        });
         (0..queries.len())
             .map(|qi| {
                 let mut scored: Vec<(f32, &str)> =
@@ -889,6 +901,54 @@ impl Model {
             self.vocab.remove(&t);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallelism under the model lock
+// ---------------------------------------------------------------------------
+
+/// Texts (or text updates) below which a section runs on the calling thread:
+/// a query is one text and an edit a handful of chunks.
+const PAR_MIN: usize = 8;
+
+/// The pool for every parallel section that runs WHILE THE MODEL LOCK IS
+/// HELD, and for nothing else.
+///
+/// The global rayon pool cannot be used there. `pipeline::embed_works` calls
+/// `embed` from every global worker and the hybrid legs call it from one, so
+/// global workers wait for the model lock; a holder that then waited for the
+/// global pool waited for threads that were waiting for it. A background
+/// embed overlapping one `observe` or one model save wedged the whole
+/// process that way: no CPU, every later tool call blocked on the lock, and
+/// the harness gave up on each after its 30 minute idle timeout.
+///
+/// Jobs on this pool only read or write model data handed to them; they
+/// never take the model lock, so a holder waiting for them always gets them.
+fn model_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("rindex-{i}"))
+            .build()
+            .expect("rindex thread pool")
+    })
+}
+
+/// Run `f`, a parallel section over model data, for a thread that holds the
+/// model lock: on [`model_pool`], with the caller blocked until it is done.
+///
+/// A caller that is itself a rayon worker hands the wait to a plain thread.
+/// A worker waiting inside `install` keeps running other queued jobs of its
+/// own pool, and one of those may ask for the lock this thread holds: a
+/// second read behind a waiting writer never returns.
+fn under_model_lock<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_none() {
+        return model_pool().install(f);
+    }
+    std::thread::scope(|s| match s.spawn(|| model_pool().install(f)).join() {
+        Ok(r) => r,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +986,10 @@ pub struct RandomIndexingEmbedder {
     observed_since_clear: std::sync::atomic::AtomicUsize,
     /// The expansion cache gained entries since it was last written.
     expand_dirty: std::sync::atomic::AtomicBool,
+    /// The model's `n_texts_seen`, readable without the model lock: the MCP
+    /// server asks on its call path, and a model save holds the write lock
+    /// for as long as the snapshot takes to write.
+    seen: std::sync::atomic::AtomicU64,
 }
 
 /// Observed texts after which cached query expansions are considered stale.
@@ -1002,6 +1066,7 @@ impl RandomIndexingEmbedder {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         Ok(RandomIndexingEmbedder {
+            seen: std::sync::atomic::AtomicU64::new(model.n_texts_seen),
             model: RwLock::new(model),
             path,
             cap,
@@ -1129,6 +1194,8 @@ impl RandomIndexingEmbedder {
     pub fn save_now(&self) -> anyhow::Result<()> {
         let mut m = self.model.write().expect("rindex model lock poisoned");
         m.save_snapshot(&self.path)?;
+        // (a save rebases onto another server's snapshot and adds its count)
+        self.seen.store(m.n_texts_seen, std::sync::atomic::Ordering::Release);
         drop(m);
         self.dirty.store(false, std::sync::atomic::Ordering::Release);
         *self.last_save.lock().expect("last_save poisoned") = std::time::Instant::now();
@@ -1181,21 +1248,29 @@ impl Embedder for RandomIndexingEmbedder {
     }
 
     fn texts_seen(&self) -> Option<u64> {
-        Some(self.model.read().expect("rindex model lock poisoned").n_texts_seen)
+        Some(self.seen.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// Embedding is pure per text under a shared read lock: rayon across
-    /// the batch. Output order = input order.
+    /// Embedding is pure per text under a shared read lock, in parallel
+    /// across the batch (see [`under_model_lock`]). Output order = input
+    /// order.
     fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         let m = self.model.read().expect("rindex model lock poisoned");
         let model: &Model = &m;
-        Ok(texts.par_iter().map(|t| model.embed_text(t)).collect())
+        if texts.len() < PAR_MIN {
+            return Ok(texts.iter().map(|t| model.embed_text(t)).collect());
+        }
+        Ok(under_model_lock(|| texts.par_iter().map(|t| model.embed_text(t)).collect()))
     }
 
     /// Per-text updates are computed in parallel (pure), then applied
     /// sequentially in input order — identical results to a serial
     /// observe, including the streaming property (piecewise == batch).
     /// Batched so the buffered contributions stay bounded in memory.
+    ///
+    /// The write lock is held per batch and only while the batch is
+    /// applied: the updates need no model state, so they are computed
+    /// before it is taken and embeds and queries run in between.
     fn observe(&self, texts: &[String]) -> anyhow::Result<()> {
         const OBSERVE_BATCH: usize = 256;
         // Neighbourhoods shift as the model learns; drop cached expansions
@@ -1208,18 +1283,24 @@ impl Embedder for RandomIndexingEmbedder {
             self.expand_cache.write().expect("expand cache lock poisoned").clear();
             self.observed_since_clear.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut m = self.model.write().expect("rindex model lock poisoned");
         let (mut compute_ms, mut apply_ms) = (0u128, 0u128);
         for batch in texts.chunks(OBSERVE_BATCH) {
             let t = std::time::Instant::now();
             let updates: Vec<TextUpdate> = batch.par_iter().map(|t| compute_update(t)).collect();
             compute_ms += t.elapsed().as_millis();
             let t = std::time::Instant::now();
+            let mut m = self.model.write().expect("rindex model lock poisoned");
             m.apply_batch(&updates);
+            self.seen.store(m.n_texts_seen, std::sync::atomic::Ordering::Release);
+            drop(m);
             apply_ms += t.elapsed().as_millis();
         }
         let t = std::time::Instant::now();
-        m.enforce_cap(self.cap);
+        let vocab = {
+            let mut m = self.model.write().expect("rindex model lock poisoned");
+            m.enforce_cap(self.cap);
+            m.vocab.len()
+        };
         if !texts.is_empty() {
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -1228,7 +1309,7 @@ impl Embedder for RandomIndexingEmbedder {
             compute_ms = compute_ms as u64,
             apply_ms = apply_ms as u64,
             cap_ms = t.elapsed().as_millis() as u64,
-            vocab = m.vocab.len(),
+            vocab,
             "rindex observe"
         );
         Ok(())

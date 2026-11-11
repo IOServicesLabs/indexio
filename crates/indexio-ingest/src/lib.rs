@@ -1358,30 +1358,39 @@ impl RepoLock {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(format!("{repo}.lock"));
         let deadline = Instant::now() + wait;
+        // immediate retries after a lock went away; past these every retry
+        // waits, so a lock that can be neither created nor removed (a held
+        // handle, a name the filesystem refuses) ends at the deadline
+        // instead of spinning on the call path for good
+        let mut retries_now = 2u8;
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    use std::io::Write as _;
-                    let _ = write!(f, "{}", std::process::id());
-                    return Some(RepoLock { path });
-                }
-                Err(_) => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_none_or(|age| age.as_secs() > REPO_LOCK_STALE_SECS);
-                    if stale {
-                        warn!(path = %path.display(), "taking over a stale repo lock");
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
+            if let Ok(mut f) = fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                use std::io::Write as _;
+                let _ = write!(f, "{}", std::process::id());
+                return Some(RepoLock { path });
             }
+            let stale = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age.as_secs() > REPO_LOCK_STALE_SECS);
+            let gone = stale
+                && match fs::remove_file(&path) {
+                    Ok(()) => {
+                        warn!(path = %path.display(), "took over a stale repo lock");
+                        true
+                    }
+                    // released between the two looks
+                    Err(e) => e.kind() == io::ErrorKind::NotFound,
+                };
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if gone && retries_now > 0 {
+                retries_now -= 1;
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -1849,6 +1858,41 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo lock that cannot be created at all gives up at the deadline:
+    /// with nothing to stat it looked stale, the takeover removed nothing,
+    /// and the retry used to loop without a sleep or a look at the clock —
+    /// on the tool-call path, since the auto-refresh takes this lock.
+    #[test]
+    fn a_repo_lock_that_cannot_be_created_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let data_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            // `repos/missing/` does not exist: the create fails and so do the stat and the remove
+            let got = RepoLock::acquire(&data_dir, "missing/repo", Duration::from_millis(150));
+            let _ = tx.send(got.is_some());
+        });
+        let held = rx.recv_timeout(Duration::from_secs(10)).expect("RepoLock::acquire never returned");
+        assert!(!held, "a lock file that was never created cannot be held");
+    }
+
+    /// A released lock is taken at once, and one left by a dead process
+    /// (older than the stale age) is taken over.
+    #[test]
+    fn a_repo_lock_is_reacquired_after_release_and_taken_over_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = RepoLock::acquire(dir.path(), "r", Duration::from_millis(50)).expect("free lock");
+        assert!(RepoLock::acquire(dir.path(), "r", Duration::from_millis(60)).is_none(), "held by `first`");
+        drop(first);
+        let again = RepoLock::acquire(dir.path(), "r", Duration::from_millis(50)).expect("released lock");
+        // a holder that died: its file stays, and ages
+        let path = dir.path().join("repos").join("r.lock");
+        std::mem::forget(again);
+        let old = std::time::SystemTime::now() - Duration::from_secs(REPO_LOCK_STALE_SECS + 60);
+        fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        assert!(RepoLock::acquire(dir.path(), "r", Duration::from_millis(50)).is_some(), "stale lock taken over");
     }
 
     /// A valid one-page PDF whose page shows `text` (Helvetica), or an empty

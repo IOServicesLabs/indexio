@@ -622,7 +622,7 @@ impl Vocab {
 
     /// Every live entry, overlay first, then the snapshot's entries the
     /// overlay does not shadow.
-    fn for_each(&self, mut f: impl FnMut(&str, EntryRef<'_>)) {
+    fn for_each<'a>(&'a self, mut f: impl FnMut(&'a str, EntryRef<'a>)) {
         for m in &self.shards {
             for (t, e) in m {
                 f(t, EntryRef { df: e.df, ctx: &e.ctx });
@@ -646,12 +646,103 @@ impl Vocab {
         out
     }
 
-    /// Sorted `(term, df, ctx)` of every live entry: what a snapshot holds.
+    /// Sorted `(term, df, ctx)` of every live entry, as owned copies: what
+    /// a save used to build (~270 MB for the 250,000-term model) before
+    /// writing. Kept for the tests that compare the streamed file with it.
+    #[cfg(test)]
     fn to_entries(&self) -> Vec<(String, u32, Vec<Comp>)> {
         let mut v: Vec<(String, u32, Vec<Comp>)> = Vec::with_capacity(self.len());
         self.for_each(|t, e| v.push((t.to_string(), e.df, e.ctx.to_vec())));
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
+    }
+
+    /// Write every live entry as a snapshot at `path`, in term order,
+    /// copying none of them: the snapshot is already sorted on disk, so the
+    /// sorted keys of the overlay (24 B per changed term) are merged with it
+    /// as the writer walks them.
+    fn write_snapshot(&self, path: &Path, n_texts_seen: u64) -> anyhow::Result<()> {
+        let base = self.base.as_deref();
+        if base.is_some_and(|b| !snapshot_is_sorted(b)) {
+            // No writer of the format leaves a snapshot out of order; one
+            // that is cannot be merged. Sort references to every entry
+            // instead (40 B per term), which is what the owned copies were
+            // sorted into before.
+            let mut all: Vec<rimodel::EntryView<'_>> = Vec::new();
+            self.for_each(|t, e| all.push((t, e.df, e.ctx)));
+            all.sort_by(|a, b| a.0.cmp(b.0));
+            return Snapshot::write_sorted(path, DIM as u32, n_texts_seen, || all.iter().copied());
+        }
+        let mut overlay: Vec<(&str, &Entry)> =
+            self.shards.iter().flat_map(|m| m.iter().map(|(t, e)| (t.as_str(), e))).collect();
+        overlay.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        Snapshot::write_sorted(path, DIM as u32, n_texts_seen, || Merged {
+            overlay: &overlay,
+            base,
+            removed: &self.removed,
+            next_overlay: 0,
+            next_base: 0,
+        })
+    }
+}
+
+/// Whether the snapshot's terms are strictly ascending (one pass over its
+/// entry records and term bytes).
+fn snapshot_is_sorted(b: &Snapshot) -> bool {
+    let mut prev: Option<&str> = None;
+    (0..b.len()).all(|i| {
+        let t = b.entry(i).0;
+        let ascending = prev.is_none_or(|p| p < t);
+        prev = Some(t);
+        ascending
+    })
+}
+
+/// Every live entry of a vocabulary in term order: the sorted overlay
+/// merged with the (sorted) snapshot. An overlay entry shadows the
+/// snapshot's entry of the same term; snapshot terms evicted by the cap are
+/// skipped. The same set [`Vocab::for_each`] visits.
+struct Merged<'a> {
+    overlay: &'a [(&'a str, &'a Entry)],
+    base: Option<&'a Snapshot>,
+    removed: &'a HashSet<String>,
+    next_overlay: usize,
+    next_base: usize,
+}
+
+impl<'a> Iterator for Merged<'a> {
+    type Item = rimodel::EntryView<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let overlay = self.overlay.get(self.next_overlay).copied();
+            let base = self.base.filter(|b| self.next_base < b.len()).map(|b| b.entry(self.next_base));
+            let from_base = match (overlay, base) {
+                (None, None) => return None,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some((ot, _)), Some((bt, _, _))) => match ot.cmp(bt) {
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => {
+                        // shadowed
+                        self.next_base += 1;
+                        false
+                    }
+                },
+            };
+            if from_base {
+                let (t, df, ctx) = base.expect("chosen above");
+                self.next_base += 1;
+                if !self.removed.contains(t) {
+                    return Some((t, df, ctx));
+                }
+            } else {
+                let (t, e) = overlay.expect("chosen above");
+                self.next_overlay += 1;
+                return Some((t, e.df, &e.ctx));
+            }
+        }
     }
 }
 
@@ -775,7 +866,21 @@ impl Model {
     /// there first — its terms survive, ours are applied on top (a term
     /// both changed keeps ours; `n_texts_seen` adds our share). Without
     /// this the last writer silently dropped the other's updates.
+    ///
+    /// The file is streamed from the mapped snapshot and the overlay
+    /// ([`Vocab::write_snapshot`]); the overlay's memory is released when
+    /// the new snapshot takes its place.
     fn save_snapshot(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.rebase(path);
+        self.vocab.write_snapshot(path, self.n_texts_seen)?;
+        let snap = Snapshot::open(path)?;
+        self.vocab = Vocab::with_base(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Continue on top of the snapshot at `path` if another writer has put
+    /// a newer one there (see [`save_snapshot`](Self::save_snapshot)).
+    fn rebase(&mut self, path: &Path) {
         // (also when we started from nothing and another server has since
         // written the first snapshot)
         if path.is_file() && rimodel::is_snapshot(path) {
@@ -789,12 +894,6 @@ impl Model {
                 }
             }
         }
-        let entries = self.vocab.to_entries();
-        Snapshot::write(path, DIM as u32, self.n_texts_seen, &entries)?;
-        drop(entries);
-        let snap = Snapshot::open(path)?;
-        self.vocab = Vocab::with_base(Arc::new(snap));
-        Ok(())
     }
 
     /// Apply a batch of text updates: shards in parallel, each shard's
@@ -1676,6 +1775,111 @@ mod tests {
             assert_eq!(label(&t), label_compute(&t));
         }
         assert_eq!(std::mem::size_of::<LabelSlot>(), 64);
+    }
+
+    /// Deterministic texts over a vocabulary of `distinct` words: frequent
+    /// ones (so contexts fill up and get truncated) and rare ones.
+    fn generated_texts(n: usize, distinct: usize, seed: u64) -> Vec<String> {
+        let mut x = seed.max(1);
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as usize
+        };
+        (0..n)
+            .map(|_| {
+                let words = 6 + next() % 30;
+                let mut t = String::new();
+                for i in 0..words {
+                    let w = if next() % 3 == 0 { next() % 12 } else { 12 + next() % distinct };
+                    t.push_str(&format!("w{w}x"));
+                    t.push(if i == 2 { '\n' } else { ' ' });
+                }
+                t
+            })
+            .collect()
+    }
+
+    /// The file a save streams out of the mapped snapshot and the overlay
+    /// is, byte for byte, the image the first writer built from owned,
+    /// sorted copies of the whole vocabulary: for an overlay alone, for an
+    /// overlay that inserts into, updates and evicts from a snapshot, for
+    /// no change at all, after a rebase onto another writer's file, and
+    /// for a snapshot that is not sorted.
+    #[test]
+    fn streamed_save_equals_the_materialized_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = RandomIndexingEmbedder::model_path(tmp.path());
+        let e = RandomIndexingEmbedder::open_with_cap(tmp.path(), 900).unwrap();
+        let image = |m: &Model| Snapshot::materialized_image(DIM as u32, m.n_texts_seen, &m.vocab.to_entries()).unwrap();
+        let save_and_compare = |e: &RandomIndexingEmbedder, what: &str| {
+            let mut m = e.model.write().unwrap();
+            let want = image(&m);
+            m.save_snapshot(&path).unwrap();
+            let got = std::fs::read(&path).unwrap();
+            assert!(got == want, "{what}: the streamed file ({} B) is not the materialized image ({} B)", got.len(), want.len());
+            assert!(m.vocab.shards.iter().all(|s| s.is_empty()) && m.vocab.removed.is_empty(), "{what}: the overlay is empty after a save");
+        };
+
+        // 1. everything in the overlay, evictions included (no snapshot yet)
+        e.observe(&generated_texts(120, 700, 1)).unwrap();
+        assert!(e.vocab_len() == 900, "the generated text must cross the cap: {}", e.vocab_len());
+        save_and_compare(&e, "overlay only");
+
+        // 2. on top of a snapshot: updates of its terms, new terms, and
+        //    evictions of terms that live only in the snapshot
+        e.observe(&generated_texts(60, 1500, 2)).unwrap();
+        {
+            let m = e.model.read().unwrap();
+            let base = m.vocab.base.as_ref().unwrap();
+            let overlay: Vec<&String> = m.vocab.shards.iter().flat_map(|s| s.keys()).collect();
+            assert!(overlay.iter().any(|t| base.get(t).is_some()), "an update of a snapshot term");
+            assert!(overlay.iter().any(|t| base.get(t).is_none()), "an insert");
+            assert!(!m.vocab.removed.is_empty(), "an eviction from the snapshot");
+        }
+        // ... and a term evicted from the snapshot, then observed again
+        // (often enough to stay under the cap this time)
+        let evicted: String = e.model.read().unwrap().vocab.removed.iter().min().unwrap().clone();
+        e.observe(&vec![format!("{evicted} w0x w1x w2x"); 4]).unwrap();
+        {
+            let m = e.model.read().unwrap();
+            assert!(m.vocab.removed.contains(&evicted), "{evicted:?} stays evicted from the snapshot");
+            assert!(m.vocab.shards[Vocab::shard_of(&evicted)].contains_key(&evicted), "{evicted:?} is back as a new term");
+        }
+        save_and_compare(&e, "overlay on a snapshot");
+
+        // 3. nothing changed
+        let before = std::fs::read(&path).unwrap();
+        save_and_compare(&e, "no change");
+        assert!(std::fs::read(&path).unwrap() == before);
+
+        // 4. another writer saved in between: rebase, then the same merge
+        let other = RandomIndexingEmbedder::open_with_cap(tmp.path(), 900).unwrap();
+        e.observe(&generated_texts(15, 1500, 3)).unwrap();
+        other.observe(&generated_texts(25, 1500, 4)).unwrap();
+        other.save_now().unwrap();
+        {
+            let mut m = e.model.write().unwrap();
+            let seen_before = m.n_texts_seen;
+            m.rebase(&path);
+            assert_eq!(m.n_texts_seen, seen_before + 25, "rebased onto the other writer's snapshot");
+        }
+        save_and_compare(&e, "after a rebase");
+
+        // 5. a snapshot that is not sorted (no writer leaves one; forged
+        //    here): the save still writes what sorting everything would
+        drop(other);
+        let mut forged = e.model.read().unwrap().vocab.to_entries();
+        forged.truncate(300);
+        forged.reverse();
+        drop(e);
+        std::fs::write(&path, Snapshot::materialized_image(DIM as u32, 77, &forged).unwrap()).unwrap();
+        let e = RandomIndexingEmbedder::open_with_cap(tmp.path(), 900).unwrap();
+        assert!(!snapshot_is_sorted(e.model.read().unwrap().vocab.base.as_ref().unwrap()));
+        e.observe(&generated_texts(10, 1500, 5)).unwrap();
+        save_and_compare(&e, "unsorted snapshot");
+        assert!(snapshot_is_sorted(e.model.read().unwrap().vocab.base.as_ref().unwrap()));
     }
 
     /// the direction permutations are deterministic, true

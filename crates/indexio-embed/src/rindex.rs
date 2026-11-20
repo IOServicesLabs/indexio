@@ -1145,6 +1145,7 @@ impl RandomIndexingEmbedder {
     pub(crate) fn open_with_cap(data_dir: &Path, cap: usize) -> anyhow::Result<Self> {
         let path = Self::model_path(data_dir);
         rimodel::reap_parked(&path);
+        rimodel::reap_stale_temps(&path);
         let model = if path.is_file() && rimodel::is_snapshot(&path) {
             // mapped, nothing read up front
             let snap = Snapshot::open(&path)?;

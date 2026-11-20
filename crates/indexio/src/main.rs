@@ -13,6 +13,7 @@ mod sessions;
 mod usage;
 mod watch;
 mod serve;
+mod sysmem;
 #[cfg(feature = "memstat")]
 mod memstat;
 
@@ -312,6 +313,18 @@ enum Commands {
         /// segments as int8 rows).
         #[arg(long)]
         vectors: bool,
+    },
+    /// One maintenance pass over the data dir, as a process of its own:
+    /// merge shards, compact the semantic segments, re-embed after model
+    /// drift, whichever is due, under the cross-process compaction lock. An
+    /// MCP server starts this instead of doing the work itself, so the
+    /// gigabytes a pass needs for a moment never become part of a
+    /// long-lived server. Exit status 3 = another process holds the lock.
+    #[command(hide = true)]
+    Maintain {
+        /// The semantic plane to maintain (default: the configured embedder's).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Engine + CAS statistics.
     Stats {
@@ -1078,6 +1091,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Maintain { model } => {
+            mcp::maintain::arm_child_deadline();
+            let embedder = select_embedder(None, &data_dir)?;
+            let code = mcp::maintain::run_child(&data_dir, embedder.as_ref(), model.as_deref());
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::Compact { max_shards, vectors } => {
             // one compaction at a time across the data dir: a server's
             // maintenance process may be merging the same shards right now
@@ -1772,6 +1793,17 @@ mod tests {
         assert_eq!(pool_size(true, Some("many"), false, 32), Some(MCP_THREADS), "not a number: the default");
         // RAYON_NUM_THREADS alone: rayon reads it for both pools
         assert_eq!(pool_size(true, None, true, 32), None);
+    }
+
+    #[test]
+    fn maintain_is_a_hidden_subcommand() {
+        let cli = Cli::try_parse_from(["indexio", "--data-dir", "d", "maintain", "--model", "rindex-v2"]).unwrap();
+        match cli.command {
+            Commands::Maintain { model } => assert_eq!(model.as_deref(), Some("rindex-v2")),
+            _ => panic!("expected maintain"),
+        }
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("maintain"), "the maintenance child is not a user command");
     }
 
     #[test]

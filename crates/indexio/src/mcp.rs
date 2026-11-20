@@ -28,6 +28,8 @@ use indexio_query::{Engine, FusionAlgo, SearchMode};
 
 use crate::mcp_text;
 
+pub(crate) mod maintain;
+
 const PARSE_ERROR: i64 = -32700;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
@@ -112,6 +114,13 @@ pub struct McpServer {
     /// never abandoned between writing the merged segment and removing
     /// its inputs.
     compactor: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The maintenance process this server started for a due pass (see
+    /// [`maintain`]); `compacting` stays set until it has exited, so a
+    /// second one is never started beside it. Not waited for at shutdown:
+    /// it is detached and finishes on its own.
+    maint_child: Arc<Mutex<Option<std::process::Child>>>,
+    /// No new maintenance child before this time: the last one failed.
+    maint_retry: Mutex<Option<std::time::Instant>>,
     /// Engine whose sidecars were opened by `prewarm_sidecars`, waiting
     /// to be adopted.
     warm: Arc<Mutex<Option<Engine>>>,
@@ -199,6 +208,9 @@ const SYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 const ADOPT_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often a server counts the shards for a compaction it did not cause.
 const COMPACT_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a server waits after a maintenance child that failed before it
+/// starts another.
+const MAINT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Guidance block for a harness's project/user instructions file
 /// (`indexio setup claude` prints/appends it).
@@ -253,6 +265,8 @@ impl McpServer {
             compacting: Arc::new(AtomicBool::new(false)),
             reload_needed: Arc::new(AtomicBool::new(false)),
             compactor: Mutex::new(None),
+            maint_child: Arc::new(Mutex::new(None)),
+            maint_retry: Mutex::new(None),
             warm: Arc::new(Mutex::new(None)),
             pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             repair_tried: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -702,9 +716,12 @@ impl McpServer {
     /// Fold the oldest shards together in the background once more than
     /// [`COMPACT_ABOVE`] exist: every refresh that changed
     /// something adds a delta shard and every lookup probes each shard.
-    /// The merge (~20 s on 100 MB of source) never blocks a tool call; the
-    /// engine is reopened by the next call after it finishes. Shards this
-    /// or another process still has mapped are parked by the merge and
+    /// The same pass compacts the semantic segments and re-embeds the plane
+    /// after model drift. None of it blocks a tool call, and none of it
+    /// runs in this process unless it has to: the pass is handed to a
+    /// short-lived `indexio maintain` child (see [`maintain`]), whose
+    /// results the next call finds like any other process's writes. Shards
+    /// this or another process still has mapped are parked by the merge and
     /// reaped by later opens.
     fn maybe_compact(&self) {
         let data_dir: Option<std::path::PathBuf> = {
@@ -712,58 +729,56 @@ impl McpServer {
             guard.data_dir().map(|d| d.to_path_buf())
         };
         let Some(data_dir) = data_dir else { return };
-        let shards_dir = data_dir.join("shards");
+        // a pass this server handed to a child: one at a time, and not
+        // again for a while after one that failed
+        if !self.maint_child_exited() {
+            return;
+        }
+        if self.maint_retry.lock().is_ok_and(|t| t.is_some_and(|t| std::time::Instant::now() < t)) {
+            return;
+        }
         let model_id = self.embedder.model_id().to_string();
-        // a directory listing, not an open of every shard
-        let n = shards_stamp(&shards_dir).0;
-        let shards_due = n > COMPACT_ABOVE;
-        let vectors_due = indexio_embed::pipeline::needs_compaction(&data_dir, &model_id);
-        // the model has learned a lot since the rows were
+        // a directory listing and segment stats, not an open of every shard;
+        // re-embed: the model has learned a lot since the rows were
         // embedded — rebuild the plane whole (30 s for 218k rows)
-        let reembed_due = indexio_embed::pipeline::reembed_due(&data_dir, &model_id, self.embedder.texts_seen());
-        if !(shards_due || vectors_due || reembed_due) || self.compacting.swap(true, Ordering::AcqRel) {
+        let due = maintain::due(&data_dir, &model_id, self.embedder.texts_seen());
+        if !due.any() || self.compacting.swap(true, Ordering::AcqRel) {
             return;
         }
         let compacting = Arc::clone(&self.compacting);
         let reload = Arc::clone(&self.reload_needed);
         let embedder = Arc::clone(&self.embedder);
+        let child_slot = Arc::clone(&self.maint_child);
+        let in_process = maintain::in_process();
         let handle = std::thread::spawn(move || {
-            let t0 = std::time::Instant::now();
+            if !in_process {
+                // another process is at it already: look again in a minute
+                if indexio_embed::pipeline::CompactLock::is_held(&data_dir) {
+                    tracing::debug!("compaction skipped: another process holds the lock");
+                    compacting.store(false, Ordering::Release);
+                    return;
+                }
+                // the child reads the model from disk: what this server has
+                // learned must be there before a re-embed
+                if due.reembed {
+                    if let Err(e) = embedder.persist() {
+                        tracing::warn!(error = %e, "model save before the re-embed failed");
+                    }
+                }
+                match maintain::spawn_child(&data_dir, &model_id) {
+                    Ok(child) => {
+                        tracing::info!(pid = child.id(), ?due, "maintenance handed to a child process");
+                        // `compacting` stays set until the child is seen to have exited
+                        *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+                        return;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "cannot start the maintenance process; compacting in this one"),
+                }
+            }
             // one compaction at a time across every server sharing the data dir
-            let Some(_lock) = indexio_embed::pipeline::CompactLock::try_acquire(&data_dir) else {
-                tracing::debug!("compaction skipped: another process holds the lock");
-                compacting.store(false, Ordering::Release);
-                return;
-            };
-            if shards_due {
-                match indexio_index::ShardSet::open_dir(&shards_dir) {
-                    Ok(mut set) => match set.merge(&shards_dir, COMPACT_TO) {
-                        Ok(()) => tracing::info!(from = n, to = COMPACT_TO, ms = t0.elapsed().as_millis() as u64, "shards compacted"),
-                        Err(e) => tracing::warn!(error = %e, "shard compaction failed"),
-                    },
-                    Err(e) => tracing::warn!(error = %e, "shard compaction: cannot open shards"),
-                }
+            if let maintain::Outcome::Done(_) = maintain::run(&data_dir, embedder.as_ref(), &model_id) {
+                reload.store(true, Ordering::Release);
             }
-            if reembed_due {
-                match indexio_index::ShardSet::open_dir(&shards_dir)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|set| indexio_embed::pipeline::embed_all(&set, &data_dir, embedder.as_ref()))
-                {
-                    Ok(reps) => tracing::info!(
-                        rows = reps.iter().map(|r| r.chunks).sum::<u64>(),
-                        ms = t0.elapsed().as_millis() as u64,
-                        "semantic plane re-embedded (model drift)"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "re-embed failed"),
-                }
-            } else if vectors_due {
-                match indexio_embed::pipeline::compact_vectors(&data_dir, &model_id) {
-                    Ok(true) => tracing::info!(ms = t0.elapsed().as_millis() as u64, "vector segments compacted"),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(error = %e, "vector compaction failed"),
-                }
-            }
-            reload.store(true, Ordering::Release);
             compacting.store(false, Ordering::Release);
         });
         let mut slot = self.compactor.lock().expect("compactor lock poisoned");
@@ -771,6 +786,47 @@ impl McpServer {
             let _ = prev.join(); // finished already (the flag was clear)
         }
         *slot = Some(handle);
+    }
+
+    /// Whether no maintenance child of this server is running: `true` when
+    /// there is none, or when the one there was has exited (it is reaped and
+    /// `compacting` cleared). What it wrote is picked up by
+    /// [`reload_if_needed`](Self::reload_if_needed) and the sidecar stamps.
+    fn maint_child_exited(&self) -> bool {
+        let mut slot = self.maint_child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(child) = slot.as_mut() else { return true };
+        match child.try_wait() {
+            Ok(None) => false,
+            done => {
+                let failed = match done {
+                    Ok(Some(status)) if status.code() == Some(maintain::EXIT_BUSY) => {
+                        tracing::debug!("maintenance child found the lock taken");
+                        false
+                    }
+                    Ok(Some(status)) if status.success() => {
+                        tracing::info!("maintenance child finished");
+                        false
+                    }
+                    Ok(Some(status)) => {
+                        tracing::warn!(%status, "maintenance child failed");
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot wait for the maintenance child");
+                        true
+                    }
+                };
+                // whatever made it fail is likely still there: a process a
+                // minute, from every server, would only add to it
+                if let Ok(mut retry) = self.maint_retry.lock() {
+                    *retry = failed.then(|| std::time::Instant::now() + MAINT_RETRY_AFTER);
+                }
+                *slot = None;
+                self.compacting.store(false, Ordering::Release);
+                true
+            }
+        }
     }
 
     /// [`maybe_compact`](Self::maybe_compact) once a minute regardless of

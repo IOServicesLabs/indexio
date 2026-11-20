@@ -57,6 +57,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::Context;
@@ -202,27 +203,162 @@ pub fn tokenize(text: &str) -> Vec<RiToken> {
 /// dim.
 type Label = [(u32, f32); LABEL_NONZEROS];
 
-/// Process-wide label cache. `label()` is pure but costs a blake3 XOF, a
-/// 2 KiB scratch array and a sort per call, and `observe` visits every
-/// token once per neighbor (6x) — this cache is the single largest win in
-/// the embed pipeline. Bounded to keep memory sane on
-/// pathological vocabularies; misses past the bound just recompute.
-fn label_cached(term: &str) -> Label {
-    const CACHE_MAX: usize = 2_000_000;
-    static CACHE: OnceLock<RwLock<HashMap<String, Label>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(l) = cache.read().expect("label cache poisoned").get(term) {
-        return *l;
-    }
-    let l = label(term);
-    let mut w = cache.write().expect("label cache poisoned");
-    if w.len() < CACHE_MAX {
-        w.insert(term.to_string(), l);
-    }
-    l
+/// Bytes of XOF output read at a time: one blake3 output block.
+const LABEL_XOF_BLOCK: usize = 64;
+
+/// The label of `term`: from the process-wide [`LabelCache`], else computed.
+fn label(term: &str) -> Label {
+    static CACHE: OnceLock<LabelCache> = OnceLock::new();
+    CACHE.get_or_init(|| LabelCache::new(LABEL_CACHE_SLOTS)).get(term)
 }
 
-fn label(term: &str) -> Label {
+/// The derivation itself. One 64-byte read of the XOF is the same stream as
+/// sixteen 4-byte reads, but each read recomputes a whole blake3 output
+/// block: read word by word (as this was first written) a label cost 8 or
+/// more compressions instead of 1.
+fn label_compute(term: &str) -> Label {
+    label_from_blocks::<LABEL_XOF_BLOCK>(term)
+}
+
+/// [`label_compute`] reading the XOF `N` bytes at a time (`N` a multiple of
+/// 4): the result does not depend on `N`, which the tests use to exercise
+/// the refill (a real label needs a second block with probability below
+/// 1e-17).
+fn label_from_blocks<const N: usize>(term: &str) -> Label {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ri-label");
+    h.update(term.as_bytes());
+    let mut xof = h.finalize_xof();
+    let mut block = [0u8; N];
+    let mut at = N;
+    let mut out = [(0u32, 0.0f32); LABEL_NONZEROS];
+    let mut filled = 0;
+    while filled < LABEL_NONZEROS {
+        if at == N {
+            xof.fill(&mut block);
+            at = 0;
+        }
+        let v = u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+        at += 4;
+        let dim = (v >> 1) % DIM as u32;
+        if out[..filled].iter().any(|&(d, _)| d == dim) {
+            continue;
+        }
+        let sign = if v & 1 == 0 { 1.0f32 } else { -1.0f32 };
+        out[filled] = (dim, sign);
+        filled += 1;
+    }
+    out.sort_unstable_by_key(|&(d, _)| d);
+    out
+}
+
+/// Slots of the process-wide label cache: 64 B each, 4 MiB in all.
+const LABEL_CACHE_SLOTS: usize = 1 << 16;
+/// Longest term (in bytes) a slot holds; longer ones are computed each time.
+const LABEL_KEY_MAX: usize = 31;
+
+// a packed label gives each nonzero 15 bits of dim and one sign bit
+const _: () = assert!(DIM <= 1 << 15 && LABEL_NONZEROS == 8);
+
+/// A fixed-size, direct-mapped, lock-free cache of labels.
+///
+/// The cache this replaces was a `HashMap<String, Label>` behind an
+/// `RwLock` that kept every token and bigram the process ever embedded: up
+/// to 2,000,000 entries of ~170 B that were never evicted (several hundred
+/// MB in a long-lived server), and a lock word every embedding thread wrote
+/// on every lookup. This one cannot grow: a slot is one cache line holding
+/// the term itself (so a hash collision is a miss, never another term's
+/// label) and its label packed into 16 bytes; a new term overwrites
+/// whatever its slot held. A hit writes nothing, so threads do not contend.
+///
+/// Slots are sequence locks over plain atomics. A writer makes `seq` odd
+/// with a compare-exchange (a second writer gives up: nothing is lost, the
+/// label was computed anyway), stores the key and the label, then makes it
+/// even again. A reader keeps what it loaded only if `seq` was even before
+/// and had the same value after; every word it read was then stored before
+/// that value of `seq` was, by one writer, so the label belongs to the key
+/// it compared.
+struct LabelCache {
+    slots: Box<[LabelSlot]>,
+}
+
+#[repr(align(64))]
+#[derive(Default)]
+struct LabelSlot {
+    /// Odd while a writer is in the slot; never the same after a write.
+    seq: AtomicU64,
+    /// The term's bytes, zero padded, with its length + 1 in the last byte
+    /// (an empty slot matches no term).
+    key: [AtomicU64; 4],
+    /// The label: per nonzero, `dim | (negative as u16) << 15`.
+    label: [AtomicU64; 2],
+}
+
+impl LabelCache {
+    /// `slots` must be a power of two.
+    fn new(slots: usize) -> Self {
+        assert!(slots.is_power_of_two());
+        LabelCache { slots: (0..slots).map(|_| LabelSlot::default()).collect() }
+    }
+
+    fn get(&self, term: &str) -> Label {
+        let bytes = term.as_bytes();
+        if bytes.len() > LABEL_KEY_MAX {
+            return label_compute(term);
+        }
+        let mut padded = [0u8; LABEL_KEY_MAX + 1];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        padded[LABEL_KEY_MAX] = bytes.len() as u8 + 1;
+        let mut key = [0u64; 4];
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        for (k, b) in key.iter_mut().zip(padded.chunks_exact(8)) {
+            *k = u64::from_le_bytes(b.try_into().expect("8 bytes"));
+            h = (h ^ *k).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            h ^= h >> 29;
+        }
+        let slot = &self.slots[(h >> 24) as usize & (self.slots.len() - 1)];
+
+        let seq = slot.seq.load(Ordering::Acquire);
+        if seq & 1 == 0 {
+            let found: [u64; 4] = std::array::from_fn(|i| slot.key[i].load(Ordering::Acquire));
+            let packed: [u64; 2] = std::array::from_fn(|i| slot.label[i].load(Ordering::Acquire));
+            if found == key && slot.seq.load(Ordering::Acquire) == seq {
+                return unpack_label(packed);
+            }
+        }
+        let label = label_compute(term);
+        if seq & 1 == 0 && slot.seq.compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            for (a, k) in slot.key.iter().zip(key) {
+                a.store(k, Ordering::Release);
+            }
+            for (a, w) in slot.label.iter().zip(pack_label(&label)) {
+                a.store(w, Ordering::Release);
+            }
+            slot.seq.store(seq + 2, Ordering::Release);
+        }
+        label
+    }
+}
+
+fn pack_label(label: &Label) -> [u64; 2] {
+    let mut words = [0u64; 2];
+    for (i, &(dim, sign)) in label.iter().enumerate() {
+        let packed = u64::from(dim) | u64::from(sign < 0.0) << 15;
+        words[i / 4] |= packed << (16 * (i % 4));
+    }
+    words
+}
+
+fn unpack_label(words: [u64; 2]) -> Label {
+    std::array::from_fn(|i| {
+        let packed = (words[i / 4] >> (16 * (i % 4))) as u32 & 0xFFFF;
+        (packed & 0x7FFF, if packed & 0x8000 == 0 { 1.0f32 } else { -1.0f32 })
+    })
+}
+
+/// The derivation as first written: the reference [`label`] must match.
+#[cfg(test)]
+fn label_reference(term: &str) -> Label {
     let mut h = blake3::Hasher::new();
     h.update(b"ri-label");
     h.update(term.as_bytes());
@@ -329,7 +465,7 @@ struct TextUpdate {
 
 fn compute_update(text: &str) -> TextUpdate {
     let toks = tokenize(text);
-    let labels: Vec<Label> = toks.iter().map(|t| label_cached(&t.term)).collect();
+    let labels: Vec<Label> = toks.iter().map(|t| label(&t.term)).collect();
     // Distinct terms + token -> term index.
     let mut term_ix: HashMap<&str, u32> = HashMap::new();
     let mut terms: Vec<String> = Vec::new();
@@ -739,7 +875,7 @@ impl Model {
                     }
                 }
                 let w = t.weight * field_w;
-                for (d, s) in label_cached(&t.term) {
+                for (d, s) in label(&t.term) {
                     v[d as usize] += LABEL_WEIGHT * w * s;
                 }
                 if let Some(e) = self.vocab.get(&t.term) {
@@ -1444,6 +1580,101 @@ mod tests {
             .all(|&(d, s)| d < DIM as u32 && (s == 1.0 || s == -1.0)));
         // Different tokens get different labels (overwhelmingly likely).
         assert_ne!(label("database"), label("authentication"));
+    }
+
+    /// A computed label is the original derivation bit for bit, whatever
+    /// the size of the XOF reads: vectors in every index were built from
+    /// these, so a single differing dim or sign would be a silent model
+    /// change.
+    #[test]
+    fn label_matches_the_reference_derivation() {
+        let mut terms: Vec<String> = vec![
+            String::new(),
+            "a".into(),
+            "authentication".into(),
+            "login password".into(),
+            "größe straße".into(),
+            "日本語 トークン".into(),
+            "x".repeat(47),
+            "x".repeat(48),
+            "x".repeat(55),
+            "x".repeat(56),
+            "x".repeat(57),
+            "y".repeat(1024),
+            "y".repeat(5000),
+        ];
+        for i in 0..20_000 {
+            terms.push(format!("tok{i}"));
+            terms.push(format!("handle_{i} request_{}", i % 97));
+        }
+        let mut retried = 0;
+        for t in &terms {
+            let want = label_reference(t);
+            assert_eq!(label(t), want, "{t:?}");
+            assert_eq!(label_from_blocks::<4>(t), want, "{t:?} (4-byte reads)");
+            assert_eq!(label_from_blocks::<12>(t), want, "{t:?} (12-byte reads)");
+            assert_eq!(label_from_blocks::<20>(t), want, "{t:?} (20-byte reads)");
+            assert_eq!(label_from_blocks::<128>(t), want, "{t:?} (128-byte reads)");
+            // did this term draw a dim twice among its first eight words?
+            let mut h = blake3::Hasher::new();
+            h.update(b"ri-label");
+            h.update(t.as_bytes());
+            let mut first = [0u8; 32];
+            h.finalize_xof().fill(&mut first);
+            let dims: std::collections::BTreeSet<u32> =
+                first.chunks(4).map(|w| (u32::from_le_bytes(w.try_into().unwrap()) >> 1) % DIM as u32).collect();
+            retried += usize::from(dims.len() < LABEL_NONZEROS);
+        }
+        assert!(retried > 50, "the sample must cover the retry past a taken dim: {retried}");
+    }
+
+    /// The cache hands out exactly what the derivation computes: terms at
+    /// and past the longest key, terms that differ only in padding, and a
+    /// table so small that every slot is fought over by several threads.
+    #[test]
+    fn label_cache_is_exact_under_contention() {
+        // packing loses nothing
+        for i in 0..5000 {
+            let l = label_reference(&format!("pack{i}"));
+            assert_eq!(unpack_label(pack_label(&l)), l);
+        }
+        let cache = LabelCache::new(4);
+        let mut terms: Vec<String> = vec![
+            String::new(),
+            "ab".into(),
+            "ab\0".into(),
+            "ab\0\0".into(),
+            "\u{1}".into(),
+            "k".repeat(LABEL_KEY_MAX - 1),
+            "k".repeat(LABEL_KEY_MAX),
+            "k".repeat(LABEL_KEY_MAX + 1),
+            "k".repeat(200),
+        ];
+        terms.extend((0..150).map(|i| format!("term{i}")));
+        let want: Vec<Label> = terms.iter().map(|t| label_reference(t)).collect();
+        for (t, w) in terms.iter().zip(&want) {
+            assert_eq!(cache.get(t), *w, "{t:?} (miss)");
+            assert_eq!(cache.get(t), *w, "{t:?} (hit)");
+        }
+        std::thread::scope(|s| {
+            for thread in 0..8usize {
+                let (cache, terms, want) = (&cache, &terms, &want);
+                s.spawn(move || {
+                    for round in 0..3000usize {
+                        // every thread walks the terms in its own order, in
+                        // runs of repeats so that hits happen while others write
+                        let i = (round / 3 * (2 * thread + 1) + thread) % terms.len();
+                        assert_eq!(cache.get(&terms[i]), want[i], "{:?}", terms[i]);
+                    }
+                });
+            }
+        });
+        // the process-wide cache as well, past its capacity
+        for i in 0..(LABEL_CACHE_SLOTS + LABEL_CACHE_SLOTS / 4) {
+            let t = format!("w{i}");
+            assert_eq!(label(&t), label_compute(&t));
+        }
+        assert_eq!(std::mem::size_of::<LabelSlot>(), 64);
     }
 
     /// the direction permutations are deterministic, true

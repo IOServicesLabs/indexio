@@ -126,6 +126,9 @@ pub struct McpServer {
     /// Engine whose sidecars were opened by `prewarm_sidecars`, waiting
     /// to be adopted.
     warm: Arc<Mutex<Option<Engine>>>,
+    /// Warm-ups in flight (see `prewarm_sidecars`): a semantic call waits
+    /// for one instead of parsing the same sidecars beside it.
+    warming: Arc<(Mutex<usize>, std::sync::Condvar)>,
     /// Paths of the current repo whose semantic rows still need embedding:
     /// drained by the background embed thread; what it
     /// could not embed (another server mid-append) stays queued for the
@@ -300,6 +303,7 @@ impl McpServer {
             maint_child: Arc::new(Mutex::new(None)),
             maint_retry: Mutex::new(None),
             warm: Arc::new(Mutex::new(None)),
+            warming: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             repair_tried: Arc::new(Mutex::new(bounded::RecentSet::new(REPAIR_TRIED_MAX))),
             plain_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -996,13 +1000,34 @@ impl McpServer {
         };
         let model = self.embedder.model_id().to_string();
         let slot = Arc::clone(&self.warm);
+        *self.warming.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let done = WarmDone(Arc::clone(&self.warming));
         std::thread::spawn(move || {
+            let _done = done;
             if let Ok(e) = Engine::open(&dir) {
                 let _ = e.vec_index(&model);
                 let _ = e.bm25_index(&model);
                 *slot.lock().expect("warm slot poisoned") = Some(e);
             }
         });
+    }
+
+    /// Let a warm-up in flight finish (bounded by [`WARM_WAIT`]) before a
+    /// semantic call goes on: it would otherwise parse the very sidecars the
+    /// warm-up is parsing, for the same wait and twice the memory. Happens
+    /// to the first semantic call of a session and to the first after an
+    /// idle trim when another call came just before it.
+    fn wait_for_warm(&self) {
+        let (count, done) = &*self.warming;
+        let deadline = std::time::Instant::now() + WARM_WAIT;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            n = done.wait_timeout(n, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 
     /// Append one JSON line per tool call to `<data_dir>/usage/<date>.jsonl`
@@ -1306,6 +1331,9 @@ impl McpServer {
         }
         if name == "refresh_index" {
             return self.refresh_index(&args, format).map(|v| (v, None));
+        }
+        if wants_semantic(name, &args) {
+            self.wait_for_warm();
         }
         self.adopt_warm();
         self.ensure_shards_watch();
@@ -2225,6 +2253,23 @@ pub(crate) fn log_usage_line(
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.jsonl"))) {
         use std::io::Write as _;
         let _ = writeln!(f, "{line}");
+    }
+}
+
+/// How long a semantic call waits for a sidecar warm-up in flight (the
+/// warm-up takes under a second on a 2.3 GB plane; past this the call opens
+/// the sidecars itself, as it always did).
+const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Counts a warm-up out when its thread ends, however it ends.
+struct WarmDone(Arc<(Mutex<usize>, std::sync::Condvar)>);
+
+impl Drop for WarmDone {
+    fn drop(&mut self) {
+        let (count, done) = &*self.0;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        done.notify_all();
     }
 }
 

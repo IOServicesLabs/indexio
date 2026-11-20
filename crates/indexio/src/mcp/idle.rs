@@ -209,8 +209,10 @@ impl McpServer {
         let child = self.maint_child.lock().is_ok_and(|c| c.is_some());
         let pass_here = self.compacting.load(Ordering::Acquire) && !child;
         let saving = self.saver.lock().is_ok_and(|s| s.as_ref().is_some_and(|h| !h.is_finished()));
+        let warming = self.warming.0.lock().is_ok_and(|n| *n > 0);
         pass_here
             || saving
+            || warming
             || [&self.embed_busy, &self.sessions_busy, &self.sync_busy, &self.prepare_busy]
                 .iter()
                 .any(|b| b.load(Ordering::Acquire))
@@ -503,6 +505,41 @@ mod tests {
             let hits = call(&s, "code_search", serde_json::json!({"query": "later_fn_1", "mode": "lexical"}));
             assert!(hits.contains("src/later_1.rs"), "window {window:?}: {hits}");
         }
+    }
+
+    /// A warm-up is counted while it runs and leaves its engine behind; a
+    /// semantic call that arrives meanwhile waits for it, any other call
+    /// does not.
+    #[test]
+    fn a_semantic_call_waits_for_a_warm_up_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_shard(tmp.path(), "base", 4);
+        let s = server(tmp.path(), None, Duration::ZERO);
+        let in_flight = || *s.warming.0.lock().unwrap();
+        s.prewarm_sidecars();
+        wait_for("the warm-up", || in_flight() == 0);
+        assert!(s.warm.lock().unwrap().is_some(), "the warm-up left no engine");
+
+        // a warm-up that ends when the test says so
+        *s.warming.0.lock().unwrap() += 1;
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let done = crate::mcp::WarmDone(Arc::clone(&s.warming));
+            scope.spawn(move || {
+                let _done = done;
+                let _ = wait.recv();
+                std::thread::sleep(Duration::from_millis(100));
+            });
+            let t0 = Instant::now();
+            session_first_call(&s); // lexical
+            assert_eq!(in_flight(), 1);
+            assert!(t0.elapsed() < Duration::from_secs(2), "a lexical call waited for the warm-up");
+            go.send(()).unwrap();
+            let msg = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "code_search", "arguments": {"query": "base fn", "mode": "hybrid"}}});
+            s.handle(&msg.to_string()).expect("a reply");
+            assert_eq!(in_flight(), 0, "the hybrid call did not wait for the warm-up");
+        });
     }
 
     fn session_first_call(s: &McpServer) {

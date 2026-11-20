@@ -1500,6 +1500,28 @@ fn print_usage(data_dir: &Path, days: u64, as_json: bool) -> anyhow::Result<()> 
 /// MCP stdio loop: newline-delimited JSON-RPC 2.0 messages (one per line;
 /// Content-Length framing is NOT supported). Notifications produce no line.
 fn run_mcp_stdio(server: mcp::McpServer) -> anyhow::Result<()> {
+    /// Ends the idle timer when the loop is left, however it is left (the
+    /// scope below waits for the timer thread).
+    struct StopTimer<'a>(&'a mcp::McpServer);
+    impl Drop for StopTimer<'_> {
+        fn drop(&mut self) {
+            self.0.stop_idle_timer();
+        }
+    }
+    std::thread::scope(|scope| {
+        // the server's one timer: a parked thread that trims an idle server
+        let timer = std::thread::Builder::new().name("idle".into());
+        if let Err(e) = timer.spawn_scoped(scope, || server.run_idle_timer()) {
+            tracing::warn!(error = %e, "cannot start the idle timer; an idle server keeps its caches");
+        }
+        let _stop = StopTimer(&server);
+        serve_mcp_stdio(&server)
+    })?;
+    server.finish_background_work();
+    Ok(())
+}
+
+fn serve_mcp_stdio(server: &mcp::McpServer) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -1520,7 +1542,6 @@ fn run_mcp_stdio(server: mcp::McpServer) -> anyhow::Result<()> {
             memstat::report("call");
         }
     }
-    server.finish_background_work();
     Ok(())
 }
 

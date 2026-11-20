@@ -29,6 +29,7 @@ use indexio_query::{Engine, FusionAlgo, SearchMode};
 use crate::mcp_text;
 
 mod bounded;
+mod idle;
 pub(crate) mod maintain;
 
 const PARSE_ERROR: i64 = -32700;
@@ -146,7 +147,7 @@ pub struct McpServer {
     embedder_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// (count, total bytes, newest mtime) of the shard files at the last
     /// check; a change means another process wrote or merged shards.
-    shards_seen: Mutex<ShardsStamp>,
+    shards_seen: Arc<Mutex<ShardsStamp>>,
     /// An engine opened (and its doc views built) off the call path after
     /// the shards dir changed, with the stamp it was opened at: a call that
     /// sees that stamp adopts it instead of reopening (another session's
@@ -156,6 +157,20 @@ pub struct McpServer {
     prepare_again: Arc<AtomicBool>,
     /// Watch on `<data_dir>/shards` that triggers the preparation.
     shards_watch: Mutex<Option<notify::RecommendedWatcher>>,
+    /// When calls were made (see [`idle`]): the shards watch prepares an
+    /// engine only for a server that was called within `prepare_window`,
+    /// and the idle timer trims one that was not called for `idle_after`.
+    activity: Arc<idle::Activity>,
+    prepare_window: std::time::Duration,
+    /// `None` = no idle trim.
+    idle_after: Option<std::time::Duration>,
+    /// Ask the allocator to return freed memory after a trim.
+    release_heap: bool,
+    /// Idle trims so far.
+    trims: std::sync::atomic::AtomicU64,
+    /// A trim is running (checked by every call in debug builds: the two
+    /// must never overlap).
+    trimming: AtomicBool,
     /// Last transcript import; throttled to
     /// [`SESSIONS_IMPORT_EVERY`] and run on a background thread.
     sessions_last: Mutex<Option<std::time::Instant>>,
@@ -296,11 +311,17 @@ impl McpServer {
             sessions_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             runs_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
             memory_cache: Arc::new(Mutex::new(indexio_ingest::WorktreeCache::default())),
-            shards_seen: Mutex::new((0, 0, None)),
+            shards_seen: Arc::new(Mutex::new((0, 0, None))),
             prepared: Arc::new(Mutex::new(None)),
             prepare_busy: Arc::new(AtomicBool::new(false)),
             prepare_again: Arc::new(AtomicBool::new(false)),
             shards_watch: Mutex::new(None),
+            activity: Arc::new(idle::Activity::new()),
+            prepare_window: idle::prepare_window(),
+            idle_after: idle::idle_trim_after(),
+            release_heap: std::env::var("INDEXIO_IDLE_HEAP_RELEASE").map_or(true, |v| v != "0"),
+            trims: std::sync::atomic::AtomicU64::new(0),
+            trimming: AtomicBool::new(false),
             exe: std::env::current_exe().ok().and_then(|p| {
                 let m = std::fs::metadata(&p).ok()?;
                 Some((p, (m.len(), m.modified().ok())))
@@ -920,10 +941,14 @@ impl McpServer {
         }
     }
 
-    /// Watch `<data_dir>/shards` (once per process): every change there
+    /// Watch `<data_dir>/shards` (once per process): a change there
     /// (another session's refresh or import, a hook's freshen, a sync, a
     /// compaction) prepares a reopened, warmed engine on a background
-    /// thread for [`reload_if_needed`](Self::reload_if_needed) to adopt.
+    /// thread for [`reload_if_needed`](Self::reload_if_needed) to adopt,
+    /// provided this server was called within `prepare_window`. One that was
+    /// not reopens on its next call instead: with a server per session,
+    /// every write used to make every idle one open and warm an engine
+    /// nobody was waiting for, and park it beside the live one.
     fn ensure_shards_watch(&self) {
         let mut slot = self.shards_watch.lock().expect("shards watch poisoned");
         if slot.is_some() {
@@ -934,13 +959,21 @@ impl McpServer {
         };
         let shards = data_dir.join("shards");
         let (prepared, busy, again) = (Arc::clone(&self.prepared), Arc::clone(&self.prepare_busy), Arc::clone(&self.prepare_again));
+        let (activity, window, seen) = (Arc::clone(&self.activity), self.prepare_window, Arc::clone(&self.shards_seen));
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let relevant = match &res {
                 Ok(ev) => ev.paths.iter().any(|p| p.extension().and_then(|e| e.to_str()) == Some("cidx")),
                 Err(_) => true,
             };
-            if relevant {
-                prepare_engine(&data_dir, &prepared, &busy, &again);
+            if !relevant {
+                return;
+            }
+            if activity.recent(window) {
+                prepare_engine(&data_dir, &prepared, &busy, &again, &seen);
+            } else {
+                // idle: the next call reopens; an engine prepared for an
+                // earlier state is of no use to it
+                drop(prepared.lock().unwrap_or_else(|e| e.into_inner()).take());
             }
         });
         match watcher {
@@ -1263,6 +1296,14 @@ impl McpServer {
             .ok_or_else(|| invalid("missing 'name' parameter"))?;
         let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let format = opt_format(&args, self.format)?;
+        // a call in flight until this returns: the idle trim stands back
+        let (_active, after_trim) = self.activity.begin();
+        debug_assert!(!self.trimming.load(Ordering::Acquire), "a call is running into an idle trim");
+        if after_trim && !wants_semantic(name, &args) {
+            // the trim dropped the parsed sidecars: warm them again off the
+            // call path, as at start (a semantic call opens them itself)
+            self.prewarm_sidecars();
+        }
         if name == "refresh_index" {
             return self.refresh_index(&args, format).map(|v| (v, None));
         }
@@ -2187,6 +2228,12 @@ pub(crate) fn log_usage_line(
     }
 }
 
+/// Whether a call uses the semantic plane (the embedder and the sidecars).
+fn wants_semantic(name: &str, args: &Value) -> bool {
+    matches!(name, "semantic_search" | "recall")
+        || args.get("mode").and_then(Value::as_str).is_some_and(|m| !m.eq_ignore_ascii_case("lexical"))
+}
+
 /// One tool call outside a server (`indexio tool`): the text the MCP tool
 /// would return, or its error message. The shell hooks rewrite a read the
 /// index can answer into this call, so the answer does not depend on the
@@ -2196,8 +2243,7 @@ pub fn call_once(data_dir: &std::path::Path, name: &str, args: &Value, current: 
     let t0 = std::time::Instant::now();
     let engine = Engine::open(data_dir).map_err(|e| format!("opening index at {}: {e}", data_dir.display()))?;
     // the lexical tools never embed: skip loading the model
-    let semantic = matches!(name, "semantic_search" | "recall")
-        || args.get("mode").and_then(Value::as_str).is_some_and(|m| !m.eq_ignore_ascii_case("lexical"));
+    let semantic = wants_semantic(name, args);
     let embedder: Arc<dyn Embedder> = if semantic {
         crate::select_embedder_or_fallback(data_dir)
     } else {
@@ -3226,17 +3272,24 @@ fn prepare_engine(
     slot: &Arc<Mutex<Option<(ShardsStamp, Engine)>>>,
     busy: &Arc<AtomicBool>,
     again: &Arc<AtomicBool>,
+    seen: &Arc<Mutex<ShardsStamp>>,
 ) {
     again.store(true, Ordering::Release);
     if busy.swap(true, Ordering::AcqRel) {
         return;
     }
-    let (data_dir, slot, busy, again) = (data_dir.to_path_buf(), Arc::clone(slot), Arc::clone(busy), Arc::clone(again));
+    let (data_dir, slot, busy, again, seen) =
+        (data_dir.to_path_buf(), Arc::clone(slot), Arc::clone(busy), Arc::clone(again), Arc::clone(seen));
     std::thread::spawn(move || {
         while again.swap(false, Ordering::AcqRel) {
             // let the rest of a writer's burst (shard + tombstones) land
             std::thread::sleep(std::time::Duration::from_millis(40));
             let stamp = shards_stamp(&data_dir.join("shards"));
+            // the state the server's own engine is at (its own refresh
+            // wrote these shards and reopened already): nothing to prepare
+            if *seen.lock().unwrap_or_else(|e| e.into_inner()) == stamp {
+                continue;
+            }
             if let Ok(e) = Engine::open(&data_dir) {
                 e.warm();
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, e));

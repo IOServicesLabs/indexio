@@ -1,5 +1,148 @@
 # Changelog
 
+## 0.1.15
+
+TypeScript and React apps: type aliases are definitions, JSX elements are call
+sites, and a symbol lookup no longer answers with a longer name when the exact
+one exists. Measured on copies of three generated Next.js apps (132 TS/TSX
+files) against grep:
+
+| Case | 0.1.14 | 0.1.15 |
+|---|---|---|
+| `type X = …` aliases found by `symbol X` | 0 of 34 | 34 of 34 |
+| JSX render sites (`<Board …/>`) found by `calls Board`, context providers aside | 0 of 62 | 62 of 62 |
+| Render sites listed by `impact --file components/X.tsx` (depth 1) | 0 of 33 | 33 of 33 |
+| Alias names answered only with longer names (`Status` → `StatusChart`) | 19 of 22 | 0 of 22 |
+
+- `type X = …` and `export type X = …` in `.ts`/`.tsx`/`.js`/`.jsx` are
+  indexed as definitions of kind `type`, so `find_symbol`, `file_outline` and
+  `read_span` see them.
+- A JSX element that renders a component is a call of that component:
+  `<Board />` and `<AppShell>…</AppShell>` (one site, at the opening tag), and
+  `<ui.Button>` as a call of `Button` (a member name matches by its last
+  segment, as `a.b()` does). Lowercase intrinsic elements (`<div>`,
+  `<motion.div>`), `<Ctx.Provider>`/`<Ctx.Consumer>` and an old-style `<Foo>x`
+  type assertion in a `.ts` file are not. `who_calls`, `calls` and `impact`
+  now list the files and functions that render a component.
+- A function bound to a module-level `const` is its calls' caller:
+  `const Board = () => …`, `export const Card = memo(function () {…})`. Their
+  calls were filed under the top level before, so an impact walk stopped there.
+  Functions bound with `let` or `var`, and an anonymous `export default
+  function`, still file their calls under the top level.
+- `Status` returned `StatusChart`: the lookup was already exact first, but
+  `Status` was a type alias, not indexed, so no definition matched exactly and
+  the substring fallback answered. With aliases indexed the exact definition
+  answers alone. When the fallback does answer, `find_symbol` now says so on
+  its first line (`no definition named exactly …`) and `indexio symbol` prints
+  that note on stderr, so a longer name is not read as the definition.
+
+### Upgrading an existing index
+
+Indexes built before 0.1.15 hold no aliases or render sites for files that have
+not changed since. No manual step is needed: the extraction cache keys TS/JS
+entries by an extractor generation, and each repo records the generation it was
+built with. The next `indexio sync`, `indexio reindex` or MCP auto-refresh of a
+repo re-extracts its unchanged TS/JS files once, and only those (other
+languages keep their cached results). The background sync of an MCP server
+treats a repo built by an older version as due. Until a repo has had that pass,
+its TS/JS symbols and calls are the 0.1.14 ones. The shard format is unchanged,
+and an older binary still reads the index. Restart or upgrade every indexio MCP
+server that shares the data dir: an older binary drops the recorded generation
+each time it rewrites a repo's state, so until then 0.1.15 re-extracts that
+repo's TS/JS files on its next sync.
+
+### Memory
+
+Memory. One MCP server runs per agent session, and ten of them on one data
+dir held 8 to 9 GB between them, single servers 1 to 2 GB, with peaks near
+10 GB. A server now starts in under 20 MB, stays in the low hundreds under
+constant edits, and goes back to about 15 MB when it is idle. No change to the
+on-disk formats; 0.1.14 servers can share the data dir with new ones.
+
+Measured with one server on a copy of a live data dir (57 repos, 986k vector
+rows), an edit every 2 seconds and tool calls throughout, for 12 minutes:
+
+| | 0.1.14 | 0.1.15 |
+|---|---|---|
+| Fresh server, before any call | 250 MB | 6–19 MB |
+| Peak during the run | 2,328 MB | 238 MB |
+| End of the run | 1,400 MB | 220 MB |
+| Heap actually in use at the end | 288 MB | 55 MB |
+| Largest maintenance spike | ~2,000 MB, inside the server | 50 MB, in a short-lived child |
+| Threads | 100 | 37 |
+| Hybrid search, median | 440 ms | 166 ms |
+| Lexical search, median | 227 ms | 90 ms |
+
+Memory figures are private bytes of the process.
+
+| Operation | 0.1.14 | 0.1.15 |
+|---|---|---|
+| Lexical merge of a real 8-shard window | 1,674 MB, 19.3 s | 81 MB, 10 s |
+| Full vector merge, 137k rows | 1,692 MB, 7.8 s | 23 MB, 2.5 s |
+| Full vector merge, 986k rows | not run (about 10 GB by extrapolation) | 82 MB, 20 s |
+| Full re-embed, 137k rows | 2,378 MB | 814 MB |
+| Model save | 500 MB | 2.6 MB |
+| CLI `embed` with nothing to do | 545 MB | 80 MB |
+| `index_stats`, peak | 436–445 MB | 58 MB |
+
+- Vector row metadata (hash, repo, path, lines of every row) is read from the
+  mapped segment instead of being parsed into the heap: 193 MB per server at
+  986k rows, and as much again on every embed, which parsed a second copy.
+  Servers and passes in one process share an open segment.
+- Lexical shard merges stream from the mapped inputs into the new shard
+  (output byte-identical to 0.1.14's) and the merge window takes the small
+  shards first, so a few megabytes of deltas no longer rewrite the largest
+  shard. Compaction starts above 10 shards and merges down to 8 (was 12 and
+  6). A posting list found out of order is sorted instead of failing the merge.
+- Vector and BM25 segments are written a row at a time: embeds, folds, full
+  merges and rebuilds no longer hold every row of the plane. A rebuild needs
+  about twice the segment size in free disk space while it runs.
+- A compaction copies the int8 rows it carries. Until now it took each row
+  through f32 and the quantizer again, which set the binary-code bit of every
+  component stored as zero (about 6% of the code bits of a real segment) and
+  so changed what the prescan of a semantic search picked after each
+  compaction.
+- The model's label cache is a fixed 4 MiB table (it grew without bound, up to
+  several hundred MB), and a model save streams the snapshot instead of
+  building it in memory. A server saves the model when it is dirty, 5 minutes
+  have passed since the last save, and either 64 new texts were observed or
+  the oldest unsaved one has waited an hour.
+- Compaction, vector folds and the drift re-embed run in a short-lived child
+  process (`indexio maintain`, below-normal priority, one at a time per data
+  dir under `compact.lock`), so their memory goes back to the system when
+  they finish instead of staying in the server's heap. Each pass writes a line
+  to `<data dir>/maintain.log`.
+- A server idle for 10 minutes drops its caches, parked engines and free heap,
+  and no longer opens an engine for every shard another process writes. The
+  first call after that pays for the reload (about 100 ms more on a hybrid
+  search in the test).
+- `indexio mcp` no longer starts a tokio runtime (32 threads), and its two
+  worker pools are capped at 16 threads.
+- The server's per-session maps (`read_span` history, repair attempts) are
+  bounded.
+
+Settings (environment):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `INDEXIO_MCP_THREADS` | 16 | Threads per worker pool of an MCP server; 0 = no cap |
+| `INDEXIO_IDLE_TRIM_SECS` | 600 | Idle time before a server drops what it can rebuild; 0 = never |
+| `INDEXIO_PREPARE_WINDOW_SECS` | 300 | How recently a call must have been made for a server to open an engine ahead of the next one |
+| `INDEXIO_IDLE_HEAP_RELEASE` | on | Ask the allocator to return free memory at the idle trim |
+| `INDEXIO_MAINT_INPROCESS` | off | Run maintenance inside the server, as 0.1.14 did |
+| `INDEXIO_MAINT_TIMEOUT_SECS` | 3600 | Deadline of one maintenance child |
+
+Checked on copies of a live data dir: 636 MCP calls replayed from real
+sessions, 619 answers byte-identical to 0.1.14 and the other 17 identical once
+both versions read the same copy (the two copies had synced the live repos at
+different moments); a new server and 0.1.14 servers on one data dir for 5
+minutes without an error; no file lost its vector rows.
+
+Known and unchanged: a semantic search rescans at most `max(8k, 256)`
+candidates per vector segment whatever the segment's size, so its answers
+depend on how the rows are spread over segments and change when segments are
+merged, in 0.1.15 as in 0.1.14.
+
 ## 0.1.14
 
 Fixes a deadlock that left a long-running MCP server silent until it was

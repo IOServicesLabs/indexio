@@ -20,7 +20,6 @@ const DICT_MIN_DOCS: usize = 100;
 /// Target dictionary size (112 KiB), clamped to what the sample set
 /// can support so training does not fail on small corpora.
 const DICT_TARGET: usize = 112 * 1024;
-const GRAM_STATS_TOP: usize = 10_000;
 
 struct PendingDoc {
     meta: DocMeta,
@@ -189,16 +188,6 @@ impl ShardWriter {
             }
         }
 
-        // ---- gram stats (top-10k by doc frequency) -----------------------
-        let mut stats: Vec<(&Vec<u8>, u64)> =
-            ngram_map.iter().map(|(g, v)| (g, v.len() as u64)).collect();
-        stats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        let gram_stats: Vec<(String, u64)> = stats
-            .into_iter()
-            .take(GRAM_STATS_TOP)
-            .map(|(g, c)| (String::from_utf8_lossy(g).into_owned(), c))
-            .collect();
-
         // ---- zstd dictionary (>100 docs) ---------------------------------
         let dict: Option<Vec<u8>> = if n > DICT_MIN_DOCS {
             let samples: Vec<&[u8]> = live
@@ -268,7 +257,7 @@ impl ShardWriter {
             repos: repos.to_vec(),
             doc_count: n as u64,
             total_raw_bytes: total_raw,
-            gram_stats,
+            gram_stats: Vec::new(), // no longer written: see ShardMeta
             zstd_dict: dict,
             created: format::unix_to_iso(self.created_unix),
         };

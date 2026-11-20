@@ -99,7 +99,7 @@ fn write_open_roundtrip() {
     assert_eq!(meta.repos, vec!["repo-a".to_string()]);
     let expect_raw: u64 = docs.iter().map(|(_, c, _)| c.len() as u64).sum();
     assert_eq!(meta.total_raw_bytes, expect_raw);
-    assert!(!meta.gram_stats.is_empty());
+    assert!(meta.gram_stats.is_empty(), "gram stats are no longer stored in META");
     assert!(meta.zstd_dict.is_none()); // exactly 100 docs => no dict
     assert!(!meta.created.is_empty());
 
@@ -160,7 +160,21 @@ fn write_open_roundtrip() {
     assert_eq!(cp[5].1, "func_5");
     assert_eq!(cp[5].2, 2);
 
-    // common_grams derives from gram_stats without panicking
+    // gram stats are counted from the postings on demand: every gram of
+    // the shard with its document frequency, most frequent first
+    let mut df: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for (_, _, art) in &docs {
+        for g in &art.ngrams {
+            *df.entry(g.clone()).or_default() += 1;
+        }
+    }
+    let mut expect: Vec<(Vec<u8>, u64)> = df.into_iter().collect();
+    expect.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let expect: Vec<(String, u64)> = expect.into_iter().map(|(g, c)| (String::from_utf8_lossy(&g).into_owned(), c)).collect();
+    assert_eq!(shard.gram_stats(usize::MAX), expect);
+    assert_eq!(shard.gram_stats(25), expect[..25]);
+    assert!(shard.gram_stats(0).is_empty());
+    // common_grams derives from them without panicking
     let _ = shard.common_grams();
 }
 
@@ -344,11 +358,17 @@ fn merge_applies_tombstones_and_keeps_postings() {
         w.finish(&["repo-a".to_string(), "repo-b".to_string()]).unwrap();
     }
     sleep(Duration::from_millis(1100));
-    // shard 3 (newest): docs 40..60
+    // shard 3 (newest): docs 40..60, each several times the size of the
+    // older ones: the two older shards are the cheapest run by a wide margin
+    // (the three used to differ by a few bytes, which decided the window)
     {
         let mut w = ShardWriter::new(dir.path()).unwrap();
         for i in 40..60u32 {
-            let (m, c, a) = make_doc(i, 0, default_content(i));
+            let mut body = default_content(i);
+            for k in 0..40 {
+                body.extend_from_slice(format!("fn extra_{i}_{k}() {{ helper(); }}\n").as_bytes());
+            }
+            let (m, c, a) = make_doc(i, 0, body);
             w.add_doc(&m, &c, &a).unwrap();
             expected.insert(m.path.clone(), c.clone());
         }

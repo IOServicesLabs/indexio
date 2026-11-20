@@ -40,7 +40,13 @@ pub struct ShardMeta {
     pub repos: Vec<String>,
     pub doc_count: u64,
     pub total_raw_bytes: u64,
-    /// Top-10k grams by document frequency: (gram as lossy UTF-8, doc_count).
+    /// Always empty. Shards up to 0.1.14 stored the top-10k grams by document
+    /// frequency here (up to 100 kB of JSON per shard, 10k Strings in every
+    /// process that opened it) and nothing but tests read them. The key stays
+    /// in the JSON because 0.1.14 refuses a META without it: it is written
+    /// as `[]` and whatever an older shard carries is skipped on read.
+    /// [`Shard::gram_stats`] computes the list from the postings on demand.
+    #[serde(default, deserialize_with = "skip_value")]
     pub gram_stats: Vec<(String, u64)>,
     /// Trained zstd dictionary, base64-encoded in JSON. Present iff the
     /// shard was built from >100 docs and training succeeded.
@@ -48,6 +54,12 @@ pub struct ShardMeta {
     pub zstd_dict: Option<Vec<u8>>,
     /// ISO-8601 UTC creation time.
     pub created: String,
+}
+
+/// Deserialize a value by skipping it (nothing is allocated for it).
+fn skip_value<'de, D: serde::Deserializer<'de>, T: Default>(d: D) -> Result<T, D::Error> {
+    serde::de::IgnoredAny::deserialize(d)?;
+    Ok(T::default())
 }
 
 /// base64 serde for `Option<Vec<u8>>` (zstd_dict is base64 in JSON).
@@ -71,4 +83,53 @@ mod b64_opt {
 
 pub(crate) fn invalid(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// META as 0.1.14 declares it: `gram_stats` is a required key.
+    #[derive(Deserialize)]
+    struct Meta0114 {
+        repos: Vec<String>,
+        doc_count: u64,
+        total_raw_bytes: u64,
+        gram_stats: Vec<(String, u64)>,
+        #[serde(default, with = "b64_opt")]
+        zstd_dict: Option<Vec<u8>>,
+        created: String,
+    }
+
+    #[test]
+    fn gram_stats_of_an_older_shard_are_skipped_on_read() {
+        let json = r#"{"repos":["a"],"doc_count":3,"total_raw_bytes":9,"gram_stats":[["abc",3],["bcd",2]],"zstd_dict":"AAEC","created":"2026-01-01T00:00:00Z"}"#;
+        let m: ShardMeta = serde_json::from_str(json).unwrap();
+        assert!(m.gram_stats.is_empty());
+        assert_eq!((m.repos.len(), m.doc_count, m.total_raw_bytes), (1, 3, 9));
+        assert_eq!(m.zstd_dict.as_deref(), Some(&[0u8, 1, 2][..]));
+        // a META without the key reads too
+        let m: ShardMeta = serde_json::from_str(r#"{"repos":[],"doc_count":0,"total_raw_bytes":0,"created":""}"#).unwrap();
+        assert!(m.gram_stats.is_empty() && m.zstd_dict.is_none());
+    }
+
+    #[test]
+    fn meta_written_now_reads_as_0_1_14_expects() {
+        let meta = ShardMeta {
+            repos: vec!["a".into(), "b".into()],
+            doc_count: 7,
+            total_raw_bytes: 1234,
+            gram_stats: Vec::new(),
+            zstd_dict: Some(vec![9, 8, 7]),
+            created: "2026-11-20T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""gram_stats":[]"#), "{json}");
+        let old: Meta0114 = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.repos, meta.repos);
+        assert_eq!((old.doc_count, old.total_raw_bytes), (7, 1234));
+        assert!(old.gram_stats.is_empty());
+        assert_eq!(old.zstd_dict, meta.zstd_dict);
+        assert_eq!(old.created, meta.created);
+    }
 }

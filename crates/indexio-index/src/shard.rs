@@ -14,6 +14,9 @@ use tracing::debug;
 use crate::format::{self, kind, get_u16, get_u32, get_u64, DOC_REC_LEN, TOMBSTONES_LEN};
 use crate::{invalid, ShardMeta};
 
+/// How many grams `gram_stats` in META listed (shards up to 0.1.14).
+const GRAM_STATS_TOP: usize = 10_000;
+
 mod mmap_impl {
     use memmap2::MmapMut;
 
@@ -303,12 +306,53 @@ impl Shard {
             .unwrap_or_else(|| self.tomb.clone())
     }
 
+    /// The `top` grams by document frequency, most frequent first (ties in
+    /// gram order): (gram as lossy UTF-8, docs listed for it). What META
+    /// carried as `gram_stats` up to 0.1.14, counted from the posting lists
+    /// when asked for (one pass over the n-gram index) instead of stored in
+    /// every shard and decoded by every open.
+    pub fn gram_stats(&self, top: usize) -> Vec<(String, u64)> {
+        use fst::Streamer;
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let Some(Ok(map)) = self.section_slice(kind::NGRAM_FST).map(fst::Map::new) else {
+            return Vec::new();
+        };
+        // the `top` best (most docs first, then gram order) seen so far; the
+        // heap's maximum is the one a better entry replaces
+        let mut best: BinaryHeap<(Reverse<u64>, Vec<u8>)> = BinaryHeap::with_capacity(top.min(1 << 16) + 1);
+        let mut stream = map.stream();
+        while let Some((gram, off)) = stream.next() {
+            let Some(payload) = self.posting_payload(kind::NGRAM_POST, off) else { continue };
+            let mut cursor = PostingCursor::new(payload);
+            let mut docs = 0u64;
+            while cursor.next_docid().is_some() {
+                docs += 1;
+            }
+            if docs == 0 || top == 0 {
+                continue;
+            }
+            if best.len() == top {
+                let worst = best.peek().expect("top > 0");
+                if (Reverse(docs), gram) >= (worst.0, worst.1.as_slice()) {
+                    continue;
+                }
+                best.pop();
+            }
+            best.push((Reverse(docs), gram.to_vec()));
+        }
+        best.into_sorted_vec()
+            .into_iter()
+            .map(|(Reverse(docs), gram)| (String::from_utf8_lossy(&gram).into_owned(), docs))
+            .collect()
+    }
+
     pub fn common_grams(&self) -> CommonGrams {
         let stats: Vec<(Vec<u8>, u64)> = self
-            .meta
-            .gram_stats
-            .iter()
-            .map(|(g, c)| (g.clone().into_bytes(), *c))
+            .gram_stats(GRAM_STATS_TOP)
+            .into_iter()
+            .map(|(g, c)| (g.into_bytes(), c))
             .collect();
         CommonGrams::from_stats(&stats, self.doc_count, 0.005)
     }

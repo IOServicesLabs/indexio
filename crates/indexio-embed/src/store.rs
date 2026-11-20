@@ -57,6 +57,9 @@ struct Pack {
     /// has looked up in `seen.idx` or appended to it, and whether the file
     /// has them. The file's own hashes are not held.
     seen: HashMap<[u8; 16], bool>,
+    /// How many of `seen` the file does not have (a pass over the file
+    /// stops when none is left to find).
+    absent: usize,
     seen_writer: Option<BufWriter<File>>,
     /// hash -> (offset of the f32 payload in pack.bin, dim)
     index: HashMap<[u8; 16], (u64, u32)>,
@@ -103,6 +106,7 @@ impl EmbedCas {
             pack: Mutex::new(Pack {
                 loaded: false,
                 seen: HashMap::new(),
+                absent: 0,
                 seen_writer: None,
                 index: HashMap::new(),
                 end: 0,
@@ -169,33 +173,40 @@ impl EmbedCas {
     /// no answer for yet, whether `seen.idx` has it. One sequential pass
     /// over the file through a fixed buffer; nothing of the file is kept
     /// but the answers. A record is tested against the 16-bit prefixes of
-    /// the wanted hashes first, so a lookup of a few chunks dismisses
+    /// the hashes asked about first, so a lookup of a few chunks dismisses
     /// nearly every record on one bit.
     fn look_up(&self, p: &mut Pack, hashes: &[[u8; 16]]) {
         self.migrate_pack(p);
-        let want: HashSet<[u8; 16]> = hashes.iter().filter(|h| !p.seen.contains_key(*h)).copied().collect();
-        if want.is_empty() {
-            return;
-        }
         let prefix_of = |h: &[u8; 16]| usize::from(u16::from_le_bytes([h[0], h[1]]));
-        let mut prefixes = vec![0u64; (1 << 16) / 64];
-        for h in &want {
-            prefixes[prefix_of(h) / 64] |= 1 << (prefix_of(h) % 64);
-        }
-        if let Ok(f) = File::open(self.seen_path()) {
-            let mut file = BufReader::with_capacity(1 << 18, f);
-            let mut rec = [0u8; 16];
-            let mut found = 0usize;
-            // a trailing partial record (another process mid-append) ends the pass
-            while found < want.len() && file.read_exact(&mut rec).is_ok() {
-                let i = prefix_of(&rec);
-                if prefixes[i / 64] & (1 << (i % 64)) != 0 && want.contains(&rec) && p.seen.insert(rec, true).is_none() {
-                    found += 1;
+        let mut prefixes: Vec<u64> = Vec::new();
+        for h in hashes {
+            if let std::collections::hash_map::Entry::Vacant(e) = p.seen.entry(*h) {
+                e.insert(false);
+                p.absent += 1;
+                if prefixes.is_empty() {
+                    prefixes = vec![0u64; (1 << 16) / 64];
                 }
+                prefixes[prefix_of(h) / 64] |= 1 << (prefix_of(h) % 64);
             }
         }
-        for h in want {
-            p.seen.entry(h).or_insert(false);
+        if prefixes.is_empty() {
+            return; // every hash was asked about before
+        }
+        let Ok(f) = File::open(self.seen_path()) else { return };
+        let mut file = BufReader::with_capacity(1 << 18, f);
+        let mut rec = [0u8; 16];
+        // a trailing partial record (another process mid-append) ends the pass
+        while p.absent > 0 && file.read_exact(&mut rec).is_ok() {
+            let i = prefix_of(&rec);
+            if prefixes[i / 64] & (1 << (i % 64)) == 0 {
+                continue;
+            }
+            if let Some(seen) = p.seen.get_mut(&rec) {
+                if !*seen {
+                    *seen = true;
+                    p.absent -= 1;
+                }
+            }
         }
     }
 
@@ -314,8 +325,10 @@ impl EmbedCas {
         let mut p = self.pack.lock().expect("embcas lock poisoned");
         if self.seen_only {
             self.look_up(&mut p, std::slice::from_ref(chunk_hash));
-            if p.seen.insert(*chunk_hash, true) == Some(true) {
-                return;
+            match p.seen.insert(*chunk_hash, true) {
+                Some(true) => return,
+                Some(false) => p.absent -= 1,
+                None => {}
             }
             if p.seen_writer.is_none() {
                 if let Err(e) = fs::create_dir_all(&self.dir) {

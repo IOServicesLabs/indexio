@@ -511,19 +511,27 @@ fn compute_update(text: &str) -> TextUpdate {
         }
     }
     // Reduce: stable sort by dim keeps visit order within a dim, so the
-    // per-dim running sum is bit-for-bit the original's.
+    // per-dim running sum is bit-for-bit the original's. Summed in place
+    // and trimmed: an update waits for its whole batch to be computed, and
+    // a second vector with room for every raw contribution (most of them
+    // folded away for a term the text repeats) waited with it.
     let adds: Vec<Vec<(u32, f32)>> = raw
         .into_iter()
         .map(|mut b| {
             b.sort_by_key(|&(d, _)| d);
-            let mut summed: Vec<(u32, f32)> = Vec::with_capacity(b.len());
-            for (d, v) in b {
-                match summed.last_mut() {
-                    Some(last) if last.0 == d => last.1 += v,
-                    _ => summed.push((d, v)),
+            let mut n = 0usize;
+            for i in 0..b.len() {
+                let (d, v) = b[i];
+                if n > 0 && b[n - 1].0 == d {
+                    b[n - 1].1 += v;
+                } else {
+                    b[n] = (d, v);
+                    n += 1;
                 }
             }
-            summed
+            b.truncate(n);
+            b.shrink_to_fit();
+            b
         })
         .collect();
     let shards: Vec<u16> = terms.iter().map(|t| Vocab::shard_of(t) as u16).collect();
@@ -751,11 +759,18 @@ impl<'a> Iterator for Merged<'a> {
 /// Arithmetic is bit-for-bit the original single-map implementation's:
 /// contributions to one (term, dim) were summed in stream-visit order
 /// (done in `compute_update`), then added onto the existing value once.
+///
+/// The merge runs in `scratch` (the caller's, reused from term to term) and
+/// the result is copied into the entry's own buffer, which is therefore
+/// never larger than its context: built in place, a context kept the
+/// capacity of the merge, its old length plus every contribution of the
+/// text (up to 17 KiB for the 1 KiB a truncated context needs).
 fn apply_term(
     shard: &mut HashMap<String, Entry>,
     base: Option<(&Snapshot, &HashSet<String>)>,
     term: &str,
     summed: &[(u32, f32)],
+    scratch: &mut Vec<Comp>,
 ) {
     if !shard.contains_key(term) {
         // first change since the snapshot: seed the overlay from it
@@ -774,7 +789,9 @@ fn apply_term(
         return;
     }
     let old = &e.ctx;
-    let mut ctx: Vec<Comp> = Vec::with_capacity(old.len() + summed.len());
+    let ctx = scratch;
+    ctx.clear();
+    ctx.reserve(old.len() + summed.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < old.len() || j < summed.len() {
         if j >= summed.len() || (i < old.len() && old[i].d < summed[j].0) {
@@ -798,7 +815,9 @@ fn apply_term(
         ctx.truncate(CTX_TOP);
         ctx.sort_by_key(|c| c.d);
     }
-    e.ctx = ctx;
+    e.ctx.clear();
+    e.ctx.reserve_exact(ctx.len());
+    e.ctx.extend_from_slice(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -910,9 +929,10 @@ impl Model {
         let base = self.vocab.base.as_deref().map(|b| (b, &self.vocab.removed));
         let shards = &mut self.vocab.shards;
         if updates.len() < PAR_MIN {
+            let mut scratch = Vec::new();
             for (shard, items) in shards.iter_mut().zip(per_shard) {
                 for (term, summed) in items {
-                    apply_term(shard, base, term, summed);
+                    apply_term(shard, base, term, summed, &mut scratch);
                 }
             }
             return;
@@ -920,8 +940,9 @@ impl Model {
         // the caller holds the write lock: never the global pool here
         under_model_lock(|| {
             shards.par_iter_mut().zip(per_shard.into_par_iter()).for_each(|(shard, items)| {
+                let mut scratch = Vec::new();
                 for (term, summed) in items {
-                    apply_term(shard, base, term, summed);
+                    apply_term(shard, base, term, summed, &mut scratch);
                 }
             })
         });
@@ -1987,6 +2008,32 @@ mod tests {
         let kept: usize = c.vocab.shards.iter().map(|s| s.capacity()).sum();
         assert_eq!(c.vocab.len(), 50);
         assert!(kept * 8 < held, "overlay capacity after evicting almost everything: {kept} slots (was {held})");
+    }
+
+    /// A context never holds more capacity than components (its merge
+    /// buffer used to stay attached: old length plus every contribution).
+    #[test]
+    fn contexts_hold_no_spare_capacity() {
+        let mut m = Model::default();
+        for step in 0..12 {
+            let updates: Vec<TextUpdate> = generated_texts(20, 400, 50 + step).iter().map(|t| compute_update(t)).collect();
+            m.apply_batch(&updates);
+        }
+        let (mut full, mut total) = (0usize, 0usize);
+        for shard in &m.vocab.shards {
+            for (t, e) in shard {
+                assert!(e.ctx.len() <= CTX_TOP);
+                assert!(e.ctx.capacity() <= CTX_TOP, "{t:?}: capacity {} for {} components", e.ctx.capacity(), e.ctx.len());
+                full += usize::from(e.ctx.len() == CTX_TOP);
+                total += 1;
+            }
+        }
+        assert!(full > 20 && total > 400, "the texts must fill some contexts to the top: {full} of {total}");
+        // a text's update holds its summed contributions and no more
+        for u in generated_texts(20, 400, 99).iter().map(|t| compute_update(t)) {
+            assert!(u.adds.iter().all(|a| a.capacity() == a.len()));
+            assert!(u.adds.iter().all(|a| a.windows(2).all(|w| w[0].0 < w[1].0)), "one sum per dim, sorted by dim");
+        }
     }
 
     /// the direction permutations are deterministic, true

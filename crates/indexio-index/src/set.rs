@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use indexio_types::codec::PostingCursor;
-use indexio_types::{DocMeta, ExtractedArtifact, SymbolKind, SymbolRec, CallRec};
+use indexio_types::DocMeta;
+use roaring::RoaringBitmap;
 use tracing::info;
 
-use crate::format::{kind, TOMBSTONES_LEN};
+use crate::format::TOMBSTONES_LEN;
+use crate::merge::{self, Compound};
 use crate::policy::{self, ShardStat};
-use crate::shard::{decode_call_payload, decode_sym_payload};
-use crate::{invalid, Shard, ShardWriter};
+use crate::{invalid, Shard};
 
 /// Extension merged-but-still-mapped shards are parked under (see `merge`).
 const STALE_EXT: &str = "stale";
@@ -645,148 +646,20 @@ impl ShardSet {
         let merged: Vec<usize> = (lo..hi).collect();
         info!(merged = merged.len(), kept = keep_n, from = lo, "merging shards");
 
-        // Union repo string tables (oldest shard first), remap repo_ids.
-        let mut repos: Vec<String> = Vec::new();
-        let mut repo_ids: HashMap<String, u32> = HashMap::new();
-        let mut repo_map: HashMap<(usize, u32), u32> = HashMap::new();
-        for &si in merged.iter().rev() {
-            for (rid, name) in self.shards[si].meta().repos.iter().enumerate() {
-                let next = repos.len() as u32;
-                let nid = *repo_ids.entry(name.clone()).or_insert_with(|| {
-                    repos.push(name.clone());
-                    next
-                });
-                repo_map.insert((si, rid as u32), nid);
-            }
-        }
-
-        // Kept docs per merged shard: skip tombstoned, newest-wins on
-        // (repo, path) within the merged group.
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut keep: HashMap<usize, Vec<bool>> = HashMap::new();
-        for &si in merged.iter() {
-            // merged indices are newest-first (ShardSet order)
-            let shard = &self.shards[si];
-            let mut kv = vec![false; shard.doc_count() as usize];
-            for docid in 0..shard.doc_count() as u32 {
-                if shard.tombstones().contains(docid) {
-                    continue;
-                }
-                let Some(dm) = shard.doc(docid) else { continue };
-                let repo = Self::repo_name(shard, dm.repo_id);
-                if seen.insert((repo, dm.path)) {
-                    kv[docid as usize] = true;
-                }
-            }
-            keep.insert(si, kv);
-        }
-
-        let mut writer = ShardWriter::new(out_dir)?;
-        // The compound shard must order as old as its newest input so that
-        // kept (newer) shards still win duplicate suppression.
-        let created = merged
-            .iter()
-            .map(|&si| self.shards[si].created_unix())
-            .max()
-            .unwrap_or(0);
-        writer.set_created_unix(created);
-
-        // Oldest shard first for a stable doc order in the compound shard.
-        // `origin[new docid] = (shard idx, old docid)` lets tombstones that
-        // land on an input while we merge be forwarded afterwards.
-        let mut origin: Vec<(usize, u32)> = Vec::new();
-        for &si in merged.iter().rev() {
-            let shard = &self.shards[si];
-            let kv = &keep[&si];
-            let kept_ids: Vec<u32> = (0..shard.doc_count() as u32)
-                .filter(|d| kv[*d as usize])
-                .collect();
-            if kept_ids.is_empty() {
-                continue;
-            }
-            origin.extend(kept_ids.iter().map(|&d| (si, d)));
-            let mut local_of: HashMap<u32, usize> = HashMap::new();
-            let mut arts: Vec<ExtractedArtifact> = Vec::with_capacity(kept_ids.len());
-            for (local, &docid) in kept_ids.iter().enumerate() {
-                local_of.insert(docid, local);
-                arts.push(ExtractedArtifact::default());
-            }
-
-            // Invert NGRAM postings for kept docs (docids only; positions
-            // an older shard may still carry are dropped here, so a
-            // compaction also shrinks older shards).
-            for (gram, off) in shard.fst_entries(kind::NGRAM_FST) {
-                let Some(payload) = shard.posting_payload(kind::NGRAM_POST, off) else {
-                    continue;
-                };
-                let mut cursor = PostingCursor::new(payload);
-                while let Some(docid) = cursor.next_docid() {
-                    if let Some(&local) = local_of.get(&docid) {
-                        arts[local].ngrams.push(gram.clone());
-                    }
-                }
-            }
-            // Symbol postings.
-            for (name, off) in shard.fst_entries(kind::SYM_FST) {
-                let Some(payload) = shard.posting_payload(kind::SYM_POST, off) else {
-                    continue;
-                };
-                let name = String::from_utf8_lossy(&name).into_owned();
-                for (docid, line, k, scope_off) in decode_sym_payload(payload) {
-                    if let Some(&local) = local_of.get(&docid) {
-                        arts[local].symbols.push(SymbolRec {
-                            name: name.clone(),
-                            kind: SymbolKind::from_u8(k),
-                            line,
-                            col: 0, // col is not stored in the shard format
-                            scope: shard.cstr_at(scope_off).unwrap_or_default(),
-                        });
-                    }
-                }
-            }
-            // Call postings.
-            for (callee, off) in shard.fst_entries(kind::CALL_FST) {
-                let Some(payload) = shard.posting_payload(kind::CALL_POST, off) else {
-                    continue;
-                };
-                let callee = String::from_utf8_lossy(&callee).into_owned();
-                for (docid, caller_off, line) in decode_call_payload(payload) {
-                    if let Some(&local) = local_of.get(&docid) {
-                        arts[local].calls.push(CallRec {
-                            callee: callee.clone(),
-                            caller: shard.cstr_at(caller_off).unwrap_or_default(),
-                            line,
-                        });
-                    }
-                }
-            }
-
-            for (local, &docid) in kept_ids.iter().enumerate() {
-                let mut dm = shard
-                    .doc(docid)
-                    .ok_or_else(|| invalid("merge: doc record missing"))?;
-                dm.repo_id = *repo_map
-                    .get(&(si, dm.repo_id))
-                    .ok_or_else(|| invalid("merge: repo_id not mapped"))?;
-                let content = shard.content(docid)?; // raw bytes, recompressed by writer
-                let mut art = std::mem::take(&mut arts[local]);
-                art.lang = dm.lang;
-                art.raw_len = dm.raw_len;
-                writer.add_doc(&dm, &content, &art)?;
-            }
-        }
-
-        // finish() does its own atomic rename; only then remove old files.
-        let compound_path: PathBuf = writer.finish(&repos)?;
+        // The compound is dated by its newest input, so that kept (newer)
+        // shards still win duplicate suppression, and is fully written and
+        // renamed into place before any input is removed. `origin[new
+        // docid] = (index in the run, old docid)`.
+        let run: Vec<&Shard> = self.shards[lo..hi].iter().collect();
+        let Compound { path: compound_path, origin } = merge::write_compound(&run, out_dir)?;
+        drop(run);
         // Docs tombstoned in an input by another process while we were
         // merging would otherwise come back to life in the compound.
+        let landed: Vec<RoaringBitmap> = self.shards[lo..hi].iter().map(|s| s.tombstones_on_disk() - s.tombstones()).collect();
         let late: Vec<u32> = origin
             .iter()
             .enumerate()
-            .filter(|(_, &(si, d))| {
-                let now = self.shards[si].tombstones_on_disk();
-                now.contains(d) && !self.shards[si].tombstones().contains(d)
-            })
+            .filter(|(_, &(ri, d))| landed[ri].contains(d))
             .map(|(new_id, _)| new_id as u32)
             .collect();
         if !late.is_empty() {

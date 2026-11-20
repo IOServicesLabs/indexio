@@ -16,10 +16,14 @@ use crate::ShardMeta;
 
 const ZSTD_LEVEL: i32 = 3;
 /// Docs threshold above which a zstd dictionary is trained.
-const DICT_MIN_DOCS: usize = 100;
+pub(crate) const DICT_MIN_DOCS: usize = 100;
 /// Target dictionary size (112 KiB), clamped to what the sample set
 /// can support so training does not fail on small corpora.
 const DICT_TARGET: usize = 112 * 1024;
+/// The dictionary is trained on the first this many docs of a shard…
+pub(crate) const DICT_SAMPLES: usize = 512;
+/// …on this many leading bytes of each.
+pub(crate) const DICT_SAMPLE_BYTES: usize = 64 * 1024;
 
 struct PendingDoc {
     meta: DocMeta,
@@ -46,13 +50,13 @@ pub struct ShardWriter {
 /// STRINGS blob builder with interning. `off` values are relative to the
 /// blob start (the blob sits after the repo table in the STRINGS section).
 #[derive(Default)]
-struct StringBlob {
-    blob: Vec<u8>,
+pub(crate) struct StringBlob {
+    pub(crate) blob: Vec<u8>,
     intern: HashMap<Vec<u8>, u32>,
 }
 
 impl StringBlob {
-    fn intern_bytes(&mut self, s: &[u8]) -> u32 {
+    pub(crate) fn intern_bytes(&mut self, s: &[u8]) -> u32 {
         if let Some(&off) = self.intern.get(s) {
             return off;
         }
@@ -64,7 +68,7 @@ impl StringBlob {
 
     /// Intern a NUL-terminated string (scope/caller payloads store only an
     /// offset, so the terminator marks the end).
-    fn intern_cstr(&mut self, s: &str) -> u32 {
+    pub(crate) fn intern_cstr(&mut self, s: &str) -> u32 {
         let clean = s.split('\0').next().unwrap_or("");
         let mut key = clean.as_bytes().to_vec();
         key.push(0);
@@ -78,11 +82,39 @@ impl StringBlob {
     }
 }
 
-fn to_io(e: impl std::fmt::Display) -> io::Error {
+pub(crate) fn to_io(e: impl std::fmt::Display) -> io::Error {
     crate::invalid(e.to_string())
 }
 
-fn compress(content: &[u8], dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
+/// `(temp path, final path)` of a new shard in `dir`.
+pub(crate) fn shard_paths(dir: &Path) -> (PathBuf, PathBuf) {
+    let id = ulid::Ulid::new();
+    (dir.join(format!("shard-{id}.cidx.tmp")), dir.join(format!("shard-{id}.cidx")))
+}
+
+/// Train the content dictionary of a shard on `data`, the samples one after
+/// the other, `sizes` long each. `None` (the shard is written without one)
+/// when training fails.
+pub(crate) fn train_dict(data: &[u8], sizes: &[usize]) -> Option<Vec<u8>> {
+    let size = DICT_TARGET.min(data.len() / 10).max(1024);
+    match zstd::dict::from_continuous(data, sizes, size) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            warn!(error = %e, "zstd dict training failed; writing shard without dict");
+            None
+        }
+    }
+}
+
+/// The TOMBSTONES section of a new shard: an empty bitmap, pre-sized.
+pub(crate) fn empty_tombstones() -> io::Result<Vec<u8>> {
+    let mut tomb = Vec::with_capacity(TOMBSTONES_LEN);
+    RoaringBitmap::new().serialize_into(&mut tomb)?;
+    tomb.resize(TOMBSTONES_LEN, 0);
+    Ok(tomb)
+}
+
+pub(crate) fn compress(content: &[u8], dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
     match dict {
         None => zstd::stream::encode_all(content, ZSTD_LEVEL),
         Some(d) => {
@@ -95,9 +127,7 @@ fn compress(content: &[u8], dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
 
 impl ShardWriter {
     pub fn new(dir: &Path) -> io::Result<Self> {
-        let id = ulid::Ulid::new();
-        let tmp_path = dir.join(format!("shard-{id}.cidx.tmp"));
-        let final_path = dir.join(format!("shard-{id}.cidx"));
+        let (tmp_path, final_path) = shard_paths(dir);
         // Reserve the temp path now (also proves the dir is writable).
         File::create(&tmp_path)?;
         let created_unix = std::time::SystemTime::now()
@@ -115,8 +145,9 @@ impl ShardWriter {
         })
     }
 
-    /// Override creation time (used by merge so the compound shard orders
-    /// as old as its newest input shard).
+    /// Override creation time (tests: shards of chosen ages, and the
+    /// in-memory merge the streaming one is compared with).
+    #[cfg(test)]
     pub(crate) fn set_created_unix(&mut self, t: u64) {
         self.created_unix = t;
     }
@@ -190,20 +221,15 @@ impl ShardWriter {
 
         // ---- zstd dictionary (>100 docs) ---------------------------------
         let dict: Option<Vec<u8>> = if n > DICT_MIN_DOCS {
-            let samples: Vec<&[u8]> = live
-                .iter()
-                .take(512)
-                .map(|d| &d.content[..d.content.len().min(64 * 1024)])
-                .collect();
-            let total: usize = samples.iter().map(|s| s.len()).sum();
-            let size = DICT_TARGET.min(total / 10).max(1024);
-            match zstd::dict::from_samples(&samples, size) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    warn!(error = %e, "zstd dict training failed; writing shard without dict");
-                    None
-                }
+            // the samples back to back, as zstd wants them
+            let mut data: Vec<u8> = Vec::new();
+            let mut sizes: Vec<usize> = Vec::new();
+            for d in live.iter().take(DICT_SAMPLES) {
+                let take = d.content.len().min(DICT_SAMPLE_BYTES);
+                data.extend_from_slice(&d.content[..take]);
+                sizes.push(take);
             }
+            train_dict(&data, &sizes)
         } else {
             None
         };
@@ -248,9 +274,7 @@ impl ShardWriter {
         let (call_fst, call_post) = build_call_index(&call_map)?;
 
         // ---- TOMBSTONES (empty bitmap, pre-sized 64KiB) ------------------
-        let mut tomb = Vec::with_capacity(TOMBSTONES_LEN);
-        RoaringBitmap::new().serialize_into(&mut tomb)?;
-        tomb.resize(TOMBSTONES_LEN, 0);
+        let tomb = empty_tombstones()?;
 
         // ---- META ---------------------------------------------------------
         let meta = ShardMeta {

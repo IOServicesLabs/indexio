@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 mod format;
+mod merge;
 mod policy;
 mod set;
 mod shard;

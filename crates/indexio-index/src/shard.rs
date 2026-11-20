@@ -401,7 +401,9 @@ impl Shard {
         Ok(())
     }
 
-    /// Stream all entries of an FST section as (key, post_off). Used by merge.
+    /// All entries of an FST section as (key, post_off) (tests, and the
+    /// in-memory merge the streaming one is compared with).
+    #[cfg(test)]
     pub(crate) fn fst_entries(&self, fst_kind: u32) -> Vec<(Vec<u8>, u64)> {
         use fst::Streamer;
         let mut out = Vec::new();

@@ -1288,13 +1288,34 @@ pub struct RandomIndexingEmbedder {
     expand_cache: RwLock<HashMap<String, Vec<(String, f32)>>>,
     /// Lazy persistence: a long-lived server observes a few
     /// chunks per edit, and serialising the ~250 MB model each time would
-    /// dominate the refresh. With `lazy_flush` set, `flush` only writes
-    /// when the model changed and the last save is older than the
-    /// interval; embeddings themselves are always persisted in the CAS,
+    /// dominate the refresh. With `lazy_flush` set, `flush` never writes
+    /// the model: the owner asks [`save_due`](Embedder::save_due) and runs
+    /// [`persist`](Embedder::persist) in the background, and once more at
+    /// shutdown. Embeddings themselves are always persisted in the CAS,
     /// so an unsaved tail costs at most a little context-vector drift.
+    ///
+    /// A save is due when the model changed, the last save (or the open) is
+    /// older than the interval, AND either [`LAZY_SAVE_MIN_TEXTS`] texts
+    /// were observed since, or the oldest unsaved text has waited
+    /// [`LAZY_SAVE_MAX_WAIT`] intervals. A save rewrites the whole file
+    /// whatever changed, and every server of a data dir saves on its own:
+    /// on the interval alone, ten sessions each editing a file now and then
+    /// rewrote 253 MB every five minutes each, for a handful of chunks.
+    ///
+    /// What a process that dies without its shutdown save loses is the
+    /// texts it observed since its last save: they are marked as seen in
+    /// the embedding cache, so no later run observes them again, and the
+    /// model on disk lacks their contribution until it is rebuilt. That was
+    /// already so for the texts of the last interval; it is now up to
+    /// `LAZY_SAVE_MIN_TEXTS - 1` texts over `LAZY_SAVE_MAX_WAIT` intervals.
     lazy_flush: Option<std::time::Duration>,
     dirty: std::sync::atomic::AtomicBool,
+    /// The last save or save attempt (the open, before the first).
     last_save: std::sync::Mutex<std::time::Instant>,
+    /// Texts observed since the last save.
+    unsaved_texts: AtomicU64,
+    /// When the first of them was observed.
+    unsaved_since: std::sync::Mutex<Option<std::time::Instant>>,
     /// Texts observed since the expansion cache was last cleared: a few
     /// chunks barely move any neighbourhood, so the cache survives the
     /// per-edit observes of the auto-refresh and is dropped only after
@@ -1307,6 +1328,14 @@ pub struct RandomIndexingEmbedder {
     /// for as long as the snapshot takes to write.
     seen: std::sync::atomic::AtomicU64,
 }
+
+/// Texts observed since the last save that make a lazy save due as soon as
+/// the interval has passed (see `lazy_flush`).
+const LAZY_SAVE_MIN_TEXTS: u64 = 64;
+
+/// Intervals after which a lazy save is due however few texts were
+/// observed: an hour at the server's 300 s.
+const LAZY_SAVE_MAX_WAIT: u32 = 12;
 
 /// Observed texts after which cached query expansions are considered stale.
 const EXPAND_CLEAR_AFTER: usize = 2000;
@@ -1391,6 +1420,8 @@ impl RandomIndexingEmbedder {
             lazy_flush: None,
             dirty: std::sync::atomic::AtomicBool::new(false),
             last_save: std::sync::Mutex::new(std::time::Instant::now()),
+            unsaved_texts: AtomicU64::new(0),
+            unsaved_since: std::sync::Mutex::new(None),
             observed_since_clear: std::sync::atomic::AtomicUsize::new(0),
             expand_dirty: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1498,7 +1529,8 @@ impl RandomIndexingEmbedder {
 }
 
 impl RandomIndexingEmbedder {
-    /// Save the model at most once per `interval` (see `lazy_flush`).
+    /// Save the model in the background, at most once per `interval` and
+    /// only for enough new text (see `lazy_flush`).
     pub fn with_lazy_flush(mut self, interval: std::time::Duration) -> Self {
         self.lazy_flush = Some(interval);
         self
@@ -1510,12 +1542,20 @@ impl RandomIndexingEmbedder {
     /// between the merge and the swap.
     pub fn save_now(&self) -> anyhow::Result<()> {
         let mut m = self.model.write().expect("rindex model lock poisoned");
-        m.save_snapshot(&self.path)?;
+        let saved = m.save_snapshot(&self.path);
+        // (a failed save waits for the interval like any other, instead of
+        // being tried again by every call that asks `save_due`)
+        *self.last_save.lock().expect("last_save poisoned") = std::time::Instant::now();
+        saved?;
         // (a save rebases onto another server's snapshot and adds its count)
         self.seen.store(m.n_texts_seen, std::sync::atomic::Ordering::Release);
-        drop(m);
+        // Still under the write lock: an observe marks the model dirty
+        // after it has applied its texts, so one that gets the lock after
+        // this save cannot have its mark cleared here.
         self.dirty.store(false, std::sync::atomic::Ordering::Release);
-        *self.last_save.lock().expect("last_save poisoned") = std::time::Instant::now();
+        self.unsaved_texts.store(0, Ordering::Release);
+        *self.unsaved_since.lock().expect("unsaved_since poisoned") = None;
+        drop(m);
         self.save_expand_cache();
         Ok(())
     }
@@ -1619,6 +1659,8 @@ impl Embedder for RandomIndexingEmbedder {
             m.vocab.len()
         };
         if !texts.is_empty() {
+            self.unsaved_texts.fetch_add(texts.len() as u64, Ordering::AcqRel);
+            self.unsaved_since.lock().expect("unsaved_since poisoned").get_or_insert_with(std::time::Instant::now);
             self.dirty.store(true, std::sync::atomic::Ordering::Release);
         }
         tracing::debug!(
@@ -1650,10 +1692,20 @@ impl Embedder for RandomIndexingEmbedder {
         self.save_now()
     }
 
+    /// See `lazy_flush` for the policy and what it risks.
     fn save_due(&self) -> bool {
         let Some(interval) = self.lazy_flush else { return false };
-        self.dirty.load(std::sync::atomic::Ordering::Acquire)
-            && self.last_save.lock().expect("last_save poisoned").elapsed() >= interval
+        if !self.dirty.load(std::sync::atomic::Ordering::Acquire)
+            || self.last_save.lock().expect("last_save poisoned").elapsed() < interval
+        {
+            return false;
+        }
+        self.unsaved_texts.load(Ordering::Acquire) >= LAZY_SAVE_MIN_TEXTS
+            || self
+                .unsaved_since
+                .lock()
+                .expect("unsaved_since poisoned")
+                .is_some_and(|first| first.elapsed() >= interval * LAZY_SAVE_MAX_WAIT)
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -1678,26 +1730,113 @@ mod tests {
         toks.iter().map(|t| (t.term.as_str(), t.weight)).collect()
     }
 
+    /// (an Instant cannot go back further than the boot: keep it short)
+    fn secs_ago(secs: u64) -> std::time::Instant {
+        std::time::Instant::now() - std::time::Duration::from_secs(secs)
+    }
+
     /// a lazily persisted model is never written inside
     /// `flush`; it reports when a save is due and `persist` writes it.
     #[test]
     fn lazy_flush_defers_the_save_to_persist() {
         let tmp = tempfile::tempdir().unwrap();
-        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(5));
-        e.observe(&["lazyterm otherterm".to_string()]).unwrap();
+        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(1));
+        let texts = |n: u64, tag: &str| -> Vec<String> { (0..n).map(|i| format!("{tag}term{i} otherterm")).collect() };
+        e.observe(&texts(LAZY_SAVE_MIN_TEXTS, "lazy")).unwrap();
         assert!(e.dirty.load(std::sync::atomic::Ordering::Acquire));
         e.flush().unwrap();
         assert!(e.dirty.load(std::sync::atomic::Ordering::Acquire), "flush must not save inline in lazy mode");
         assert!(!e.save_due(), "the interval has not passed");
-        // (an Instant cannot go back further than the boot: keep it short)
-        *e.last_save.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        *e.last_save.lock().unwrap() = secs_ago(2);
         assert!(e.save_due());
         e.persist().unwrap();
         assert!(!e.dirty.load(std::sync::atomic::Ordering::Acquire));
         assert!(!e.save_due());
-        // the saved model reopens with the term
+        // the saved model reopens with the texts
         let e2 = RandomIndexingEmbedder::open(tmp.path()).unwrap();
-        assert!(e2.texts_seen().unwrap() >= 1);
+        assert_eq!(e2.texts_seen(), Some(LAZY_SAVE_MIN_TEXTS));
+    }
+
+    /// The interval alone does not make a save due: a handful of observed
+    /// texts waits for more, or for `LAZY_SAVE_MAX_WAIT` intervals, and the
+    /// shutdown save (`persist`) writes whatever is unsaved.
+    #[test]
+    fn lazy_save_waits_for_enough_text_or_long_enough() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(1));
+        let path = RandomIndexingEmbedder::model_path(tmp.path());
+        let text = |i: u64| vec![format!("edit{i} chunk{i} body")];
+        assert!(!e.save_due(), "nothing to save");
+
+        // a few texts, interval long past: not worth rewriting the model
+        e.observe(&text(0)).unwrap();
+        e.observe(&text(1)).unwrap();
+        *e.last_save.lock().unwrap() = secs_ago(3);
+        assert!(!e.save_due(), "two texts after one interval");
+        assert!(!path.exists());
+        // ... until they have waited LAZY_SAVE_MAX_WAIT intervals
+        *e.unsaved_since.lock().unwrap() = Some(secs_ago(u64::from(LAZY_SAVE_MAX_WAIT) / 2));
+        assert!(!e.save_due(), "not yet");
+        *e.unsaved_since.lock().unwrap() = Some(secs_ago(u64::from(LAZY_SAVE_MAX_WAIT) + 1));
+        assert!(e.save_due(), "nothing waits longer than LAZY_SAVE_MAX_WAIT intervals");
+        *e.unsaved_since.lock().unwrap() = Some(std::time::Instant::now());
+
+        // enough text makes it due at the interval, never before
+        for i in 2..LAZY_SAVE_MIN_TEXTS - 1 {
+            e.observe(&text(i)).unwrap();
+        }
+        assert!(!e.save_due(), "one text short");
+        e.observe(&text(LAZY_SAVE_MIN_TEXTS)).unwrap();
+        assert!(e.save_due());
+        *e.last_save.lock().unwrap() = std::time::Instant::now();
+        assert!(!e.save_due(), "never before the interval, whatever was observed");
+        *e.last_save.lock().unwrap() = secs_ago(3);
+        e.persist().unwrap();
+        assert!(path.is_file());
+        assert_eq!(e.unsaved_texts.load(Ordering::Acquire), 0);
+        assert!(e.unsaved_since.lock().unwrap().is_none());
+
+        // the count starts over after a save
+        e.observe(&text(1000)).unwrap();
+        *e.last_save.lock().unwrap() = secs_ago(3);
+        assert!(!e.save_due(), "one text since the save");
+        // the shutdown save takes it whatever the policy says
+        e.persist().unwrap();
+        assert!(!e.dirty.load(std::sync::atomic::Ordering::Acquire));
+        let reopened = RandomIndexingEmbedder::open(tmp.path()).unwrap();
+        assert_eq!(reopened.texts_seen(), Some(LAZY_SAVE_MIN_TEXTS + 1), "every observed text reached the file");
+        assert!(reopened.model.read().unwrap().vocab.contains_key("edit1000"));
+
+        // an eager embedder (the CLI) saves on every flush, as before
+        let eager = RandomIndexingEmbedder::open(tmp.path()).unwrap();
+        eager.observe(&text(2000)).unwrap();
+        assert!(!eager.save_due(), "eager mode never asks for a background save");
+        eager.flush().unwrap();
+        assert!(!eager.dirty.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A save that fails keeps the model dirty and is tried again after the
+    /// interval, not by every call that asks.
+    #[test]
+    fn failed_save_waits_for_the_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = RandomIndexingEmbedder::open(tmp.path()).unwrap().with_lazy_flush(std::time::Duration::from_secs(1));
+        e.observe(&(0..LAZY_SAVE_MIN_TEXTS).map(|i| format!("failterm{i} body")).collect::<Vec<_>>()).unwrap();
+        // the model's directory cannot be created: a file is in its place
+        let sem = tmp.path().join("sem");
+        std::fs::write(&sem, b"in the way").unwrap();
+        *e.last_save.lock().unwrap() = secs_ago(3);
+        assert!(e.save_due());
+        assert!(e.persist().is_err());
+        assert!(e.dirty.load(std::sync::atomic::Ordering::Acquire), "nothing was saved");
+        assert_eq!(e.unsaved_texts.load(Ordering::Acquire), LAZY_SAVE_MIN_TEXTS);
+        assert!(!e.save_due(), "the retry waits for the interval");
+        *e.last_save.lock().unwrap() = secs_ago(3);
+        assert!(e.save_due());
+        std::fs::remove_file(&sem).unwrap();
+        e.persist().unwrap();
+        assert!(!e.dirty.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(RandomIndexingEmbedder::open(tmp.path()).unwrap().texts_seen(), Some(LAZY_SAVE_MIN_TEXTS));
     }
 
     #[test]

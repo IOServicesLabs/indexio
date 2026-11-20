@@ -840,6 +840,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rebuild_model,
         } => {
             let embedder = select_embedder(embedder_flag.as_deref(), &data_dir)?;
+            // a rebuild of the whole plane replaces the segments a compaction
+            // merges: one of the two at a time (one repo is an append, which
+            // every writer does beside a compaction)
+            let _lock = if repo.is_none() || rebuild_model { compact_lock(&data_dir)? } else { None };
             let embedder = if rebuild_model {
                 // wipe the on-disk semantic model and this
                 // model's embcas namespace, then re-observe ALL chunks
@@ -1075,6 +1079,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Compact { max_shards, vectors } => {
+            // one compaction at a time across the data dir: a server's
+            // maintenance process may be merging the same shards right now
+            let _lock = compact_lock(&data_dir)?;
             let shards_dir = data_dir.join("shards");
             let mut set = ShardSet::open_dir(&shards_dir)?;
             let before = set.len();
@@ -1088,19 +1095,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // semantic plane: fold delta segments / purge tombstones
             let model = select_embedder(None, &data_dir).map(|e| e.model_id().to_string());
             if let Ok(model) = model {
-                let _lock = indexio_embed::pipeline::CompactLock::try_acquire(&data_dir);
-                if _lock.is_none() {
-                    println!("vector segments: another process is compacting; skipped");
-                } else {
-                    let (n, rows, dead) = indexio_embed::index::segment_stats(&data_dir.join("vec"), &model);
-                    match indexio_embed::pipeline::compact_vectors_opts(&data_dir, &model, vectors) {
-                        Ok(true) => {
-                            let (m, _, _) = indexio_embed::index::segment_stats(&data_dir.join("vec"), &model);
-                            println!("vector segments: {n} -> {m} ({rows} rows, {dead} were tombstoned)");
-                        }
-                        Ok(false) => println!("vector segments: nothing to compact ({n} segments, {dead}/{rows} tombstoned)"),
-                        Err(e) => println!("vector segments: compaction failed: {e:#}"),
+                let (n, rows, dead) = indexio_embed::index::segment_stats(&data_dir.join("vec"), &model);
+                match indexio_embed::pipeline::compact_vectors_opts(&data_dir, &model, vectors) {
+                    Ok(true) => {
+                        let (m, _, _) = indexio_embed::index::segment_stats(&data_dir.join("vec"), &model);
+                        println!("vector segments: {n} -> {m} ({rows} rows, {dead} were tombstoned)");
                     }
+                    Ok(false) => println!("vector segments: nothing to compact ({n} segments, {dead}/{rows} tombstoned)"),
+                    Err(e) => println!("vector segments: compaction failed: {e:#}"),
                 }
             }
         }
@@ -1318,6 +1320,33 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// How long a command waits for another process's compaction pass.
+const COMPACT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// The cross-process compaction lock for a command that merges shards or
+/// rewrites the semantic plane: taken at once when free, else after waiting
+/// for the pass that holds it (an MCP server's maintenance process, another
+/// command). `None` for a data dir that does not exist yet: nothing there
+/// to compact, and nothing to collide with.
+pub(crate) fn compact_lock(data_dir: &Path) -> anyhow::Result<Option<indexio_embed::pipeline::CompactLock>> {
+    use indexio_embed::pipeline::CompactLock;
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    if let Some(lock) = CompactLock::try_acquire(data_dir) {
+        return Ok(Some(lock));
+    }
+    eprintln!("another process is compacting {}; waiting for it to finish", data_dir.display());
+    match CompactLock::acquire(data_dir, COMPACT_LOCK_WAIT) {
+        Some(lock) => Ok(Some(lock)),
+        None => anyhow::bail!(
+            "another process still holds the compaction lock ({}) after {} minutes",
+            data_dir.join("compact.lock").display(),
+            COMPACT_LOCK_WAIT.as_secs() / 60
+        ),
+    }
 }
 
 /// Embedder selection, in precedence order:
@@ -1625,6 +1654,8 @@ fn embed_after_sync(data_dir: &Path, indexed: &[IndexReport]) -> anyhow::Result<
         .map(|r| r.repo.clone())
         .collect();
     let reports = if !indexio_embed::pipeline::plane_exists(data_dir, embedder.model_id()) {
+        // (a whole-plane build: under the compaction lock, like `embed`)
+        let _lock = compact_lock(data_dir)?;
         indexio_embed::pipeline::embed_all(&set, data_dir, embedder.as_ref())?
     } else if changed.is_empty() {
         Vec::new()

@@ -1015,9 +1015,13 @@ async fn admin_embed(
     let embedder = state.embedder.read().expect("embedder lock poisoned").clone();
     let engine = state.base();
     let dd = Arc::clone(&state.data_dir);
-    let reports = blocking(move || embed_all(engine.shard_set(), &dd, embedder.as_ref()))
-        .await?
-        .map_err(|e| internal_error(format!("embed failed: {e}")))?;
+    let reports = blocking(move || {
+        // a whole-plane rebuild: one at a time with any compaction pass
+        let _lock = crate::compact_lock(&dd)?;
+        embed_all(engine.shard_set(), &dd, embedder.as_ref())
+    })
+    .await?
+    .map_err(|e| internal_error(format!("embed failed: {e}")))?;
     Ok(Json(
         json!({ "reports": reports.iter().map(embed_report_to_json).collect::<Vec<_>>() }),
     ))

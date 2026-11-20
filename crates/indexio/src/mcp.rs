@@ -28,6 +28,7 @@ use indexio_query::{Engine, FusionAlgo, SearchMode};
 
 use crate::mcp_text;
 
+mod bounded;
 pub(crate) mod maintain;
 
 const PARSE_ERROR: i64 = -32700;
@@ -129,8 +130,9 @@ pub struct McpServer {
     /// could not embed (another server mid-append) stays queued for the
     /// next refresh.
     pending_embed: Arc<Mutex<std::collections::BTreeSet<String>>>,
-    /// (repo, path) the coverage repair already tried in this process.
-    repair_tried: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    /// (repo, path) the coverage repair already tried in this process
+    /// (the most recent [`REPAIR_TRIED_MAX`] to twice that many).
+    repair_tried: Arc<Mutex<bounded::RecentSet<(String, String)>>>,
     /// Per plain folder (not the session's own): file stamps of the last
     /// background pass, so the next one only stats unchanged files.
     plain_caches: Arc<Mutex<HashMap<String, indexio_ingest::WorktreeCache>>>,
@@ -178,7 +180,7 @@ pub struct McpServer {
     /// Files this session has already been charged a whole-file read for
     ///: only the first `read_span` of a file is measured
     /// against the harness reading it whole.
-    read_seen: Mutex<HashMap<(String, String), [u8; 16]>>,
+    read_seen: ReadSeen,
     /// Recent `read_span` answers by content id (see `elide_repeat_span`).
     span_seen: Mutex<HashMap<indexio_types::BlobId, std::time::SystemTime>>,
 }
@@ -198,7 +200,22 @@ const SPAN_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 /// and again whenever the file changed since (an agent re-reads a file it
 /// edited, so a session that keeps coming back to the same files is not
 /// scored as if the harness had read them once).
-type ReadSeen = Mutex<HashMap<(String, String), [u8; 16]>>;
+type ReadSeen = Mutex<bounded::RecentMap<(String, String), [u8; 16]>>;
+
+/// Files per generation of [`ReadSeen`]: a session that reads more distinct
+/// files by span than this is charged a whole-file read again for the ones
+/// it has not touched for longest.
+const READ_SEEN_MAX: usize = 4096;
+
+/// Docs per generation the coverage repair remembers having tried. Every
+/// pass asks again for every doc that still has no vector rows, so the ones
+/// that cannot be embedded stay remembered; past twice this many a doc is
+/// tried again, which costs one chunking.
+const REPAIR_TRIED_MAX: usize = 32 * 1024;
+
+fn new_read_seen() -> ReadSeen {
+    Mutex::new(bounded::RecentMap::new(READ_SEEN_MAX))
+}
 
 /// How often the running server re-imports session transcripts.
 const SESSIONS_IMPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(180);
@@ -269,7 +286,7 @@ impl McpServer {
             maint_retry: Mutex::new(None),
             warm: Arc::new(Mutex::new(None)),
             pending_embed: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            repair_tried: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            repair_tried: Arc::new(Mutex::new(bounded::RecentSet::new(REPAIR_TRIED_MAX))),
             plain_caches: Arc::new(Mutex::new(HashMap::new())),
             embed_busy: Arc::new(AtomicBool::new(false)),
             embed_lock: Arc::new(Mutex::new(())),
@@ -292,7 +309,7 @@ impl McpServer {
             stale_noted: AtomicBool::new(false),
             sync_last: Mutex::new(None),
             sync_busy: Arc::new(AtomicBool::new(false)),
-            read_seen: Mutex::new(HashMap::new()),
+            read_seen: new_read_seen(),
             span_seen: Mutex::new(HashMap::new()),
         }
     }
@@ -372,6 +389,8 @@ impl McpServer {
                             Err(e) => tracing::warn!(repo = %n, error = %e, "background sync failed"),
                         }
                     }
+                    // (a folder that is no longer registered keeps no stamps here)
+                    plain_caches.lock().unwrap_or_else(|e| e.into_inner()).retain(|n, _| plain.contains(n));
                     for n in &plain {
                         let mut caches = plain_caches.lock().unwrap_or_else(|e| e.into_inner());
                         let cache = caches.entry(n.clone()).or_default();
@@ -1574,7 +1593,7 @@ pub fn handle_remote(engine: &Engine, embedder: &dyn Embedder, reranker: &dyn Re
                 if name == "impact_of_diff" {
                     return remote_impact_of_diff(engine, ctx, &args, format);
                 }
-                call_tool(engine, embedder, reranker, name, &args, format, ctx.current, &Mutex::new(HashMap::new()), &mut None)
+                call_tool(engine, embedder, reranker, name, &args, format, ctx.current, &new_read_seen(), &mut None)
             });
             Some(match res {
                 Ok(v) => result_response(id, v),
@@ -2185,7 +2204,7 @@ pub fn call_once(data_dir: &std::path::Path, name: &str, args: &Value, current: 
         Arc::new(indexio_embed::embed::HashEmbedder::new(512))
     };
     let reranker = crate::select_reranker_or_fallback();
-    let read_seen: ReadSeen = Mutex::new(HashMap::new());
+    let read_seen = new_read_seen();
     let mut baseline = None;
     let out = call_tool(&engine, embedder.as_ref(), reranker.as_ref(), name, args, OutputFormat::Text, current, &read_seen, &mut baseline)
         .map(|v| {
@@ -3623,7 +3642,7 @@ mod tests {
     #[test]
     fn read_span_baseline_is_charged_once_per_file_version() {
         let (tmp, e) = fixture_engine();
-        let seen: ReadSeen = Mutex::new(HashMap::new());
+        let seen = new_read_seen();
         let span = |e: &Engine, seen: &ReadSeen| {
             let mut baseline = None;
             let args = json!({"repo": "alpha", "path": "src/foo.rs", "start": 1, "end": 1});
@@ -3744,7 +3763,7 @@ mod tests {
             .collect();
         write_shard(&shards, &docs, &["beta".to_string()]);
         let e = Engine::open(tmp.path()).unwrap();
-        let seen: ReadSeen = Mutex::new(HashMap::new());
+        let seen = new_read_seen();
         let grep = |current: Option<&str>| {
             let mut baseline = None;
             let args = json!({"pattern": "foo_bar_123"});

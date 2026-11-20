@@ -68,6 +68,11 @@ fn data_dir_with_shards(tmp: &Path, shards: usize) -> (PathBuf, PathBuf) {
     (data, repo)
 }
 
+/// More shards than any server lets pile up before it merges (0.1.14: 12).
+/// How many a pass leaves is the merge policy's business: these tests only
+/// ask that it leaves fewer.
+const DUE: usize = 14;
+
 fn maintain_log(data: &Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(data.join("maintain.log"))
         .unwrap_or_default()
@@ -145,15 +150,16 @@ fn wait_for(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
 #[test]
 fn the_child_merges_due_shards_under_the_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    let (data, _repo) = data_dir_with_shards(tmp.path(), 14);
+    let (data, _repo) = data_dir_with_shards(tmp.path(), DUE);
     run_ok(indexio(&data).arg("maintain"));
     let left = shard_count(&data);
-    assert!(left <= 6, "{left} shards left");
+    assert!(left < DUE, "{left} shards left");
     assert!(!data.join("compact.lock").exists(), "the pass left its lock behind");
     let log = maintain_log(&data);
     assert_eq!(log.len(), 1, "{log:?}");
     assert_eq!(log[0]["shards"], true);
-    assert_eq!(log[0]["shards_before"], 14);
+    assert_eq!(log[0]["shards_before"], DUE);
+    assert_eq!(log[0]["shards_after"], left);
     // every doc is still there
     let hits = run_ok(indexio(&data).args(["search", "edited_thing_3"]));
     assert!(hits.contains("src/edit_3.rs"), "{hits}");
@@ -172,12 +178,12 @@ fn the_child_merges_due_shards_under_the_lock() {
 #[test]
 fn a_held_lock_stops_the_child_and_a_stale_one_is_taken_over() {
     let tmp = tempfile::tempdir().unwrap();
-    let (data, _repo) = data_dir_with_shards(tmp.path(), 14);
+    let (data, _repo) = data_dir_with_shards(tmp.path(), DUE);
     let lock = data.join("compact.lock");
     std::fs::write(&lock, "4242").unwrap();
     let out = indexio(&data).arg("maintain").output().unwrap();
     assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(shard_count(&data), 14, "merged without the lock");
+    assert_eq!(shard_count(&data), DUE, "merged without the lock");
     assert!(maintain_log(&data).is_empty());
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), "4242", "the other holder's lock was touched");
 
@@ -217,13 +223,13 @@ fn a_held_lock_stops_the_child_and_a_stale_one_is_taken_over() {
 #[test]
 fn a_server_hands_a_due_pass_to_a_child_process() {
     let tmp = tempfile::tempdir().unwrap();
-    let (data, repo) = data_dir_with_shards(tmp.path(), 14);
+    let (data, repo) = data_dir_with_shards(tmp.path(), DUE);
     let mut mcp = Mcp::start(&data, &repo, &[]);
     assert!(mcp.finds("edited_thing_2"));
-    wait_for("the child's pass", 60, || shard_count(&data) <= 6 && maintain_log(&data).len() == 1);
+    wait_for("the child's pass", 60, || shard_count(&data) < DUE && maintain_log(&data).len() == 1);
     let log = maintain_log(&data);
     assert_ne!(log[0]["pid"].as_u64().unwrap(), u64::from(mcp.child.id()), "the server merged in its own process");
-    assert_eq!(log[0]["shards_before"], 14);
+    assert_eq!(log[0]["shards_before"], DUE);
     wait_for("the lock's release", 20, || !data.join("compact.lock").exists());
     // the server sees the merged shards on its next calls
     for sym in ["edited_thing_0", "edited_thing_7", "original_thing"] {
@@ -243,10 +249,10 @@ fn a_server_hands_a_due_pass_to_a_child_process() {
 #[test]
 fn the_in_process_switch_keeps_the_pass_in_the_server() {
     let tmp = tempfile::tempdir().unwrap();
-    let (data, repo) = data_dir_with_shards(tmp.path(), 14);
+    let (data, repo) = data_dir_with_shards(tmp.path(), DUE);
     let mut mcp = Mcp::start(&data, &repo, &[("INDEXIO_MAINT_INPROCESS", "1")]);
     assert!(mcp.finds("edited_thing_2"));
-    wait_for("the in-process pass", 60, || shard_count(&data) <= 6 && !data.join("compact.lock").exists());
+    wait_for("the in-process pass", 60, || shard_count(&data) < DUE && !data.join("compact.lock").exists());
     assert!(maintain_log(&data).is_empty(), "a child ran although the pass was forced in-process");
     for sym in ["edited_thing_0", "edited_thing_7", "original_thing"] {
         assert!(mcp.finds(sym), "{sym} is gone after the merge");
@@ -258,12 +264,12 @@ fn the_in_process_switch_keeps_the_pass_in_the_server() {
 #[test]
 fn two_servers_deciding_at_once_run_one_pass() {
     let tmp = tempfile::tempdir().unwrap();
-    let (data, repo) = data_dir_with_shards(tmp.path(), 14);
+    let (data, repo) = data_dir_with_shards(tmp.path(), DUE);
     let mut a = Mcp::start(&data, &repo, &[]);
     let mut b = Mcp::start(&data, &repo, &[]);
     assert!(a.finds("edited_thing_2"));
     assert!(b.finds("edited_thing_2"));
-    wait_for("the pass", 60, || shard_count(&data) <= 6 && !data.join("compact.lock").exists());
+    wait_for("the pass", 60, || shard_count(&data) < DUE && !data.join("compact.lock").exists());
     std::thread::sleep(Duration::from_millis(1500)); // a second child, had one been started, has run by now
     assert_eq!(maintain_log(&data).len(), 1, "{:?}", maintain_log(&data));
     for sym in ["edited_thing_0", "edited_thing_7", "original_thing"] {

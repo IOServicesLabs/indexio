@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use indexio_embed::bm25::Bm25Set;
 use indexio_embed::index::{VecIndex, VecRowMeta, VecSet};
+use indexio_embed::store::{chunk_hash, EmbedCas};
 
 struct Counting;
 
@@ -178,6 +179,44 @@ fn opening_a_segment_keeps_a_few_bytes_per_row() {
     assert!(cost.allocs <= 4, "repo_rows allocated {} blocks", cost.allocs);
 }
 
+/// Asking a seen-only embedding cache about a few chunks must not load the
+/// hash of every chunk the model ever observed (1.37 M hashes on a real
+/// data dir: 21 MB read into a 36-55 MB set, on each embed with a changed
+/// chunk).
+#[test]
+fn seen_only_lookup_does_not_load_the_hash_file() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    const N: u32 = 400_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("embcas").join("m");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hash = |i: u32| chunk_hash(&i.to_le_bytes());
+    let bytes: Vec<u8> = (0..N).flat_map(hash).collect();
+    std::fs::write(dir.join("seen.idx"), &bytes).unwrap();
+    let file_len = bytes.len();
+    drop(bytes);
+
+    // the chunks of one edited file: some seen before, some new
+    let ask: Vec<[u8; 16]> = (0..40).map(|i| hash(if i % 2 == 0 { i * 9_001 } else { N + i })).collect();
+    let cas = EmbedCas::open_seen_only(tmp.path(), "m");
+    let (seen, cost) = measure(|| cas.contains_many(&ask));
+    assert!(seen.iter().enumerate().all(|(i, &s)| s == (i % 2 == 0)));
+    assert!(file_len > 6 << 20);
+    assert!(cost.peak < 1 << 20, "a lookup of 40 hashes in a {file_len}-byte file peaked at {cost:?}");
+    assert!(cost.kept < 64 << 10, "a lookup of 40 hashes kept {cost:?}");
+
+    // recording the new ones appends them and loads nothing either
+    let (_, cost) = measure(|| {
+        for h in &ask {
+            cas.put(h, &[0.0]);
+        }
+        cas.flush();
+    });
+    assert!(cost.peak < 1 << 20, "puts peaked at {cost:?}");
+    drop(cas);
+    assert_eq!(std::fs::metadata(dir.join("seen.idx")).unwrap().len(), file_len as u64 + 20 * 16);
+}
+
 /// What opening the semantic plane of a real data dir costs, next to what
 /// deserializing its metadata blocks (the previous open) costs.
 #[test]
@@ -231,6 +270,24 @@ fn measure_real_plane() {
             timed(&format!("repo_rows(\"indexio\") ({} ranges)", ranges.len()), &cost, t);
         }
     }
+
+    // the seen-only embedding cache: a lookup of a few chunk hashes
+    let cas = EmbedCas::open_seen_only(&data, &model);
+    let ask: Vec<[u8; 16]> = (0..64u32).map(|i| chunk_hash(&i.to_le_bytes())).collect();
+    let t = Instant::now();
+    let (seen, cost) = measure(|| cas.contains_many(&ask));
+    timed(&format!("EmbedCas lookup of 64 hashes ({} seen)", seen.iter().filter(|s| **s).count()), &cost, t);
+    let t = Instant::now();
+    let (stats, cost) = measure(|| cas.stats());
+    timed(&format!("EmbedCas stats ({} hashes)", stats.0), &cost, t);
+    drop(cas);
+    let t = Instant::now();
+    let (n, cost) = measure(|| {
+        let bytes = std::fs::read(data.join("embcas").join(&model).join("seen.idx")).unwrap_or_default();
+        let set: std::collections::HashSet<[u8; 16]> = bytes.chunks_exact(16).map(|c| c.try_into().unwrap()).collect();
+        set.len()
+    });
+    timed(&format!("loading {n} hashes into a set (before)"), &cost, t);
 
     // the previous open: one owned VecRowMeta per row
     let (mut kept, mut allocs, mut ms) = (0usize, 0u64, 0.0f64);

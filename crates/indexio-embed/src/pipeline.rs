@@ -155,10 +155,15 @@ fn embed_works(
             vecs[i] = Some(v);
         } else {
             report.cas_misses += 1;
-            known[i] = cas.contains(&w.hash);
-            report.cas_known += u64::from(known[i]);
             miss_all.push(i);
         }
+    }
+    // all misses in one question: a seen-only cache answers it with one
+    // pass over its file instead of loading every hash the model ever saw
+    let miss_hashes: Vec<[u8; 16]> = miss_all.iter().map(|&i| works[i].hash).collect();
+    for (&i, seen) in miss_all.iter().zip(cas.contains_many(&miss_hashes)) {
+        known[i] = seen;
+        report.cas_known += u64::from(seen);
     }
     let mut seen: HashSet<[u8; 16]> = HashSet::new();
     let miss_uniq: Vec<usize> = miss_all

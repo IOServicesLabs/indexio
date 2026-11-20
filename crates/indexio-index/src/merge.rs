@@ -334,8 +334,12 @@ pub(crate) fn write_compound(run: &[&Shard], out_dir: &Path) -> io::Result<Compo
             }
         }
         if !ids.is_empty() {
+            // The writer only produces ascending lists. One that is not
+            // (a damaged shard) is put in order, as the in-memory merge did
+            // by construction: failing here would fail every later
+            // compaction of this run and let the shard count grow.
             if ids.windows(2).any(|w| w[0] > w[1]) {
-                return Err(invalid("merge: n-gram posting list out of order"));
+                ids.sort_unstable();
             }
             payload.extend_from_slice(&encode_doc_postings(&ids));
         }
@@ -344,43 +348,62 @@ pub(crate) fn write_compound(run: &[&Shard], out_dir: &Path) -> io::Result<Compo
     drop(ids);
 
     // SYM: varint(doc_delta), varint(line), u8 kind, varint(scope_off)
+    // One key's postings at a time (new docid, line, kind, scope): in
+    // order for shards the writer produced; a list that is not is put in
+    // order by docid, keeping the order of a doc's own entries.
+    let mut syms: Vec<(u32, u32, u8, u32)> = Vec::new();
     posting_sections(&sources, (kind::SYM_FST, kind::SYM_POST), &mut out, &mut spill, &mut sections, |hits, payload| {
-        let mut prev = 0u32;
+        syms.clear();
         for &(i, off) in hits {
             let s = &sources[i];
             let Some(list) = s.shard.posting_payload(kind::SYM_POST, off) else { continue };
             for (docid, line, k, scope_off) in decode_sym_payload(list) {
                 let Some(new) = s.new_id(docid) else { continue };
                 let scope = *s.strings.get(&scope_off).ok_or_else(|| invalid("merge: scope string not mapped"))?;
-                let delta = new.checked_sub(prev).ok_or_else(|| invalid("merge: symbol posting list out of order"))?;
-                prev = new;
-                write_varint(payload, delta as u64);
-                write_varint(payload, line as u64);
-                payload.push(SymbolKind::from_u8(k).as_u8());
-                write_varint(payload, scope as u64);
+                syms.push((new, line, k, scope));
             }
+        }
+        if syms.windows(2).any(|w| w[0].0 > w[1].0) {
+            syms.sort_by_key(|e| e.0);
+        }
+        let mut prev = 0u32;
+        for &(new, line, k, scope) in &syms {
+            write_varint(payload, (new - prev) as u64);
+            prev = new;
+            write_varint(payload, line as u64);
+            payload.push(SymbolKind::from_u8(k).as_u8());
+            write_varint(payload, scope as u64);
         }
         Ok(())
     })?;
+    drop(syms);
 
     // CALL: varint(doc_delta), varint(caller_off), varint(line)
+    let mut calls: Vec<(u32, u32, u32)> = Vec::new();
     posting_sections(&sources, (kind::CALL_FST, kind::CALL_POST), &mut out, &mut spill, &mut sections, |hits, payload| {
-        let mut prev = 0u32;
+        calls.clear();
         for &(i, off) in hits {
             let s = &sources[i];
             let Some(list) = s.shard.posting_payload(kind::CALL_POST, off) else { continue };
             for (docid, caller_off, line) in decode_call_payload(list) {
                 let Some(new) = s.new_id(docid) else { continue };
                 let caller = *s.strings.get(&caller_off).ok_or_else(|| invalid("merge: caller string not mapped"))?;
-                let delta = new.checked_sub(prev).ok_or_else(|| invalid("merge: call posting list out of order"))?;
-                prev = new;
-                write_varint(payload, delta as u64);
-                write_varint(payload, caller as u64);
-                write_varint(payload, line as u64);
+                calls.push((new, caller, line));
             }
+        }
+        if calls.windows(2).any(|w| w[0].0 > w[1].0) {
+            calls.sort_by_key(|e| e.0);
+        }
+        let mut prev = 0u32;
+        for &(new, caller, line) in &calls {
+            write_varint(payload, (new - prev) as u64);
+            prev = new;
+            write_varint(payload, caller as u64);
+            write_varint(payload, line as u64);
         }
         Ok(())
     })?;
+    drop(calls);
     drop(spill);
 
     let (off, len) = out.section(&writer::empty_tombstones()?)?;

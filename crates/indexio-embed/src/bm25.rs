@@ -1239,6 +1239,17 @@ pub(crate) mod reference {
         rows
     }
 
+    /// Per-row term maps of segment `i`, tombstoned rows emptied.
+    pub fn rows_tf_of(set: &Bm25Set, i: usize) -> Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> {
+        let mut rows = rows_tf(&set.segs[i]);
+        for &r in &set.tombs[i] {
+            if let Some(row) = rows.get_mut(r as usize) {
+                *row = (BTreeMap::new(), BTreeMap::new());
+            }
+        }
+        rows
+    }
+
     /// Serializes the full current state (index + tombstones) via
     /// tmp+rename.
     fn write_file(idx: &ChunkBm25) -> anyhow::Result<()> {

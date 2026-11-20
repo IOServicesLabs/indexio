@@ -31,6 +31,7 @@ pub mod bm25;
 pub mod embed;
 pub mod hnsw;
 pub mod index;
+pub mod lock;
 pub mod pipeline;
 pub mod rerank;
 pub mod rimodel;

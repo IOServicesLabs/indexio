@@ -891,50 +891,9 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
     Ok(true)
 }
 
-/// Cross-process compaction lock: `<data_dir>/compact.lock`,
-/// created exclusively; a lock older than [`LOCK_STALE_SECS`] is assumed
-/// to belong to a dead process and is taken over. Dropping releases it.
-pub struct CompactLock {
-    path: PathBuf,
-}
-
-/// Age past which a compaction lock is considered abandoned.
-pub const LOCK_STALE_SECS: u64 = 15 * 60;
-
-impl CompactLock {
-    /// `None` when another live process holds the lock.
-    pub fn try_acquire(data_dir: &Path) -> Option<CompactLock> {
-        let path = data_dir.join("compact.lock");
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    use std::io::Write as _;
-                    let _ = write!(f, "{}", std::process::id());
-                    return Some(CompactLock { path });
-                }
-                Err(_) => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_none_or(|age| age.as_secs() > LOCK_STALE_SECS);
-                    if !stale {
-                        return None;
-                    }
-                    tracing::warn!(path = %path.display(), "taking over a stale compaction lock");
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-        None
-    }
-}
-
-impl Drop for CompactLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+/// The cross-process compaction lock lives in [`crate::lock`]; re-exported
+/// here, where callers have always found it.
+pub use crate::lock::{CompactLock, LOCK_STALE_SECS};
 
 /// Whether a semantic plane for `model_id` exists at all:
 /// the one case a sync should rebuild whole rather than append.

@@ -251,27 +251,21 @@ fn a_compaction_holds_a_few_dozen_bytes_per_row() {
 }
 
 /// A shard set of `files` generated source files in one repo, a short
-/// function (one chunk) each; returns it with the bytes of source it holds.
-fn shards_of(dir: &Path, files: usize) -> (indexio_index::ShardSet, usize) {
+/// function (one chunk) each, the first `edited` of them with another body;
+/// returns it with the bytes of source it holds.
+fn shards_of(dir: &Path, files: usize, edited: usize) -> (indexio_index::ShardSet, usize) {
     use indexio_types::{BlobId, DocMeta, ExtractedArtifact, Lang};
     let shards_dir = dir.join("shards");
     std::fs::create_dir_all(&shards_dir).unwrap();
     let mut w = indexio_index::ShardWriter::new(&shards_dir).unwrap();
     let mut source = 0usize;
     for k in 0..files {
-        let mut text = String::new();
-        for j in 0..1 {
-            text.push_str(&format!("pub fn handler_{k}_{j}(input: u32) -> u32 {{
-"));
-            for line in 0..2 {
-                text.push_str(&format!("    let step_{line} = input.wrapping_mul({line}).wrapping_add(lookup_{k}_{j}_{line}(input));
-"));
-            }
-            text.push_str("    input
-}
-
-");
+        let version = if k < edited { "edited" } else { "input" };
+        let mut text = format!("pub fn handler_{k}(input: u32) -> u32 {{\n");
+        for line in 0..2 {
+            text.push_str(&format!("    let step_{line} = {version}.wrapping_mul({line}).wrapping_add(lookup_{k}_{line}(input));\n"));
         }
+        text.push_str("    input\n}\n\n");
         source += text.len();
         let path = format!("src/module_{}/file_{k}.rs", k % 40);
         let meta = DocMeta {
@@ -302,7 +296,7 @@ fn a_rebuild_holds_a_round_of_vectors_not_the_corpus() {
     const EMBED_DIM: usize = 2048;
     let rebuild = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
-        let (shards, source) = shards_of(tmp.path(), files);
+        let (shards, source) = shards_of(tmp.path(), files, 0);
         let e = HashEmbedder::new(EMBED_DIM);
         let (reports, peak) = peak_of(|| pipeline::embed_all(&shards, tmp.path(), &e).unwrap());
         let chunks = reports[0].chunks as usize;
@@ -324,4 +318,40 @@ fn a_rebuild_holds_a_round_of_vectors_not_the_corpus() {
     assert!(large < fixed + 3 * large_text, "{large_chunks} chunks ({large_text} bytes of text) peaked at {large} bytes");
     assert!(large < small + 3 * (large_text - small_text) + 2 * MB, "twice the chunks took {large} bytes, up from {small}");
     assert!(large < as_f32(large_chunks) / 3, "{large} bytes held for {} bytes of vectors", as_f32(large_chunks));
+}
+
+/// An edit of a few hundred chunks compares the repo's files a batch at a
+/// time and appends the chunks that changed as a delta segment. It holds
+/// that batch, the vectors of the chunks it embeds and the writers'
+/// buffers, plus a few hundred bytes per file of the repo (its path and the
+/// hashes of its rows, to tell what changed): not the chunks of the repo,
+/// which the old pass chunked whole, text included, before it looked at a
+/// file.
+#[test]
+fn an_edit_of_a_few_hundred_chunks_holds_a_batch_of_the_repo() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    const EMBED_DIM: usize = 2048;
+    const EDITED: usize = 300;
+    let edit = |files: usize| {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = HashEmbedder::new(EMBED_DIM);
+        let (before, _) = shards_of(&tmp.path().join("before"), files, 0);
+        pipeline::embed_all(&before, tmp.path(), &e).unwrap();
+        drop(before);
+        let (after, _) = shards_of(&tmp.path().join("after"), files, EDITED);
+        let (report, peak) = peak_of(|| pipeline::embed_repo_with(&after, tmp.path(), "generated", &e, pipeline::MAX_CHARS).unwrap());
+        assert_eq!((report.chunks as usize, report.carried as usize, report.embedded as usize), (files, files - EDITED, EDITED));
+        let set = VecSet::open(&tmp.path().join("vec"), "hash-v1").unwrap().unwrap();
+        assert_eq!((set.segments().len(), set.raw_len(), set.len()), (2, files + EDITED, files));
+        peak
+    };
+    edit(400);
+    const FILES: usize = 10_000;
+    let small = edit(FILES);
+    let large = edit(2 * FILES);
+    println!("edit of {EDITED} chunks: repo of {FILES} files: peak {small}; of {} files: peak {large}", 2 * FILES);
+    // the vectors of the chunks embedded are 300 x 2048 x 4 = 2.4 MB
+    assert!(small < 24 * MB, "an edit of {EDITED} chunks in {FILES} files peaked at {small} bytes");
+    assert!(large < 24 * MB + 768 * FILES, "an edit of {EDITED} chunks in {} files peaked at {large} bytes", 2 * FILES);
+    assert!(large < small + 768 * FILES + MB, "twice the files took {large} bytes, up from {small}");
 }

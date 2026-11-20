@@ -6,6 +6,9 @@
 //! the server's idle trim calls [`release_free_heap`] after dropping its
 //! caches.
 
+// (with the experimental `mimalloc` feature the system heap is not ours to trim)
+#![cfg_attr(feature = "mimalloc", allow(dead_code))]
+
 /// Bytes, as the system accounts them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessMemory {
@@ -141,8 +144,21 @@ pub fn process_memory() -> Option<ProcessMemory> {
 /// Ask the allocator to give freed memory back to the system (Windows:
 /// `HeapCompact` on the process heap; glibc: `malloc_trim`). The return
 /// value is the platform call's own and only good for a log line.
+#[cfg(not(feature = "mimalloc"))]
 pub fn release_free_heap() -> usize {
     sys::release_free_heap()
+}
+
+/// With the `mimalloc` feature the heap is mimalloc's: collect it.
+#[cfg(feature = "mimalloc")]
+#[allow(unsafe_code)]
+pub fn release_free_heap() -> usize {
+    extern "C" {
+        fn mi_collect(force: bool);
+    }
+    // SAFETY: a mimalloc entry point without preconditions; thread-safe.
+    unsafe { mi_collect(true) };
+    0
 }
 
 #[cfg(test)]

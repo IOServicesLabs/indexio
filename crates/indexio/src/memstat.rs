@@ -10,7 +10,14 @@
 //! memory the allocator holds but the program does not use (fragmentation and
 //! retention after a spike), which no data-structure change can give back.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+/// The allocator that is counted: the system's, or mimalloc with that
+/// feature.
+#[cfg(not(feature = "mimalloc"))]
+use std::alloc::System as Inner;
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc as Inner;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 pub struct Counting;
@@ -30,25 +37,25 @@ fn add(n: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = System.alloc(l);
+        let p = Inner.alloc(l);
         if !p.is_null() {
             add(l.size());
         }
         p
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(l);
+        let p = Inner.alloc_zeroed(l);
         if !p.is_null() {
             add(l.size());
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        System.dealloc(p, l);
+        Inner.dealloc(p, l);
         LIVE.fetch_sub(l.size(), Relaxed);
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        let q = System.realloc(p, l, new);
+        let q = Inner.realloc(p, l, new);
         if !q.is_null() {
             LIVE.fetch_sub(l.size(), Relaxed);
             add(new);

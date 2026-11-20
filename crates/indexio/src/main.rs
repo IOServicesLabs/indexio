@@ -25,6 +25,10 @@ static GLOBAL: memstat::Counting = memstat::Counting;
 #[global_allocator]
 static GLOBAL: dhat::Alloc = dhat::Alloc;
 
+#[cfg(all(feature = "mimalloc", not(feature = "memstat"), not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

@@ -1351,7 +1351,8 @@ impl RandomIndexingEmbedder {
     }
 
     /// `open` with a caller-chosen vocabulary cap (tests).
-    pub(crate) fn open_with_cap(data_dir: &Path, cap: usize) -> anyhow::Result<Self> {
+    #[doc(hidden)]
+    pub fn open_with_cap(data_dir: &Path, cap: usize) -> anyhow::Result<Self> {
         let path = Self::model_path(data_dir);
         rimodel::reap_parked(&path);
         rimodel::reap_stale_temps(&path);

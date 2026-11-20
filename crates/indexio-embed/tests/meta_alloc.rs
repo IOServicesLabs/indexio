@@ -179,6 +179,26 @@ fn opening_a_segment_keeps_a_few_bytes_per_row() {
     assert!(cost.allocs <= 4, "repo_rows allocated {} blocks", cost.allocs);
 }
 
+/// A vector search must not hold a candidate for every row while it scans
+/// the binary codes (8 bytes per row: 8 MB per query at a million rows).
+#[test]
+fn a_vector_search_keeps_no_candidate_per_row() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    const N: usize = 200_000;
+    let tmp = tempfile::tempdir().unwrap();
+    VecIndex::create_segment(&tmp.path().join("m.d0000000000001.civec"), DIM, rows(N, "a")).unwrap();
+    let set = VecSet::open(tmp.path(), "m").unwrap().unwrap();
+    let q = set.row_vector(1234);
+    let warm = set.search(&q, 10); // the thread pool starts here, outside the measurement
+    let (hits, cost) = measure(|| set.search(&q, 10));
+    assert_eq!(hits, warm);
+    assert_eq!(hits.len(), 10);
+    assert!(cost.peak < 2 * N, "a search over {N} rows peaked at {} bytes: {cost:?}", cost.peak);
+    let (hits, cost) = measure(|| set.search_repo(&q, 10, "repo-a-7"));
+    assert_eq!(hits.len(), 10);
+    assert!(cost.peak < 64 * 1024, "a search in one repo peaked at {} bytes: {cost:?}", cost.peak);
+}
+
 /// Asking a seen-only embedding cache about a few chunks must not load the
 /// hash of every chunk the model ever observed (1.37 M hashes on a real
 /// data dir: 21 MB read into a 36-55 MB set, on each embed with a changed
@@ -268,6 +288,20 @@ fn measure_real_plane() {
             let t = Instant::now();
             let (ranges, cost) = measure(|| set.repo_rows("indexio"));
             timed(&format!("repo_rows(\"indexio\") ({} ranges)", ranges.len()), &cost, t);
+
+            // per-query scratch
+            let q = set.row_vector(set.raw_len() as u32 / 2);
+            let t = Instant::now();
+            let (hits, cost) = measure(|| set.search(&q, 10));
+            timed(&format!("vector search, k=10 (top row {})", hits[0].0), &cost, t);
+            let t = Instant::now();
+            let (hits, cost) = measure(|| set.search_repo(&q, 10, "indexio"));
+            timed(&format!("vector search in one repo, k=10 ({} hits)", hits.len()), &cost, t);
+            for query in ["where is the embedding model saved to disk", "error return value test file"] {
+                let t = Instant::now();
+                let (hits, cost) = measure(|| bset.search(query, 10));
+                timed(&format!("bm25 search, k=10 ({} hits)", hits.len()), &cost, t);
+            }
         }
     }
 

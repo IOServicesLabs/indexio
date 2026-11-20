@@ -148,6 +148,23 @@ fn decode_postings(buf: &[u8], mut off: usize) -> Option<(u32, Vec<(u32, u32, u3
     Some((df, out))
 }
 
+/// Walk the posting list at `off`, handing each `(row, tf_body, tf_header)`
+/// to `f`: returns df, `None` on truncation/corruption (where
+/// [`decode_postings`] gives `None`; `f` has then seen the postings before
+/// the damage). Nothing is allocated: a query term in two rows of five
+/// has a posting list of megabytes once decoded.
+fn walk_postings(buf: &[u8], mut off: usize, mut f: impl FnMut(u32, u32, u32)) -> Option<u32> {
+    let df = leb128_read(buf, &mut off)? as u32;
+    let mut row = 0u64;
+    for _ in 0..df {
+        row = row.checked_add(leb128_read(buf, &mut off)?)?;
+        let tf_body = leb128_read(buf, &mut off)? as u32;
+        let tf_header = leb128_read(buf, &mut off)? as u32;
+        f(u32::try_from(row).ok()?, tf_body, tf_header);
+    }
+    Some(df)
+}
+
 /// Unigram term frequencies of `text` (bigram terms skipped).
 fn unigram_tf(text: &str) -> BTreeMap<String, u32> {
     let mut tf: BTreeMap<String, u32> = BTreeMap::new();
@@ -450,7 +467,7 @@ impl ChunkBm25 {
     /// Document frequency of `term` in this segment (`None` when absent).
     pub fn term_df(&self, term: &str) -> Option<u32> {
         let off = self.dict.get(term)?;
-        decode_postings(self.postings.as_ref(), off as usize).map(|(df, _)| df)
+        walk_postings(self.postings.as_ref(), off as usize, |_, _, _| {})
     }
 
     /// Rows and average document length this segment contributes to
@@ -482,15 +499,18 @@ impl ChunkBm25 {
         touched: &mut Vec<u32>,
     ) {
         let Some(off) = self.dict.get(term) else { return };
-        let Some((_, postings)) = decode_postings(self.postings.as_ref(), off as usize) else {
-            return; // corrupt list: skip term rather than fail the query
-        };
-        for (row, tf_body, tf_header) in postings {
+        let postings = self.postings.as_ref();
+        // corrupt list: skip the term rather than fail the query. The list
+        // is checked whole first, so a damaged one scores none of its rows.
+        if walk_postings(postings, off as usize, |_, _, _| {}).is_none() {
+            return;
+        }
+        walk_postings(postings, off as usize, |row, tf_body, tf_header| {
             if self.tombstones.contains(&row) || dead.contains(&row) {
-                continue;
+                return;
             }
             let Some(&(bl, hl)) = self.row_lens.get(row as usize) else {
-                continue; // corrupt row id
+                return; // corrupt row id
             };
             let dl = f64::from(bl) + f64::from(hl);
             let tfw = f64::from(tf_body) + HEADER_WEIGHT * f64::from(tf_header);
@@ -500,7 +520,7 @@ impl ChunkBm25 {
                 touched.push(row);
             }
             *slot += score;
-        }
+        });
     }
 
     /// Tombstone every row matching `pred` (by row id — the same row ids as
@@ -867,6 +887,82 @@ mod tests {
             .iter()
             .map(|(h, b)| (h.to_string(), b.to_string()))
             .collect()
+    }
+
+    /// The walk that allocates nothing sees the postings `decode_postings`
+    /// returns and fails wherever it fails.
+    #[test]
+    fn walking_a_posting_list_matches_decoding_it() {
+        let encode = |list: &[(u64, u32, u32)]| {
+            let mut buf = vec![0xAA; 3]; // the list starts at offset 3
+            leb128_push(&mut buf, list.len() as u64);
+            let mut prev = 0u64;
+            for &(row, body, header) in list {
+                leb128_push(&mut buf, row - prev);
+                leb128_push(&mut buf, u64::from(body));
+                leb128_push(&mut buf, u64::from(header));
+                prev = row;
+            }
+            buf
+        };
+        let walk = |buf: &[u8]| {
+            let mut seen = Vec::new();
+            let df = walk_postings(buf, 3, |r, b, h| seen.push((r, b, h)));
+            (df, seen)
+        };
+        let list: Vec<(u64, u32, u32)> = vec![(0, 1, 0), (7, 3, 1), (137, 300, 0), (1 << 20, 1, 70_000), (u64::from(u32::MAX), 2, 2)];
+        let rows: Vec<(u32, u32, u32)> = list.iter().map(|&(r, b, h)| (r as u32, b, h)).collect();
+        let buf = encode(&list);
+        assert_eq!(walk(&buf), (Some(5), rows.clone()));
+        assert_eq!(decode_postings(&buf, 3), Some((5, rows.clone())));
+        assert_eq!(walk(&encode(&[])), (Some(0), Vec::new()));
+        // cut anywhere: both fail; the walk saw the postings before the cut
+        for cut in 3..buf.len() {
+            let (df, seen) = walk(&buf[..cut]);
+            assert_eq!(df, None, "cut at {cut}");
+            assert!(decode_postings(&buf[..cut], 3).is_none(), "cut at {cut}");
+            assert_eq!(seen[..], rows[..seen.len()]);
+        }
+        // a row id past u32
+        let over = encode(&[(5, 1, 1), (u64::from(u32::MAX) + 1, 1, 1)]);
+        assert_eq!(walk(&over), (None, vec![(5, 1, 1)]));
+        assert!(decode_postings(&over, 3).is_none());
+    }
+
+    /// A term whose posting list is damaged scores nothing and counts in
+    /// no document frequency, as when the list was decoded whole first.
+    #[test]
+    fn a_damaged_posting_list_scores_no_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = rows(&[
+            ("a.rs", "alpha beta"),
+            ("b.rs", "alpha gamma"),
+            ("c.rs", "delta"),
+            ("d.rs", "epsilon"),
+            ("e.rs", "zeta"),
+            ("f.rs", "eta"),
+        ]);
+        let path = tmp.path().join("t.cibm25");
+        ChunkBm25::create_path(&path, &data).unwrap();
+        let mut idx = ChunkBm25::open_path(&path).unwrap();
+        assert_eq!(idx.term_df("alpha"), Some(2));
+        let (mut acc, mut touched) = (vec![0.0; idx.raw_len()], Vec::new());
+        idx.score_into("alpha", 1.0, 2.0, &mut acc, &mut touched);
+        assert_eq!(touched, [0, 1]);
+
+        // the same list cut after its first posting
+        let off = idx.dict.get("alpha").unwrap() as usize;
+        let whole = idx.postings.as_ref().to_vec();
+        let mut end = off;
+        leb128_read(&whole, &mut end).unwrap(); // df
+        for _ in 0..3 {
+            leb128_read(&whole, &mut end).unwrap(); // row, tf_body, tf_header of posting 1
+        }
+        idx.postings = Bytes::Owned(whole[..end].to_vec());
+        assert_eq!(idx.term_df("alpha"), None);
+        let (mut acc, mut touched) = (vec![0.0; idx.raw_len()], Vec::new());
+        idx.score_into("alpha", 1.0, 2.0, &mut acc, &mut touched);
+        assert!(touched.is_empty() && acc.iter().all(|s| *s == 0.0));
     }
 
     /// Planted-doc ordering: the doc with the most query-term mass wins,

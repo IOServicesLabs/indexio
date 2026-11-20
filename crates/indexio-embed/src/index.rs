@@ -148,6 +148,46 @@ fn hamming(a: &[u8], b: &[u8]) -> u32 {
     d
 }
 
+/// Candidates a prescan holds before it cuts them back to its pool.
+const PRESCAN_BATCH: usize = 1024;
+
+/// The `pool` smallest `(distance, row)` pairs over `rows`, in no
+/// particular order: what collecting a pair for every row and selecting
+/// the `pool` smallest gives, without the pair per row (8 MB of scratch
+/// per query at a million rows). The candidates are cut back to the pool
+/// whenever a batch has gathered, and a row behind the worst pair kept by
+/// the last cut is dropped on one comparison: `pool` pairs before it are
+/// already known, so it cannot be one of the `pool` smallest.
+fn prescan_best(rows: impl Iterator<Item = u32>, pool: usize, dist: impl Fn(u32) -> u32) -> Vec<(u32, u32)> {
+    let pool = pool.max(1);
+    let cap = (pool * 2).max(PRESCAN_BATCH);
+    let mut best: Vec<(u32, u32)> = Vec::new();
+    let mut worst = (u32::MAX, u32::MAX);
+    for r in rows {
+        let cand = (dist(r), r);
+        if cand > worst {
+            continue;
+        }
+        if best.len() == cap {
+            best.select_nth_unstable(pool - 1);
+            best.truncate(pool);
+            worst = best[pool - 1];
+            if cand > worst {
+                continue;
+            }
+        }
+        if best.capacity() == 0 {
+            best.reserve_exact(cap);
+        }
+        best.push(cand);
+    }
+    if best.len() > pool {
+        best.select_nth_unstable(pool - 1);
+        best.truncate(pool);
+    }
+    best
+}
+
 // ---------------------------------------------------------------------------
 // Memory-mapped storage (the crate's only unsafe)
 // ---------------------------------------------------------------------------
@@ -804,22 +844,10 @@ impl VecIndex {
         let codes = self.codes();
         let total: usize = ranges.iter().map(|&(s, e)| (e - s) as usize).sum();
         let pool = (k * 8).max(256).min(total.max(1));
+        let dist = |r: u32| hamming(&codes[r as usize * cb..(r as usize + 1) * cb], &qcode);
         let mut cands: Vec<(u32, u32)> = ranges
             .par_iter()
-            .map(|&(lo, hi)| {
-                let mut v: Vec<(u32, u32)> = (lo..hi)
-                    .filter(|&r| !is_dead(r))
-                    .map(|r| {
-                        let row_code = &codes[r as usize * cb..(r as usize + 1) * cb];
-                        (hamming(row_code, &qcode), r)
-                    })
-                    .collect();
-                if v.len() > pool {
-                    v.select_nth_unstable(pool - 1);
-                    v.truncate(pool);
-                }
-                v
-            })
+            .map(|&(lo, hi)| prescan_best((lo..hi).filter(|&r| !is_dead(r)), pool, &dist))
             .reduce(Vec::new, |mut a, b| {
                 a.extend(b);
                 a
@@ -883,30 +911,13 @@ impl VecIndex {
             .step_by(range_len)
             .map(|s| (s as u32, (s + range_len).min(n) as u32))
             .collect();
+        let dist = |r: u32| hamming(&codes[r as usize * cb..(r as usize + 1) * cb], &qcode);
         let mut cands: Vec<(u32, u32)> = if ranges.len() <= 1 {
-            select_pool(
-                (0..n as u32)
-                    .filter(|&r| !is_dead(r))
-                    .map(|r| {
-                        let row_code = &codes[r as usize * cb..(r as usize + 1) * cb];
-                        (hamming(row_code, &qcode), r)
-                    })
-                    .collect(),
-            )
+            prescan_best((0..n as u32).filter(|&r| !is_dead(r)), pool, &dist)
         } else {
             let partial: Vec<Vec<(u32, u32)>> = ranges
                 .par_iter()
-                .map(|&(lo, hi)| {
-                    select_pool(
-                        (lo..hi)
-                            .filter(|&r| !is_dead(r))
-                            .map(|r| {
-                                let row_code = &codes[r as usize * cb..(r as usize + 1) * cb];
-                                (hamming(row_code, &qcode), r)
-                            })
-                            .collect(),
-                    )
-                })
+                .map(|&(lo, hi)| prescan_best((lo..hi).filter(|&r| !is_dead(r)), pool, &dist))
                 .collect();
             select_pool(partial.into_iter().flatten().collect())
         };
@@ -1541,6 +1552,48 @@ mod tests {
             self.0 ^= self.0 << 17;
             // uniform in [-1, 1)
             (self.0 >> 40) as f32 / (1u64 << 24) as f32 - 1.0
+        }
+    }
+
+    /// The bounded prescan keeps exactly the pairs that collecting a pair
+    /// for every row and selecting the smallest keeps, whatever the pool,
+    /// the number of rows and the ties between distances.
+    #[test]
+    fn prescan_best_equals_selecting_over_every_row() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let cases: [(usize, usize, f32); 9] = [
+            (0, 4, 8.0),
+            (3, 4, 8.0),
+            (5000, 1, 3.0),
+            (5000, 256, 40.0),
+            (20_000, 256, 6.0),
+            (20_000, 700, 500.0),
+            (3000, 3000, 9.0),
+            (9000, 2999, 1.0),
+            (PRESCAN_BATCH * 2 + 1, PRESCAN_BATCH, 2.0),
+        ];
+        for (n, pool, spread) in cases {
+            let dists: Vec<u32> = (0..n).map(|_| ((rng.next_f32() + 1.0) * spread) as u32).collect();
+            // rows with gaps, as a tombstone filter leaves them
+            let rows: Vec<u32> = (0..n as u32).map(|r| r * 3 + 1).collect();
+            let dist = |r: u32| dists[(r / 3) as usize];
+            let mut want: Vec<(u32, u32)> = rows.iter().map(|&r| (dist(r), r)).collect();
+            want.sort_unstable();
+            want.truncate(pool);
+            let mut got = prescan_best(rows.iter().copied(), pool, dist);
+            got.sort_unstable();
+            assert_eq!(got, want, "n={n} pool={pool} spread={spread}");
+        }
+        // distances falling and rising: the kept worst pair must not shut out better rows
+        for rising in [false, true] {
+            let n = 10_000u32;
+            let dist = |r: u32| if rising { r } else { n - r };
+            let mut want: Vec<(u32, u32)> = (0..n).map(|r| (dist(r), r)).collect();
+            want.sort_unstable();
+            want.truncate(300);
+            let mut got = prescan_best(0..n, 300, dist);
+            got.sort_unstable();
+            assert_eq!(got, want);
         }
     }
 

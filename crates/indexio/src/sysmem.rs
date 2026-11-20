@@ -59,7 +59,7 @@ mod sys {
         // SAFETY: `c` is a correctly sized, writable PROCESS_MEMORY_COUNTERS_EX
         // and the pseudo handle of the current process is always valid.
         let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-        (ok != 0).then(|| ProcessMemory {
+        (ok != 0).then_some(ProcessMemory {
             private: c.private_usage as u64,
             peak_private: c.peak_pagefile_usage as u64,
             resident: c.working_set_size as u64,

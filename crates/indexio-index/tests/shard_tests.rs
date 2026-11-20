@@ -461,6 +461,49 @@ fn merge_folds_young_deltas_and_leaves_the_big_shard() {
     assert_eq!(set2.visible_docs().len(), 205);
 }
 
+/// A doc tombstoned by another process after this set read the shard's
+/// bitmap is still written into the compound, which is what the merge had
+/// read; the merge then finds the tombstone on disk and applies it to the
+/// compound, for itself and for whoever opens the directory next.
+#[test]
+fn merge_forwards_tombstones_written_behind_its_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shard_paths = Vec::new();
+    for s in 0..3u32 {
+        let mut w = ShardWriter::new(dir.path()).unwrap();
+        for i in s * 10..s * 10 + 5 {
+            let (m, c, a) = make_doc(i, 0, default_content(i));
+            w.add_doc(&m, &c, &a).unwrap();
+        }
+        shard_paths.push(w.finish(&["repo-a".to_string()]).unwrap());
+        sleep(Duration::from_millis(5)); // the shards order by name within a second
+    }
+    let mut set = ShardSet::open_dir(dir.path()).unwrap();
+    assert_eq!(set.visible_docs().len(), 15);
+
+    // the other process: docs 1 and 3 of the oldest shard, doc 2 of the newest
+    Shard::open(&shard_paths[0]).unwrap().delete_docs(&[1, 3]).unwrap();
+    Shard::open(&shard_paths[2]).unwrap().delete_docs(&[2]).unwrap();
+    let gone = ["src/file_1.rs", "src/file_3.rs", "src/file_22.rs"];
+
+    set.merge(dir.path(), 1).unwrap();
+    assert_eq!(set.len(), 1);
+    assert_eq!(set.shards()[0].doc_count(), 15, "the compound holds every doc the merge had read");
+    assert_eq!(set.shards()[0].tombstones().len(), 3, "and the tombstones that landed meanwhile");
+    assert_eq!(set.doc_count(), 12);
+    for set in [set, ShardSet::open_dir(dir.path()).unwrap()] {
+        let visible: BTreeSet<String> = set.visible_docs().into_iter().map(|(_, _, dm)| dm.path.clone()).collect();
+        assert_eq!(visible.len(), 12);
+        for path in gone {
+            assert!(!visible.contains(path), "{path} came back to life in the compound");
+        }
+        // lookups go by the same bitmap
+        assert!(set.symbol_postings("func_22").is_empty());
+        assert_eq!(set.symbol_postings("func_21").len(), 1);
+        assert_eq!(set.call_postings("helper").len(), 12);
+    }
+}
+
 #[test]
 fn merge_noop_when_within_limit() {
     let dir = tempfile::tempdir().unwrap();

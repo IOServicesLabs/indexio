@@ -13,6 +13,16 @@ mod sessions;
 mod usage;
 mod watch;
 mod serve;
+#[cfg(feature = "memstat")]
+mod memstat;
+
+#[cfg(all(feature = "memstat", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: memstat::Counting = memstat::Counting;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -514,6 +524,12 @@ fn install_team_sync_hook(print_only: bool) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::builder()
+        .file_name(std::env::var("INDEXIO_DHAT_OUT").unwrap_or_else(|_| "dhat-heap.json".into()))
+        .build();
+    #[cfg(feature = "memstat")]
+    memstat::start_timer();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -1388,11 +1404,21 @@ fn run_mcp_stdio(server: mcp::McpServer) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    #[cfg(feature = "memstat")]
+    let memstat_on = memstat::enabled();
+    #[cfg(feature = "memstat")]
+    if memstat_on {
+        memstat::report("ready");
+    }
     for line in stdin.lock().lines() {
         let line = line?;
         if let Some(resp) = server.handle(&line) {
             writeln!(out, "{resp}")?;
             out.flush()?;
+        }
+        #[cfg(feature = "memstat")]
+        if memstat_on {
+            memstat::report("call");
         }
     }
     server.finish_background_work();

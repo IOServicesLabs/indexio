@@ -122,6 +122,26 @@ fn decode(block: &[u8], off: usize) -> Option<RowMeta<'_>> {
     })
 }
 
+/// Bytes of the record of `m`.
+pub(crate) fn record_len(m: &RowMeta<'_>) -> usize {
+    MIN_RECORD + m.repo.len() + m.path.len()
+}
+
+/// Append the record of `m`: the bytes `bincode::serialize` gives for the
+/// owned row, so records written one after another behind their count are
+/// the block `bincode::serialize(&Vec<VecRowMeta>)` gives. A segment writer
+/// streams its metadata with this instead of holding every row for one
+/// `serialize` call.
+pub(crate) fn write_record(out: &mut dyn std::io::Write, m: &RowMeta<'_>) -> std::io::Result<()> {
+    out.write_all(&m.chunk_hash)?;
+    out.write_all(&(m.repo.len() as u64).to_le_bytes())?;
+    out.write_all(m.repo.as_bytes())?;
+    out.write_all(&(m.path.len() as u64).to_le_bytes())?;
+    out.write_all(m.path.as_bytes())?;
+    out.write_all(&m.start_line.to_le_bytes())?;
+    out.write_all(&m.end_line.to_le_bytes())
+}
+
 /// What one pass over a block yields.
 struct Walk {
     /// Offset of each row's record from the start of the block.
@@ -284,6 +304,34 @@ impl MetaStore {
         }
     }
 
+    /// Where the record of `row` lies in an in-place block.
+    fn record_range(block: &[u8], offs: &[u32], row: u32) -> std::ops::Range<usize> {
+        let start = offs[row as usize] as usize;
+        let end = offs.get(row as usize + 1).map_or(block.len(), |&o| o as usize);
+        start..end
+    }
+
+    /// Bytes of the record of `row` (see [`write_record`](Self::write_record)).
+    pub fn record_len(&self, row: u32) -> usize {
+        match &self.rows {
+            Rows::Owned(v) => record_len(&v[row as usize].as_row()),
+            Rows::InPlace { block, offs } => Self::record_range(block.as_ref(), offs, row).len(),
+        }
+    }
+
+    /// Append the record of `row` as a segment file carries it: copied from
+    /// the block for a row read in place (a compaction carries a mapped
+    /// row's metadata without decoding it), encoded for an owned one.
+    pub fn write_record(&self, row: u32, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        match &self.rows {
+            Rows::Owned(v) => write_record(out, &v[row as usize].as_row()),
+            Rows::InPlace { block, offs } => {
+                let block = block.as_ref();
+                out.write_all(&block[Self::record_range(block, offs, row)])
+            }
+        }
+    }
+
     /// Whether rows are read from the block (no owned row exists).
     #[cfg(test)]
     pub fn is_in_place(&self) -> bool {
@@ -364,6 +412,45 @@ mod tests {
             assert_eq!(store.encode().unwrap(), bytes);
             assert_eq!(MetaStore::owned(want).encode().unwrap(), bytes);
         }
+    }
+
+    /// Records written one by one behind their count are the block bincode
+    /// writes, whether they come from owned rows, from decoded views or
+    /// straight from a block read in place.
+    #[test]
+    fn records_written_one_by_one_are_the_bincode_block() {
+        for (n, seed) in [(0usize, 1u64), (1, 2), (57, 4), (3000, 5)] {
+            let want = rows(n, seed);
+            let bytes = bincode::serialize(&want).unwrap();
+            let (owned, placed) = (MetaStore::owned(want.clone()), in_place(&want));
+            let count = (n as u64).to_le_bytes();
+            let (mut a, mut b, mut c) = (count.to_vec(), count.to_vec(), count.to_vec());
+            let (mut len_a, mut len_b) = (8usize, 8usize);
+            for r in 0..n as u32 {
+                owned.write_record(r, &mut a).unwrap();
+                placed.write_record(r, &mut b).unwrap();
+                write_record(&mut c, &placed.row(r)).unwrap();
+                len_a += owned.record_len(r);
+                len_b += placed.record_len(r);
+                assert_eq!(record_len(&placed.row(r)), placed.record_len(r));
+                assert_eq!(bincode::serialize(&want[r as usize]).unwrap().len(), owned.record_len(r));
+            }
+            assert_eq!(a, bytes, "owned rows, n={n}");
+            assert_eq!(b, bytes, "rows in place, n={n}");
+            assert_eq!(c, bytes, "decoded views, n={n}");
+            assert_eq!((len_a, len_b), (bytes.len(), bytes.len()));
+        }
+        // a block with trailing bytes: the last record ends where the encoding ends
+        let want = rows(9, 77);
+        let mut bytes = bincode::serialize(&want).unwrap();
+        let len = bytes.len();
+        bytes.extend_from_slice(&[0xee; 5]);
+        let store = MetaStore::in_place(Bytes::Owned(bytes.clone()), want.len()).unwrap();
+        let mut out = 9u64.to_le_bytes().to_vec();
+        for r in 0..9 {
+            store.write_record(r, &mut out).unwrap();
+        }
+        assert_eq!(out, bytes[..len]);
     }
 
     #[test]

@@ -37,4 +37,5 @@ pub mod rerank;
 pub mod rimodel;
 pub mod rindex;
 mod rowmeta;
+mod spool;
 pub mod store;

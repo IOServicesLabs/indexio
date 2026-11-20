@@ -804,73 +804,99 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
     }
     let t0 = Instant::now();
     let dim = vset.dim();
-    let mut rows: Vec<(VecRowMeta, Vec<f32>)> = Vec::new();
-    let mut tf_rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> = Vec::new();
-    // origin[new row] = (segment, local row): tombstones another server
-    // writes to an input while we merge are forwarded afterwards
-    let mut origin: Vec<(usize, u32)> = Vec::new();
-    for &i in &merge {
+    // The rows carried, in merge order (segment by segment, row by row),
+    // each with what it sorts by: its file and its first line. A file is
+    // looked at once per run of its rows, a row for its line alone; the
+    // rows themselves stay in the mapped segments until they are written.
+    struct Carried {
+        file: u32,
+        start_line: u32,
+        /// Position of the row's segment in `merge`, and its row there.
+        seg: u32,
+        row: u32,
+    }
+    let mut files: Vec<(&str, &str)> = Vec::new();
+    let mut carried: Vec<Carried> = Vec::new();
+    for (k, &i) in merge.iter().enumerate() {
         let vs = &vset.segments()[i];
-        let mut bs_rows = bset.rows_tf_of(i);
-        let off = vset.offset(i);
-        for r in 0..vs.raw_len() as u32 {
-            if vset.is_deleted(off + r) {
-                continue;
+        let dead = vset.dead(i);
+        for (file, rows) in vs.file_runs(0..vs.raw_len() as u32) {
+            let mut listed = false;
+            for r in rows {
+                if dead.contains(&r) {
+                    continue;
+                }
+                if !listed {
+                    files.push((file.repo, file.path));
+                    listed = true;
+                }
+                carried.push(Carried { file: files.len() as u32 - 1, start_line: vs.row_meta(r).start_line, seg: k as u32, row: r });
             }
-            origin.push((i, r));
-            rows.push((vs.row_meta(r).to_owned_meta(), vs.row_vector(r)));
-            tf_rows.push(std::mem::take(&mut bs_rows[r as usize]));
         }
     }
     // group rows by repo (then path, line) so a repo-scoped search scans
-    // one run of the merged segment; BM25 rows and origins
-    // follow the same permutation (rows are aligned across the sidecars)
+    // one run of the merged segment; rows that tie keep their merge order.
+    // BM25 rows follow the same order (rows are aligned across the sidecars)
     {
-        let mut order: Vec<usize> = (0..rows.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (ma, mb) = (&rows[a].0, &rows[b].0);
-            ma.repo.cmp(&mb.repo).then_with(|| ma.path.cmp(&mb.path)).then_with(|| ma.start_line.cmp(&mb.start_line))
-        });
-        let mut rows_s = Vec::with_capacity(rows.len());
-        let mut tf_s = Vec::with_capacity(tf_rows.len());
-        let mut origin_s = Vec::with_capacity(origin.len());
-        let mut rows_opt: Vec<Option<(VecRowMeta, Vec<f32>)>> = rows.into_iter().map(Some).collect();
-        let mut tf_opt: Vec<Option<(BTreeMap<String, u32>, BTreeMap<String, u32>)>> = tf_rows.into_iter().map(Some).collect();
-        for i in order {
-            rows_s.push(rows_opt[i].take().expect("row moved once"));
-            tf_s.push(tf_opt[i].take().expect("tf row moved once"));
-            origin_s.push(origin[i]);
+        let mut by_name: Vec<u32> = (0..files.len() as u32).collect();
+        by_name.sort_unstable_by_key(|&f| files[f as usize]);
+        let mut rank = vec![0u32; files.len()];
+        for j in 1..by_name.len() {
+            let (prev, f) = (by_name[j - 1] as usize, by_name[j] as usize);
+            rank[f] = rank[prev] + u32::from(files[f] != files[prev]);
         }
-        rows = rows_s;
-        tf_rows = tf_s;
-        origin = origin_s;
+        carried.sort_unstable_by_key(|c| (rank[c.file as usize], c.start_line, c.seg, c.row));
+    }
+    drop(files);
+    // order[new row] = (segment, local row): the rows to write, and where
+    // tombstones another server writes to an input while we merge are
+    // forwarded afterwards
+    let order: Vec<(u32, u32)> = carried.iter().map(|c| (c.seg, c.row)).collect();
+    drop(carried);
+    // per input, where each of its rows goes in the merged BM25 segment: a
+    // row tombstoned on the BM25 side alone is carried without its terms
+    let mut row_maps: Vec<Vec<u32>> = merge
+        .iter()
+        .map(|&i| vec![crate::bm25::DROPPED; bset.segments()[i].raw_len()])
+        .collect();
+    for (new_row, &(k, r)) in order.iter().enumerate() {
+        if !bset.dead(merge[k as usize]).contains(&r) {
+            row_maps[k as usize][r as usize] = new_row as u32;
+        }
     }
     let merged_v: Vec<PathBuf> = merge.iter().map(|&i| vset.segments()[i].path().to_path_buf()).collect();
     let merged_b: Vec<PathBuf> = merge.iter().map(|&i| bset.segments()[i].path().to_path_buf()).collect();
-    let carried = rows.len();
-    drop(vset);
-    drop(bset);
     let seg = crate::index::next_delta_path(&vec_dir(data_dir), model_id);
     let bseg = crate::bm25::aligned_path(&bm25_dir(data_dir), &seg);
-    create_pair(
-        &seg,
-        &bseg,
-        |p| VecIndex::create_segment(p, dim, rows),
-        |p| ChunkBm25::create_from_tf(p, tf_rows),
-    )?;
+    {
+        let inputs_v: Vec<&VecIndex> = merge.iter().map(|&i| &*vset.segments()[i]).collect();
+        let inputs_b: Vec<(&crate::bm25::ChunkBm25, crate::bm25::RowMap<'_>)> = merge
+            .iter()
+            .zip(&row_maps)
+            .map(|(&i, map)| (&*bset.segments()[i], crate::bm25::RowMap::Table(map)))
+            .collect();
+        create_pair(
+            &seg,
+            &bseg,
+            |p| crate::index::write_carried(p, dim, &inputs_v, &order),
+            |p| crate::bm25::merge_segments(p, order.len() as u32, &inputs_b),
+        )?;
+    }
+    drop(row_maps);
+    // the inputs are read from their mappings up to here; unmapped, they
+    // can be removed instead of parked
+    drop(vset);
+    drop(bset);
     // rows tombstoned in an input since we read it
     let late: std::collections::BTreeSet<u32> = {
         let mut now: Vec<std::collections::HashSet<u32>> = Vec::with_capacity(merge.len());
         for p in &merged_v {
             now.push(crate::index::read_tomb_side(p).into_iter().collect());
         }
-        origin
+        order
             .iter()
             .enumerate()
-            .filter(|(_, &(i, r))| {
-                let k = merge.iter().position(|&m| m == i).expect("origin segment is merged");
-                now[k].contains(&r)
-            })
+            .filter(|(_, &(k, r))| now[k as usize].contains(&r))
             .map(|(new_row, _)| new_row as u32)
             .collect()
     };
@@ -884,7 +910,7 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
     }
     info!(
         merged = merge.len(),
-        rows = carried,
+        rows = order.len(),
         ms = t0.elapsed().as_millis() as u64,
         "semantic segments compacted"
     );

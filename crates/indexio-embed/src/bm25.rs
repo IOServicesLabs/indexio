@@ -33,7 +33,7 @@
 //!   (k1 = [`K1`], b = [`B`]), rather than per-field b factors — the spec
 //!   fixes one b for both fields.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,7 @@ impl AsRef<[u8]> for Bytes {
     }
 }
 
+#[cfg(test)]
 impl Bytes {
     fn len(&self) -> usize {
         self.as_ref().len()
@@ -68,6 +69,7 @@ impl Bytes {
 
 use crate::embed::stopwords;
 use crate::rindex::tokenize;
+use crate::spool::{scratch_file, Spool};
 
 const MAGIC: &[u8; 8] = b"CIBM25 1";
 /// BM25F parameters: short, uniform-length chunks justify the
@@ -116,6 +118,11 @@ fn leb128_push(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
+/// Bytes [`leb128_push`] writes for `v`.
+fn leb128_len(v: u64) -> u64 {
+    u64::from((64 - v.leading_zeros()).max(1).div_ceil(7))
+}
+
 fn leb128_read(buf: &[u8], off: &mut usize) -> Option<u64> {
     let mut v = 0u64;
     let mut shift = 0u32;
@@ -135,6 +142,7 @@ fn leb128_read(buf: &[u8], off: &mut usize) -> Option<u64> {
 
 /// Decode the posting list at `off`: returns (df, [(row, tf_body,
 /// tf_header)]). `None` on truncation/corruption.
+#[cfg(test)]
 fn decode_postings(buf: &[u8], mut off: usize) -> Option<(u32, Vec<(u32, u32, u32)>)> {
     let df = leb128_read(buf, &mut off)? as u32;
     let mut out = Vec::with_capacity(df as usize);
@@ -165,16 +173,383 @@ fn walk_postings(buf: &[u8], mut off: usize, mut f: impl FnMut(u32, u32, u32)) -
     Some(df)
 }
 
-/// Unigram term frequencies of `text` (bigram terms skipped).
-fn unigram_tf(text: &str) -> BTreeMap<String, u32> {
-    let mut tf: BTreeMap<String, u32> = BTreeMap::new();
-    for t in tokenize(text) {
-        if t.term.contains(' ') {
-            continue; // adjacent-bigram term: not indexed (a non-goal)
-        }
-        *tf.entry(t.term).or_insert(0) += 1;
+// ---------------------------------------------------------------------------
+// Writing segments
+// ---------------------------------------------------------------------------
+
+/// The postings of one term while a segment is being built: the LEB128
+/// `(row_delta, tf_body, tf_header)` triples as the file will carry them.
+#[derive(Default)]
+struct TermList {
+    df: u32,
+    /// Row of the last posting: the next one is written as a delta from it.
+    last: u32,
+    bytes: Vec<u8>,
+}
+
+/// Bytes of the term table (terms and encoded postings) at which a
+/// [`Bm25Writer`] sets the rows folded so far aside as a part.
+pub const TABLE_BUDGET: usize = 32 << 20;
+
+/// What a term costs in the table besides its text and its postings.
+const TERM_OVERHEAD: usize = 96;
+
+/// Postings a merge holds in memory before they move to a scratch file.
+const POSTINGS_IN_MEMORY: usize = 4 << 20;
+
+/// Rows of a segment being built that were set aside: a complete segment
+/// in a scratch file, mapped. The mapping goes before the file handle that
+/// keeps the file alive.
+struct Part {
+    seg: ChunkBm25,
+    _file: fs::File,
+}
+
+/// Builds one `.cibm25` segment a row at a time.
+///
+/// `create_path` used to turn every row into a pair of term maps, invert
+/// those into one map of `(row, tf, tf)` lists and serialize the whole file
+/// into a buffer: 2.3 to 2.9 GB for the 945k rows of a rebuild. Here a row
+/// is folded straight into the term table, whose lists are the encoded
+/// bytes the file carries; when the table reaches its budget the rows so
+/// far are written out as a part (a segment in a scratch file) and the
+/// table starts again. [`finish`](Self::finish) writes the table as the
+/// segment, or merges the parts into it term by term. Either way the file
+/// is the one `create_path` wrote, byte for byte.
+pub struct Bm25Writer {
+    dir: PathBuf,
+    budget: usize,
+    table: HashMap<String, TermList>,
+    table_bytes: usize,
+    /// One row's (body, header) count per term, emptied after each row.
+    row_terms: HashMap<String, (u32, u32)>,
+    /// (body, header) token counts of the rows in `table`.
+    lens: Vec<(u32, u32)>,
+    parts: Vec<Part>,
+    n_rows: u32,
+}
+
+impl Bm25Writer {
+    /// A writer whose scratch files, if it comes to them, live in `dir`:
+    /// the directory the segment will be written to.
+    pub fn new(dir: &Path) -> Self {
+        Self::with_budget(dir, TABLE_BUDGET)
     }
-    tf
+
+    /// [`new`](Self::new) with a term table of `budget` bytes before rows
+    /// are set aside (the file written does not depend on it).
+    pub fn with_budget(dir: &Path, budget: usize) -> Self {
+        Bm25Writer {
+            dir: dir.to_path_buf(),
+            budget,
+            table: HashMap::new(),
+            table_bytes: 0,
+            row_terms: HashMap::new(),
+            lens: Vec::new(),
+            parts: Vec::new(),
+            n_rows: 0,
+        }
+    }
+
+    /// Rows pushed so far.
+    pub fn rows(&self) -> u32 {
+        self.n_rows
+    }
+
+    /// Append the row of a chunk: its header (path + scope line) and body.
+    /// Row i here is row i of the vector segment written alongside.
+    pub fn push(&mut self, header: &str, body: &str) -> anyhow::Result<()> {
+        let row = self.lens.len() as u32;
+        let (mut body_len, mut header_len) = (0u32, 0u32);
+        for t in tokenize(body) {
+            if t.term.contains(' ') {
+                continue; // adjacent-bigram term: not indexed (a non-goal)
+            }
+            body_len += 1;
+            self.row_terms.entry(t.term).or_default().0 += 1;
+        }
+        for t in tokenize(header) {
+            if t.term.contains(' ') {
+                continue;
+            }
+            header_len += 1;
+            self.row_terms.entry(t.term).or_default().1 += 1;
+        }
+        self.lens.push((body_len, header_len));
+        for (term, (tf_body, tf_header)) in self.row_terms.drain() {
+            let list = match self.table.entry(term) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    self.table_bytes += e.key().len() + TERM_OVERHEAD;
+                    e.insert(TermList::default())
+                }
+            };
+            let held = list.bytes.capacity();
+            leb128_push(&mut list.bytes, u64::from(row - list.last));
+            leb128_push(&mut list.bytes, u64::from(tf_body));
+            leb128_push(&mut list.bytes, u64::from(tf_header));
+            list.last = row;
+            list.df += 1;
+            self.table_bytes += list.bytes.capacity() - held;
+        }
+        self.n_rows = self.n_rows.checked_add(1).ok_or_else(|| anyhow!("too many bm25 rows"))?;
+        if self.table_bytes >= self.budget {
+            self.cut_part()?;
+        }
+        Ok(())
+    }
+
+    /// Set the rows in the table aside as a part and empty the table.
+    fn cut_part(&mut self) -> anyhow::Result<()> {
+        if self.lens.is_empty() {
+            return Ok(());
+        }
+        let file = scratch_file(&self.dir, "cibm25-part").with_context(|| format!("scratch file in {}", self.dir.display()))?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        write_table(&mut out, &self.table, &self.lens)?;
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        let seg = map_part(&file)?;
+        self.parts.push(Part { seg, _file: file });
+        self.table.clear();
+        self.table_bytes = 0;
+        self.lens.clear();
+        Ok(())
+    }
+
+    /// Write the segment at `path` (tmp + rename) and remove a tombstone
+    /// side file left at that path.
+    pub fn finish(mut self, path: &Path) -> anyhow::Result<()> {
+        if self.parts.is_empty() {
+            return write_segment_file(path, |out| write_table(out, &self.table, &self.lens));
+        }
+        self.cut_part()?;
+        self.table = HashMap::new();
+        let mut base = 0u32;
+        let mut sources: Vec<(&ChunkBm25, RowMap<'_>)> = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            sources.push((&part.seg, RowMap::Shift(base)));
+            base += part.seg.n_rows;
+        }
+        merge_segments(path, self.n_rows, &sources)
+    }
+}
+
+/// Map a part just written to its scratch file.
+///
+/// # Safety (why the mapping is sound)
+/// The file is this writer's alone (a scratch file has no name another
+/// process could open it by) and nothing writes to it after this point.
+#[allow(unsafe_code)]
+fn map_part(file: &fs::File) -> anyhow::Result<ChunkBm25> {
+    let map = Arc::new(unsafe { Mmap::map(file) }.context("map a bm25 part")?);
+    ChunkBm25::parse(PathBuf::from("bm25 part"), Some(&map), &map[..])
+}
+
+/// Write a `.cibm25` file at `path` through `body` (tmp + rename), then
+/// remove a tombstone side file left at that path.
+fn write_segment_file(path: &Path, body: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("create bm25 dir {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("cibm25.tmp");
+    let file = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    if let Err(e) = body(&mut out).and_then(|()| Ok(out.flush()?)) {
+        drop(out);
+        fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    out.get_ref().sync_all().ok();
+    drop(out);
+    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    let side = crate::index::tomb_side_path(path);
+    if side.exists() {
+        fs::remove_file(&side).ok();
+    }
+    Ok(())
+}
+
+/// The file up to its postings: header, term dictionary, postings length.
+fn write_head(out: &mut dyn Write, n_rows: u32, n_terms: u32, tot_body: u64, tot_head: u64, dict: &[u8], postings_len: u64) -> std::io::Result<()> {
+    let avg = |tot: u64| if n_rows > 0 { tot / u64::from(n_rows) } else { 0 };
+    out.write_all(MAGIC)?;
+    out.write_all(&n_rows.to_le_bytes())?;
+    out.write_all(&n_terms.to_le_bytes())?;
+    out.write_all(&((avg(tot_body) as f64) as u32).to_le_bytes())?;
+    out.write_all(&((avg(tot_head) as f64) as u32).to_le_bytes())?;
+    out.write_all(&(dict.len() as u64).to_le_bytes())?;
+    out.write_all(dict)?;
+    out.write_all(&postings_len.to_le_bytes())
+}
+
+/// The file after its postings: the row lengths (saturating) and no
+/// tombstone (bincode's empty `Vec<u32>`).
+fn write_tail(out: &mut dyn Write, lens: impl ExactSizeIterator<Item = (u32, u32)>) -> std::io::Result<()> {
+    out.write_all(&((lens.len() * 3) as u64).to_le_bytes())?;
+    for (body, header) in lens {
+        out.write_all(&(body.min(u16::MAX as u32) as u16).to_le_bytes())?;
+        out.write_all(&[header.min(u8::MAX as u32) as u8])?;
+    }
+    out.write_all(&8u64.to_le_bytes())?;
+    out.write_all(&0u64.to_le_bytes())
+}
+
+/// Write the segment a term table holds. The dictionary precedes the
+/// postings in the file and points into them, so the terms are walked
+/// twice: once for the dictionary (a term's offset is the size of the
+/// lists before it), once to write the lists. No copy of the postings is
+/// made.
+fn write_table(out: &mut dyn Write, table: &HashMap<String, TermList>, lens: &[(u32, u32)]) -> anyhow::Result<()> {
+    let mut terms: Vec<(&str, &TermList)> = table.iter().map(|(t, l)| (t.as_str(), l)).collect();
+    terms.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut dict = fst::MapBuilder::memory();
+    let mut postings_len = 0u64;
+    for (term, list) in &terms {
+        dict.insert(term, postings_len).with_context(|| format!("fst insert '{term}'"))?;
+        postings_len += leb128_len(u64::from(list.df)) + list.bytes.len() as u64;
+    }
+    let dict = dict.into_inner().map_err(|e| anyhow!("building bm25 term dictionary: {e}"))?;
+    let tot_body: u64 = lens.iter().map(|l| u64::from(l.0)).sum();
+    let tot_head: u64 = lens.iter().map(|l| u64::from(l.1)).sum();
+    write_head(out, lens.len() as u32, terms.len() as u32, tot_body, tot_head, &dict, postings_len)?;
+    let mut df = Vec::with_capacity(5);
+    for (_, list) in &terms {
+        df.clear();
+        leb128_push(&mut df, u64::from(list.df));
+        out.write_all(&df)?;
+        out.write_all(&list.bytes)?;
+    }
+    write_tail(out, lens.iter().copied())?;
+    Ok(())
+}
+
+/// A row that is not carried into the merged segment.
+pub(crate) const DROPPED: u32 = u32::MAX;
+
+/// Where the rows of a source segment go in the segment being written.
+pub(crate) enum RowMap<'a> {
+    /// Row `r` becomes row `base + r`: the parts of one build, in row order.
+    Shift(u32),
+    /// Row `r` becomes row `table[r]`, or is left out when that is
+    /// [`DROPPED`] or `r` is past the table.
+    Table(&'a [u32]),
+}
+
+impl RowMap<'_> {
+    fn get(&self, row: u32) -> Option<u32> {
+        match self {
+            RowMap::Shift(base) => base.checked_add(row),
+            RowMap::Table(t) => t.get(row as usize).copied().filter(|&r| r != DROPPED),
+        }
+    }
+}
+
+/// Write the segment at `path` whose `n_rows` rows are rows of `sources`,
+/// renumbered by each source's [`RowMap`]: the dictionaries are walked
+/// together in term order and each term's postings are gathered from the
+/// sources, renumbered, put in row order and written. What is held is one
+/// term's postings and two counters per row.
+///
+/// A compaction used to recover a pair of term maps for every row of every
+/// input (`rows_tf`) and build the merged segment from those (11 to 17 KB
+/// per row carried, with the vectors). The file written here is the same:
+/// a posting `(row, tf_body, tf_header)` of an input is the posting
+/// `(new row, tf_body, tf_header)` of the output, a term is in the
+/// dictionary when a carried row has it, and a row's lengths are the sums
+/// of its term frequencies. Like `rows_tf`, a posting list that does not
+/// decode is left out whole and a posting of a row the source does not
+/// have is ignored.
+pub(crate) fn merge_segments(path: &Path, n_rows: u32, sources: &[(&ChunkBm25, RowMap<'_>)]) -> anyhow::Result<()> {
+    use fst::Streamer as _;
+    let mut dicts = fst::map::OpBuilder::new();
+    for (seg, _) in sources {
+        dicts.push(&seg.dict);
+    }
+    let mut terms = dicts.union();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut postings = Spool::new(dir, "cibm25-postings", POSTINGS_IN_MEMORY);
+    let mut dict = fst::MapBuilder::memory();
+    let mut n_terms = 0u32;
+    let mut lens: Vec<(u32, u32)> = vec![(0, 0); n_rows as usize];
+    // one term at a time: where it is in each source, its postings, their bytes
+    let mut found: Vec<(usize, u64)> = Vec::new();
+    let mut list: Vec<(u32, u32, u32)> = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some((term, offs)) = terms.next() {
+        found.clear();
+        found.extend(offs.iter().map(|o| (o.index, o.value)));
+        found.sort_unstable();
+        list.clear();
+        let mut in_order = true;
+        for &(src, off) in &found {
+            let (seg, map) = &sources[src];
+            let buf = seg.postings.as_ref();
+            // a damaged list contributes nothing
+            if walk_postings(buf, off as usize, |_, _, _| {}).is_none() {
+                continue;
+            }
+            walk_postings(buf, off as usize, |row, tf_body, tf_header| {
+                if row >= seg.n_rows {
+                    return;
+                }
+                if let Some(new) = map.get(row).filter(|&r| r < n_rows) {
+                    in_order &= list.last().is_none_or(|last| last.0 < new);
+                    list.push((new, tf_body, tf_header));
+                }
+            });
+        }
+        if !in_order {
+            list.sort_by_key(|p| p.0); // stable: repeats of a row keep their order
+        }
+        bytes.clear();
+        let (mut df, mut prev) = (0u64, 0u32);
+        let mut at = 0;
+        while at < list.len() {
+            // a row listed twice (no writer does that) counts once, its
+            // last non-zero frequencies standing, as in a map per row
+            let (row, mut tf_body, mut tf_header) = list[at];
+            at += 1;
+            while at < list.len() && list[at].0 == row {
+                if list[at].1 > 0 {
+                    tf_body = list[at].1;
+                }
+                if list[at].2 > 0 {
+                    tf_header = list[at].2;
+                }
+                at += 1;
+            }
+            if tf_body == 0 && tf_header == 0 {
+                continue;
+            }
+            leb128_push(&mut bytes, u64::from(row - prev));
+            leb128_push(&mut bytes, u64::from(tf_body));
+            leb128_push(&mut bytes, u64::from(tf_header));
+            prev = row;
+            df += 1;
+            let len = &mut lens[row as usize];
+            len.0 += tf_body;
+            len.1 += tf_header;
+        }
+        if df == 0 {
+            continue; // no carried row has the term
+        }
+        dict.insert(term, postings.len()).with_context(|| format!("fst insert '{}'", String::from_utf8_lossy(term)))?;
+        n_terms += 1;
+        let mut head = Vec::with_capacity(5);
+        leb128_push(&mut head, df);
+        postings.write(&head)?;
+        postings.write(&bytes)?;
+    }
+    drop(terms);
+    let dict = dict.into_inner().map_err(|e| anyhow!("building bm25 term dictionary: {e}"))?;
+    let tot_body: u64 = lens.iter().map(|l| u64::from(l.0)).sum();
+    let tot_head: u64 = lens.iter().map(|l| u64::from(l.1)).sum();
+    write_segment_file(path, |out| {
+        write_head(out, n_rows, n_terms, tot_body, tot_head, &dict, postings.len())?;
+        postings.copy_to(out)?;
+        write_tail(out, lens.iter().copied())?;
+        Ok(())
+    })
 }
 
 impl ChunkBm25 {
@@ -189,94 +564,15 @@ impl ChunkBm25 {
         Self::create_path(&file_path(dir, ns), rows)
     }
 
-    /// [`create`](Self::create) at an explicit segment path.
+    /// [`create`](Self::create) at an explicit segment path: every row
+    /// through a [`Bm25Writer`]. For callers that hold their rows anyway;
+    /// the pipeline feeds the writer itself.
     pub fn create_path(path: &Path, rows: &[(String, String)]) -> anyhow::Result<()> {
-        let tf_rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> = rows
-            .iter()
-            .map(|(header, body)| (unigram_tf(body), unigram_tf(header)))
-            .collect();
-        Self::create_from_tf(path, tf_rows)
-    }
-
-    /// Build from per-row `(body term→tf, header term→tf)` maps — what
-    /// [`rows_tf`](Self::rows_tf) recovers from an existing segment, so
-    /// segments can be merged without re-chunking any source.
-    pub fn create_from_tf(
-        path: &Path,
-        rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)>,
-    ) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("create bm25 dir {}", dir.display()))?;
+        let mut w = Bm25Writer::new(path.parent().unwrap_or(Path::new(".")));
+        for (header, body) in rows {
+            w.push(header, body)?;
         }
-        let n_rows = rows.len() as u32;
-
-        // Inverted lists: term -> [(row, tf_body, tf_header)], row-ordered
-        // because rows are visited in ascending order.
-        let mut terms: BTreeMap<String, Vec<(u32, u32, u32)>> = BTreeMap::new();
-        let mut row_lens: Vec<(u16, u8)> = Vec::with_capacity(rows.len());
-        let mut tot_body = 0u64;
-        let mut tot_head = 0u64;
-        for (i, (body_tf, head_tf)) in rows.into_iter().enumerate() {
-            let row = i as u32;
-            let blen: u32 = body_tf.values().sum();
-            let hlen: u32 = head_tf.values().sum();
-            row_lens.push((
-                blen.min(u16::MAX as u32) as u16,
-                hlen.min(u8::MAX as u32) as u8,
-            ));
-            tot_body += u64::from(blen);
-            tot_head += u64::from(hlen);
-            for (term, tf) in body_tf {
-                terms.entry(term).or_default().push((row, tf, 0));
-            }
-            for (term, tf) in head_tf {
-                let list = terms.entry(term).or_default();
-                match list.last_mut() {
-                    Some(e) if e.0 == row => e.2 = tf, // same row: body pass ran first
-                    _ => list.push((row, 0, tf)),
-                }
-            }
-        }
-        let avg_body = if n_rows > 0 { tot_body / u64::from(n_rows) } else { 0 };
-        let avg_head = if n_rows > 0 { tot_head / u64::from(n_rows) } else { 0 };
-
-        // Postings block + FST term dictionary (term -> postings offset).
-        let mut postings: Vec<u8> = Vec::new();
-        let mut fstb = fst::MapBuilder::memory();
-        for (term, list) in &terms {
-            let off = postings.len() as u64;
-            leb128_push(&mut postings, list.len() as u64); // df
-            let mut prev = 0u64;
-            for &(row, tf_body, tf_header) in list {
-                leb128_push(&mut postings, u64::from(row) - prev);
-                prev = u64::from(row);
-                leb128_push(&mut postings, u64::from(tf_body));
-                leb128_push(&mut postings, u64::from(tf_header));
-            }
-            fstb.insert(term, off)
-                .with_context(|| format!("fst insert '{term}'"))?;
-        }
-        let fst_bytes = fstb
-            .into_inner()
-            .map_err(|e| anyhow!("building bm25 term dictionary: {e}"))?;
-
-        let idx = ChunkBm25 {
-            path: path.to_path_buf(),
-            n_rows,
-            avg_body_len: avg_body as f64,
-            avg_header_len: avg_head as f64,
-            dict: fst::Map::new(Bytes::Owned(fst_bytes))
-                .map_err(|e| anyhow!("finalizing bm25 term dictionary: {e}"))?,
-            postings: Bytes::Owned(postings),
-            row_lens,
-            tombstones: BTreeSet::new(),
-        };
-        idx.write_file()?;
-        let side = crate::index::tomb_side_path(path);
-        if side.exists() {
-            fs::remove_file(&side).ok();
-        }
-        Ok(())
+        w.finish(path)
     }
 
     /// Opens the sidecar; `Ok(None)` if the file does not exist.
@@ -305,31 +601,6 @@ impl ChunkBm25 {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Per-row `(body term→tf, header term→tf)` recovered from the inverted
-    /// lists (tombstoned rows included, as empty maps are fine to carry).
-    pub fn rows_tf(&self) -> Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> {
-        let mut rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> =
-            (0..self.n_rows).map(|_| (BTreeMap::new(), BTreeMap::new())).collect();
-        let mut stream = self.dict.stream();
-        use fst::Streamer as _;
-        while let Some((term, off)) = stream.next() {
-            let term = String::from_utf8_lossy(term).into_owned();
-            let Some((_, postings)) = decode_postings(self.postings.as_ref(), off as usize) else {
-                continue;
-            };
-            for (row, tf_body, tf_header) in postings {
-                let Some(r) = rows.get_mut(row as usize) else { continue };
-                if tf_body > 0 {
-                    r.0.insert(term.clone(), tf_body);
-                }
-                if tf_header > 0 {
-                    r.1.insert(term.clone(), tf_header);
-                }
-            }
-        }
-        rows
     }
 
     /// Parse a segment; with `map` given, the dictionary and postings
@@ -392,45 +663,6 @@ impl ChunkBm25 {
             row_lens,
             tombstones,
         })
-    }
-
-    /// Serializes the full current state (index + tombstones) via
-    /// tmp+rename.
-    fn write_file(&self) -> anyhow::Result<()> {
-        let tombs: Vec<u32> = self.tombstones.iter().copied().collect();
-        let tombs = bincode::serialize(&tombs)?;
-
-        let mut out = Vec::with_capacity(
-            44 + self.postings.len() + self.row_lens.len() * 3 + tombs.len(),
-        );
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&self.n_rows.to_le_bytes());
-        out.extend_from_slice(&(self.dict.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.avg_body_len as u32).to_le_bytes());
-        out.extend_from_slice(&(self.avg_header_len as u32).to_le_bytes());
-        let fst_bytes = self.dict.as_fst().as_bytes();
-        out.extend_from_slice(&(fst_bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(fst_bytes);
-        out.extend_from_slice(&(self.postings.len() as u64).to_le_bytes());
-        out.extend_from_slice(self.postings.as_ref());
-        out.extend_from_slice(&((self.row_lens.len() * 3) as u64).to_le_bytes());
-        for &(bl, hl) in &self.row_lens {
-            out.extend_from_slice(&bl.to_le_bytes());
-            out.push(hl);
-        }
-        out.extend_from_slice(&(tombs.len() as u64).to_le_bytes());
-        out.extend_from_slice(&tombs);
-
-        let tmp = self.path.with_extension("cibm25.tmp");
-        {
-            let mut f = fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(&out)?;
-            f.sync_all().ok();
-        }
-        fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename to {}", self.path.display()))?;
-        Ok(())
     }
 
     /// BM25F top-k over live rows. Returns `(row, score)` sorted by score
@@ -862,15 +1094,188 @@ impl Bm25Set {
         Ok(())
     }
 
-    /// Per-row term maps of segment `i`, tombstoned rows emptied.
-    pub fn rows_tf_of(&self, i: usize) -> Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> {
-        let mut rows = self.segs[i].rows_tf();
-        for &r in &self.tombs[i] {
-            if let Some(row) = rows.get_mut(r as usize) {
-                *row = (BTreeMap::new(), BTreeMap::new());
+    /// Tombstoned local rows of segment `seg` (in-file ∪ side file).
+    pub fn dead(&self, seg: usize) -> &BTreeSet<u32> {
+        &self.tombs[seg]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The writers before segments were streamed
+// ---------------------------------------------------------------------------
+
+/// What built and merged `.cibm25` segments before [`Bm25Writer`] and
+/// [`merge_segments`]: a pair of term maps per row, one map of posting
+/// lists, the file in one buffer. Kept, as it was, for the tests that hold
+/// the streaming writers to the bytes these wrote.
+#[cfg(test)]
+pub(crate) mod reference {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Unigram term frequencies of `text` (bigram terms skipped).
+    fn unigram_tf(text: &str) -> BTreeMap<String, u32> {
+        let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+        for t in tokenize(text) {
+            if t.term.contains(' ') {
+                continue; // adjacent-bigram term: not indexed (a non-goal)
+            }
+            *tf.entry(t.term).or_insert(0) += 1;
+        }
+        tf
+    }
+
+    pub fn create_path(path: &Path, rows: &[(String, String)]) -> anyhow::Result<()> {
+        let tf_rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> = rows
+            .iter()
+            .map(|(header, body)| (unigram_tf(body), unigram_tf(header)))
+            .collect();
+        create_from_tf(path, tf_rows)
+    }
+
+    /// Build from per-row `(body term→tf, header term→tf)` maps — what
+    /// [`rows_tf`] recovers from an existing segment.
+    pub fn create_from_tf(
+        path: &Path,
+        rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)>,
+    ) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create bm25 dir {}", dir.display()))?;
+        }
+        let n_rows = rows.len() as u32;
+
+        // Inverted lists: term -> [(row, tf_body, tf_header)], row-ordered
+        // because rows are visited in ascending order.
+        let mut terms: BTreeMap<String, Vec<(u32, u32, u32)>> = BTreeMap::new();
+        let mut row_lens: Vec<(u16, u8)> = Vec::with_capacity(rows.len());
+        let mut tot_body = 0u64;
+        let mut tot_head = 0u64;
+        for (i, (body_tf, head_tf)) in rows.into_iter().enumerate() {
+            let row = i as u32;
+            let blen: u32 = body_tf.values().sum();
+            let hlen: u32 = head_tf.values().sum();
+            row_lens.push((
+                blen.min(u16::MAX as u32) as u16,
+                hlen.min(u8::MAX as u32) as u8,
+            ));
+            tot_body += u64::from(blen);
+            tot_head += u64::from(hlen);
+            for (term, tf) in body_tf {
+                terms.entry(term).or_default().push((row, tf, 0));
+            }
+            for (term, tf) in head_tf {
+                let list = terms.entry(term).or_default();
+                match list.last_mut() {
+                    Some(e) if e.0 == row => e.2 = tf, // same row: body pass ran first
+                    _ => list.push((row, 0, tf)),
+                }
+            }
+        }
+        let avg_body = if n_rows > 0 { tot_body / u64::from(n_rows) } else { 0 };
+        let avg_head = if n_rows > 0 { tot_head / u64::from(n_rows) } else { 0 };
+
+        // Postings block + FST term dictionary (term -> postings offset).
+        let mut postings: Vec<u8> = Vec::new();
+        let mut fstb = fst::MapBuilder::memory();
+        for (term, list) in &terms {
+            let off = postings.len() as u64;
+            leb128_push(&mut postings, list.len() as u64); // df
+            let mut prev = 0u64;
+            for &(row, tf_body, tf_header) in list {
+                leb128_push(&mut postings, u64::from(row) - prev);
+                prev = u64::from(row);
+                leb128_push(&mut postings, u64::from(tf_body));
+                leb128_push(&mut postings, u64::from(tf_header));
+            }
+            fstb.insert(term, off)
+                .with_context(|| format!("fst insert '{term}'"))?;
+        }
+        let fst_bytes = fstb
+            .into_inner()
+            .map_err(|e| anyhow!("building bm25 term dictionary: {e}"))?;
+
+        let idx = ChunkBm25 {
+            path: path.to_path_buf(),
+            n_rows,
+            avg_body_len: avg_body as f64,
+            avg_header_len: avg_head as f64,
+            dict: fst::Map::new(Bytes::Owned(fst_bytes))
+                .map_err(|e| anyhow!("finalizing bm25 term dictionary: {e}"))?,
+            postings: Bytes::Owned(postings),
+            row_lens,
+            tombstones: BTreeSet::new(),
+        };
+        write_file(&idx)?;
+        let side = crate::index::tomb_side_path(path);
+        if side.exists() {
+            fs::remove_file(&side).ok();
+        }
+        Ok(())
+    }
+
+    /// Per-row `(body term→tf, header term→tf)` recovered from the inverted
+    /// lists (tombstoned rows included, as empty maps are fine to carry).
+    pub fn rows_tf(seg: &ChunkBm25) -> Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> {
+        let mut rows: Vec<(BTreeMap<String, u32>, BTreeMap<String, u32>)> =
+            (0..seg.n_rows).map(|_| (BTreeMap::new(), BTreeMap::new())).collect();
+        let mut stream = seg.dict.stream();
+        use fst::Streamer as _;
+        while let Some((term, off)) = stream.next() {
+            let term = String::from_utf8_lossy(term).into_owned();
+            let Some((_, postings)) = decode_postings(seg.postings.as_ref(), off as usize) else {
+                continue;
+            };
+            for (row, tf_body, tf_header) in postings {
+                let Some(r) = rows.get_mut(row as usize) else { continue };
+                if tf_body > 0 {
+                    r.0.insert(term.clone(), tf_body);
+                }
+                if tf_header > 0 {
+                    r.1.insert(term.clone(), tf_header);
+                }
             }
         }
         rows
+    }
+
+    /// Serializes the full current state (index + tombstones) via
+    /// tmp+rename.
+    fn write_file(idx: &ChunkBm25) -> anyhow::Result<()> {
+        let tombs: Vec<u32> = idx.tombstones.iter().copied().collect();
+        let tombs = bincode::serialize(&tombs)?;
+
+        let mut out = Vec::with_capacity(
+            44 + idx.postings.len() + idx.row_lens.len() * 3 + tombs.len(),
+        );
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&idx.n_rows.to_le_bytes());
+        out.extend_from_slice(&(idx.dict.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(idx.avg_body_len as u32).to_le_bytes());
+        out.extend_from_slice(&(idx.avg_header_len as u32).to_le_bytes());
+        let fst_bytes = idx.dict.as_fst().as_bytes();
+        out.extend_from_slice(&(fst_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(fst_bytes);
+        out.extend_from_slice(&(idx.postings.len() as u64).to_le_bytes());
+        out.extend_from_slice(idx.postings.as_ref());
+        out.extend_from_slice(&((idx.row_lens.len() * 3) as u64).to_le_bytes());
+        for &(bl, hl) in &idx.row_lens {
+            out.extend_from_slice(&bl.to_le_bytes());
+            out.push(hl);
+        }
+        out.extend_from_slice(&(tombs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&tombs);
+
+        let tmp = idx.path.with_extension("cibm25.tmp");
+        {
+            let mut f = fs::File::create(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(&out)?;
+            f.sync_all().ok();
+        }
+        fs::rename(&tmp, &idx.path)
+            .with_context(|| format!("rename to {}", idx.path.display()))?;
+        Ok(())
     }
 }
 
@@ -1187,5 +1592,196 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("x.cibm25"), b"CIBM25 1 truncated").unwrap();
         assert!(ChunkBm25::open(&dir, "x").is_err());
+    }
+
+    // ---- the streaming writers against the writers they replace -----------
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        /// A word of a vocabulary with a few very common members and a
+        /// long tail, some of them identifiers that split, some not ASCII.
+        fn word(&mut self) -> String {
+            let u = self.below(1000) as f64 / 1000.0;
+            let k = (u * u * u * 4000.0) as u64;
+            match k % 11 {
+                0 => format!("parseQuery{k}"),
+                1 => format!("größe{k}"),
+                2 => format!("数据{k}"),
+                3 => format!("snake_case_{k}"),
+                _ => format!("w{k}"),
+            }
+        }
+
+        fn words(&mut self, n: u64) -> String {
+            (0..n).map(|_| self.word()).collect::<Vec<_>>().join(" ")
+        }
+    }
+
+    /// (header, body) rows of generated text, with the odd ones: empty
+    /// fields, empty rows, and fields longer than the lengths a row stores
+    /// (u16 body tokens, u8 header tokens).
+    fn generated_rows(n: usize, seed: u64) -> Vec<(String, String)> {
+        let mut rng = Rng(seed | 1);
+        (0..n)
+            .map(|i| {
+                let header = format!("src/mod{}/file{}.rs > fn {}", i % 7, i % 31, rng.word());
+                match i % 211 {
+                    3 => (String::new(), String::new()),
+                    5 => (header, String::new()),
+                    7 => (String::new(), rng.words(40)),
+                    11 => (rng.words(300), rng.words(5)),
+                    13 if i % 1000 == 13 => (header, "tok ".repeat(70_000)),
+                    _ => {
+                        let len = 1 + rng.below(120);
+                        (header, rng.words(len))
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Extensions of the files in `dir`, sorted.
+    fn extensions(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A segment built a row at a time is, byte for byte, the segment built
+    /// from a pair of term maps per row, whether the term table held every
+    /// row or was set aside as parts along the way.
+    #[test]
+    fn streamed_segments_are_the_segments_built_from_term_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (want_path, got_path) = (dir.join("want.cibm25"), dir.join("got.cibm25"));
+        for (n, budgets) in [
+            (0usize, &[TABLE_BUDGET, 0][..]),
+            (1, &[TABLE_BUDGET, 0]),
+            (60, &[TABLE_BUDGET, 0, 1, 3000]),
+            (3000, &[TABLE_BUDGET, 40_000, 200_000]),
+        ] {
+            let rows = generated_rows(n, 17 + n as u64);
+            reference::create_path(&want_path, &rows).unwrap();
+            let want = fs::read(&want_path).unwrap();
+            for &budget in budgets {
+                let mut w = Bm25Writer::with_budget(dir, budget);
+                for (header, body) in &rows {
+                    w.push(header, body).unwrap();
+                }
+                assert_eq!(w.rows() as usize, n);
+                let parts = w.parts.len();
+                assert_eq!(parts > 0, n > 0 && budget < TABLE_BUDGET, "n={n} budget={budget}: {parts} parts");
+                assert!(budget != 40_000 || parts > 10, "{parts} parts");
+                w.finish(&got_path).unwrap();
+                assert!(fs::read(&got_path).unwrap() == want, "n={n} budget={budget} ({parts} parts)");
+            }
+            // the wrapper callers with rows in hand use
+            ChunkBm25::create_path(&got_path, &rows).unwrap();
+            assert!(fs::read(&got_path).unwrap() == want, "create_path, n={n}");
+            let seg = ChunkBm25::open_path(&got_path).unwrap();
+            assert_eq!(seg.raw_len(), n);
+            if n == 3000 {
+                // the lengths saturate where the reference's did
+                assert!(seg.row_lens.iter().any(|l| l.0 == u16::MAX) && seg.row_lens.iter().any(|l| l.1 == u8::MAX));
+            }
+        }
+        assert_eq!(extensions(dir), ["cibm25"], "a temp or scratch file was left");
+    }
+
+    /// The reference merge of a compaction: recover a pair of term maps per
+    /// row of each input, pick the carried rows in order (a row tombstoned
+    /// on this side alone is carried bare), build the segment from them.
+    fn reference_merge(path: &Path, segs: &[ChunkBm25], order: &[(usize, u32)], bare: &dyn Fn(usize, u32) -> bool) {
+        let mut recovered: Vec<_> = segs.iter().map(reference::rows_tf).collect();
+        let tf_rows = order
+            .iter()
+            .map(|&(s, r)| if bare(s, r) { Default::default() } else { std::mem::take(&mut recovered[s][r as usize]) })
+            .collect();
+        reference::create_from_tf(path, tf_rows).unwrap();
+    }
+
+    fn streamed_merge(path: &Path, segs: &[ChunkBm25], order: &[(usize, u32)], bare: &dyn Fn(usize, u32) -> bool) {
+        let mut maps: Vec<Vec<u32>> = segs.iter().map(|s| vec![DROPPED; s.raw_len()]).collect();
+        for (new_row, &(s, r)) in order.iter().enumerate() {
+            if !bare(s, r) {
+                maps[s][r as usize] = new_row as u32;
+            }
+        }
+        let sources: Vec<(&ChunkBm25, RowMap<'_>)> = segs.iter().zip(&maps).map(|(s, m)| (s, RowMap::Table(m))).collect();
+        merge_segments(path, order.len() as u32, &sources).unwrap();
+    }
+
+    /// A merge of segments by their posting lists writes, byte for byte,
+    /// the segment built from the rows recovered out of them.
+    #[test]
+    fn merged_segments_are_the_segments_built_from_recovered_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut segs: Vec<ChunkBm25> = Vec::new();
+        for (i, n) in [700usize, 1, 0, 1100, 55].into_iter().enumerate() {
+            let p = dir.join(format!("in{i}.cibm25"));
+            ChunkBm25::create_path(&p, &generated_rows(n, 900 + i as u64)).unwrap();
+            segs.push(ChunkBm25::open_path(&p).unwrap());
+        }
+        let (want_path, got_path) = (dir.join("want.cibm25"), dir.join("got.cibm25"));
+        let check = |segs: &[ChunkBm25], order: &[(usize, u32)], bare: &dyn Fn(usize, u32) -> bool, what: &str| {
+            reference_merge(&want_path, segs, order, bare);
+            streamed_merge(&got_path, segs, order, bare);
+            assert!(fs::read(&got_path).unwrap() == fs::read(&want_path).unwrap(), "{what}");
+        };
+        let all: Vec<(usize, u32)> = segs.iter().enumerate().flat_map(|(s, seg)| (0..seg.raw_len() as u32).map(move |r| (s, r))).collect();
+        let none = |_: usize, _: u32| false;
+
+        // every row, in segment order: the concatenation
+        check(&segs, &all, &none, "every row in order");
+        let term = "tok";
+        assert_eq!(ChunkBm25::open_path(&got_path).unwrap().term_df(term), Some(3), "three inputs have the long row");
+        // most rows, in an order that mixes the segments; some carried bare
+        let mut order: Vec<(usize, u32)> = all.iter().copied().filter(|&(s, r)| (r + s as u32) % 9 != 2).collect();
+        let mut rng = Rng(0xC0FFEE);
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        check(&segs, &order, &|s, r| (r + 2 * s as u32) % 13 == 5, "rows dropped, permuted, some bare");
+        // the order a compaction gives: rows of each input kept in order, inputs interleaved
+        let mut by_row = order.clone();
+        by_row.sort_by_key(|&(s, r)| (r, s));
+        check(&segs, &by_row, &none, "inputs interleaved");
+        // nothing carried, and one row
+        check(&segs, &[], &none, "no row");
+        check(&segs, &[(3, 1099)], &none, "one row");
+
+        // an input with a posting list that does not decode: the list is
+        // left out whole by both
+        let victim = dir.join("in3.cibm25");
+        let mut bytes = fs::read(&victim).unwrap();
+        let fst_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let postings_at = 32 + fst_len + 8;
+        let off = segs[3].dict.get(term).expect("the long row's term") as usize;
+        bytes[postings_at + off..postings_at + off + 5].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
+        drop(segs);
+        fs::write(&victim, &bytes).unwrap();
+        let segs: Vec<ChunkBm25> = (0..5).map(|i| ChunkBm25::open_path(&dir.join(format!("in{i}.cibm25"))).unwrap()).collect();
+        check(&segs, &all, &none, "a damaged list");
+        let merged = ChunkBm25::open_path(&got_path).unwrap();
+        assert_eq!(merged.term_df(term), Some(2), "the damaged list was carried");
+        assert_eq!(extensions(dir), ["cibm25"], "a temp or scratch file was left");
     }
 }

@@ -54,6 +54,7 @@ use crate::bm25::Bytes;
 use crate::embed::dot;
 use crate::hnsw::{Hnsw, HnswOptions};
 use crate::rowmeta::{BlockError, MetaStore};
+use crate::spool::Spool;
 
 pub use crate::rowmeta::RowMeta;
 
@@ -61,16 +62,36 @@ const MAGIC_V1: &[u8; 8] = b"CIVEC001";
 const MAGIC: &[u8; 8] = b"CIVEC002";
 const MAGIC_V3: &[u8; 8] = b"CIVEC003";
 
-/// Per-row symmetric int8 quantisation: `(scale, q)` with `x ≈ q * scale`.
-fn quantize_row(v: &[f32]) -> (f32, Vec<i8>) {
+/// Per-row symmetric int8 quantisation: the row's int8 values replace the
+/// contents of `q` (as the bytes a segment stores) and its scale is
+/// returned, with `x ≈ q * scale`.
+fn quantize_into(v: &[f32], q: &mut Vec<u8>) -> f32 {
+    q.clear();
     let amax = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
     if amax == 0.0 {
-        return (0.0, vec![0; v.len()]);
+        q.resize(v.len(), 0);
+        return 0.0;
     }
     let scale = amax / 127.0;
     let inv = 127.0 / amax;
-    let q = v.iter().map(|&x| (x * inv).round().clamp(-127.0, 127.0) as i8).collect();
-    (scale, q)
+    q.extend(v.iter().map(|&x| (x * inv).round().clamp(-127.0, 127.0) as i8 as u8));
+    scale
+}
+
+/// The scale [`quantize_into`] returns for an int8 row taken back to f32
+/// (`q * scale`), from the row's largest |q| alone. The largest |x| of that
+/// row is the product of the largest |q|: a product is rounded the same way
+/// whatever its sign and rounding keeps order, and a product that is not a
+/// number (a zero times an infinite scale, anything times NaN) is passed
+/// over here as it is there.
+fn requantized_scale(q: &[i8], scale: f32) -> f32 {
+    let most = q.iter().fold(0u8, |m, &x| m.max(x.unsigned_abs()));
+    let amax = 0f32.max((f32::from(most) * scale).abs());
+    if amax == 0.0 {
+        0.0
+    } else {
+        amax / 127.0
+    }
 }
 
 /// `scale * dot(q, row)` for an int8 row.
@@ -119,13 +140,20 @@ pub struct VecRowMeta {
 
 /// Binary sign-bit code: bit i set iff `v[i] >= 0.0`.
 fn encode_code(v: &[f32]) -> Vec<u8> {
-    let mut code = vec![0u8; v.len().div_ceil(8)];
+    let mut code = Vec::new();
+    encode_code_into(v, &mut code);
+    code
+}
+
+/// [`encode_code`] into a buffer the caller keeps between rows.
+fn encode_code_into(v: &[f32], code: &mut Vec<u8>) {
+    code.clear();
+    code.resize(v.len().div_ceil(8), 0);
     for (i, &x) in v.iter().enumerate() {
         if x >= 0.0 {
             code[i / 8] |= 1 << (i % 8);
         }
     }
-    code
 }
 
 /// Smallest row range worth a rayon task in the binary prescan.
@@ -306,10 +334,15 @@ mod mapped {
         }
 
         pub fn row(&self, r: usize) -> &[i8] {
-            let start = self.q_off + r * self.dim;
-            let bytes = &self.map[start..start + self.dim];
+            let bytes = self.row_bytes(r);
             // i8 and u8 have the same layout
             unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i8, self.dim) }
+        }
+
+        /// The int8 row as the bytes the file holds (what a compaction copies).
+        pub fn row_bytes(&self, r: usize) -> &[u8] {
+            let start = self.q_off + r * self.dim;
+            &self.map[start..start + self.dim]
         }
 
         pub fn codes(&self) -> &[u8] {
@@ -614,86 +647,19 @@ impl VecIndex {
         Self::open_file(path.to_path_buf())
     }
 
-    /// Write one flat segment file at `path` (tmp+rename; no HNSW).
+    /// Write one flat segment file at `path` (tmp+rename; no HNSW): every
+    /// row through a [`SegmentWriter`]. For callers that hold their rows
+    /// anyway (tests, small segments); the pipeline feeds the writer itself.
     pub fn create_segment(
         path: &Path,
         dim: usize,
         rows: Vec<(VecRowMeta, Vec<f32>)>,
     ) -> anyhow::Result<()> {
-        ensure!(dim > 0, "dim must be > 0");
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("create vec dir {}", dir.display()))?;
-        }
-        if std::env::var_os("INDEXIO_VEC_F32").is_some() {
-            // A/B knob: the older f32 layout (v2)
-            let mut vectors: Vec<f32> = Vec::with_capacity(rows.len() * dim);
-            let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
-            let mut metas = Vec::with_capacity(rows.len());
-            for (m, v) in rows {
-                ensure!(v.len() == dim, "row {:?} has dim {}, expected {dim}", m.path, v.len());
-                codes.extend(encode_code(&v));
-                vectors.extend_from_slice(&v);
-                metas.push(m);
-            }
-            let idx = VecIndex {
-                path: path.to_path_buf(),
-                dim,
-                metas: MetaStore::owned(metas),
-                store: Storage::Owned { vectors, codes },
-                tombstones: BTreeSet::new(),
-                hnsw: None,
-            };
-            idx.write_file()?;
-            let side = tomb_side_path(path);
-            if side.exists() {
-                fs::remove_file(&side).ok();
-            }
-            return Ok(());
-        }
-        // v3: int8 rows with a per-row scale
-        let mut scales: Vec<u8> = Vec::with_capacity(rows.len() * 4);
-        let mut qrows: Vec<u8> = Vec::with_capacity(rows.len() * dim);
-        let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
-        let mut metas = Vec::with_capacity(rows.len());
+        let mut w = SegmentWriter::new(path.parent().unwrap_or(Path::new(".")), dim)?;
         for (m, v) in rows {
-            ensure!(v.len() == dim, "row {:?} has dim {}, expected {dim}", m.path, v.len());
-            codes.extend(encode_code(&v));
-            let (scale, q) = quantize_row(&v);
-            scales.extend_from_slice(&scale.to_le_bytes());
-            qrows.extend(q.into_iter().map(|x| x as u8));
-            metas.push(m);
+            w.push(&m.as_row(), &v)?;
         }
-        let metas_bytes = bincode::serialize(&metas)?;
-        let tombs = bincode::serialize(&Vec::<u32>::new())?;
-        let header_len = 8 + 4 + 4 + 4 + 8;
-        let scale_off = align8(header_len + metas_bytes.len());
-        let code_off = align8(scale_off + scales.len() + qrows.len());
-        let mut out = Vec::with_capacity(code_off + codes.len() + 8 + tombs.len());
-        out.extend_from_slice(MAGIC_V3);
-        out.extend_from_slice(&(dim as u32).to_le_bytes());
-        out.extend_from_slice(&(metas.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(metas_bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(&metas_bytes);
-        out.resize(scale_off, 0);
-        out.extend_from_slice(&scales);
-        out.extend_from_slice(&qrows);
-        out.resize(code_off, 0);
-        out.extend_from_slice(&codes);
-        out.extend_from_slice(&(tombs.len() as u64).to_le_bytes());
-        out.extend_from_slice(&tombs);
-        let tmp = path.with_extension("civec.tmp");
-        {
-            let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(&out)?;
-            f.sync_all().ok();
-        }
-        fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-        let side = tomb_side_path(path);
-        if side.exists() {
-            fs::remove_file(&side).ok();
-        }
-        Ok(())
+        w.finish(path)
     }
 
     pub fn path(&self) -> &Path {
@@ -985,15 +951,24 @@ impl VecIndex {
         self.tombstones.contains(&row)
     }
 
-    /// The row as f32 (dequantised for v3 segments): what a compaction carries.
+    /// The row as f32 (dequantised for v3 segments).
     pub(crate) fn row_vector(&self, row: u32) -> Vec<f32> {
+        let mut v = Vec::new();
+        self.row_into(row, &mut v);
+        v
+    }
+
+    /// [`row_vector`](Self::row_vector) into a buffer the caller keeps
+    /// between rows: what a compaction carries, one row at a time.
+    fn row_into(&self, row: u32, v: &mut Vec<f32>) {
         let r = row as usize;
+        v.clear();
         match &self.store {
             Storage::Quant(m) => {
                 let s = m.scales()[r];
-                m.row(r).iter().map(|&x| x as f32 * s).collect()
+                v.extend(m.row(r).iter().map(|&x| x as f32 * s));
             }
-            _ => self.vectors().expect("f32 store")[r * self.dim..(r + 1) * self.dim].to_vec(),
+            _ => v.extend_from_slice(&self.vectors().expect("f32 store")[r * self.dim..(r + 1) * self.dim]),
         }
     }
 
@@ -1005,6 +980,357 @@ impl VecIndex {
 
 fn align8(v: usize) -> usize {
     (v + 7) & !7
+}
+
+// ---------------------------------------------------------------------------
+// Writing segments
+// ---------------------------------------------------------------------------
+
+/// int8 (or f32) rows a segment being written holds in memory before they
+/// move to a scratch file, and the same for each of its smaller sections
+/// (row metadata, scales, binary codes). An append of a few thousand chunks
+/// stays under these and is written as before: one temp file, one rename.
+const ROWS_IN_MEMORY: usize = 4 << 20;
+const SIDE_IN_MEMORY: usize = 1 << 20;
+
+/// Whether segments are written in the older f32 layout (v2): an A/B knob.
+fn f32_layout() -> bool {
+    std::env::var_os("INDEXIO_VEC_F32").is_some()
+}
+
+/// The sections of a segment file that hold one item per row.
+#[derive(Clone, Copy, Debug)]
+enum Section {
+    /// The row records of the metadata block (its count is written apart).
+    Metas,
+    /// One f32 scale per row (v3 only).
+    Scales,
+    /// The rows: int8 (v3) or f32 (v2).
+    Rows,
+    /// One binary sign-bit code per row.
+    Codes,
+}
+
+/// What fixes the layout of a segment file before any row is written to it.
+struct Shape {
+    /// v2 (f32 rows, no scales) instead of v3.
+    f32_rows: bool,
+    dim: usize,
+    n_rows: usize,
+    /// Bytes of the row records: the metadata block less its count.
+    records: u64,
+}
+
+/// A writer that knows how many bytes went through it.
+struct Counted<W: Write> {
+    out: W,
+    n: u64,
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.n += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+impl Shape {
+    fn section_len(&self, s: Section) -> u64 {
+        let n = self.n_rows as u64;
+        match s {
+            Section::Metas => self.records,
+            Section::Scales => n * 4,
+            Section::Rows => n * self.dim as u64 * if self.f32_rows { 4 } else { 1 },
+            Section::Codes => n * self.dim.div_ceil(8) as u64,
+        }
+    }
+
+    /// Write the segment file at `path` (tmp + rename), front to back:
+    /// `section` is asked for each per-row section in file order and writes
+    /// it straight into the file, so nothing of the segment is held here.
+    /// A section of the wrong length is an error and leaves no file.
+    fn write(
+        &self,
+        path: &Path,
+        mut section: impl FnMut(Section, &mut dyn Write) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        ensure!(self.dim > 0, "dim must be > 0");
+        ensure!(u32::try_from(self.n_rows).is_ok(), "too many vector rows");
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create vec dir {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("civec.tmp");
+        let file = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut out = Counted { out: std::io::BufWriter::with_capacity(1 << 20, file), n: 0 };
+        let mut body = || -> anyhow::Result<()> {
+            let mut put = |s: Section, out: &mut Counted<std::io::BufWriter<fs::File>>| -> anyhow::Result<()> {
+                let before = out.n;
+                section(s, out)?;
+                ensure!(
+                    out.n - before == self.section_len(s),
+                    "segment section {s:?} is {} bytes, expected {}",
+                    out.n - before,
+                    self.section_len(s)
+                );
+                Ok(())
+            };
+            let pad8 = |out: &mut Counted<std::io::BufWriter<fs::File>>| -> std::io::Result<()> {
+                let pad = align8(out.n as usize) - out.n as usize;
+                out.write_all(&[0u8; 8][..pad])
+            };
+            out.write_all(if self.f32_rows { MAGIC } else { MAGIC_V3 })?;
+            out.write_all(&(self.dim as u32).to_le_bytes())?;
+            out.write_all(&(self.n_rows as u32).to_le_bytes())?;
+            out.write_all(&0u32.to_le_bytes())?;
+            // the metadata block is bincode's `Vec<VecRowMeta>`: a count, then the records
+            out.write_all(&(8 + self.records).to_le_bytes())?;
+            out.write_all(&(self.n_rows as u64).to_le_bytes())?;
+            put(Section::Metas, &mut out)?;
+            pad8(&mut out)?;
+            if !self.f32_rows {
+                put(Section::Scales, &mut out)?;
+            }
+            put(Section::Rows, &mut out)?;
+            if !self.f32_rows {
+                pad8(&mut out)?;
+            }
+            put(Section::Codes, &mut out)?;
+            // no tombstone yet: the length of, then, bincode's empty `Vec<u32>`
+            out.write_all(&8u64.to_le_bytes())?;
+            out.write_all(&0u64.to_le_bytes())?;
+            out.flush()?;
+            Ok(())
+        };
+        if let Err(e) = body() {
+            drop(out);
+            fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        out.out.get_ref().sync_all().ok();
+        drop(out);
+        fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+        let side = tomb_side_path(path);
+        if side.exists() {
+            fs::remove_file(&side).ok();
+        }
+        Ok(())
+    }
+}
+
+/// Writes one segment file a row at a time.
+///
+/// `create_segment` used to take every row as `(VecRowMeta, Vec<f32>)`,
+/// quantize them into four vectors and copy those into one buffer holding
+/// the whole file: 8.2 KB per row coming in plus twice the file going out
+/// (12 GB for the 945k-row segment of a rebuild). Here a row is quantized
+/// when it arrives and its four parts go to [`Spool`]s, so the writer holds
+/// a few MB whatever the number of rows; [`finish`](Self::finish) lays the
+/// file out from the spools. The file is the one `create_segment` wrote,
+/// byte for byte.
+pub struct SegmentWriter {
+    dim: usize,
+    f32_rows: bool,
+    n_rows: u32,
+    metas: Spool,
+    scales: Spool,
+    rows: Spool,
+    codes: Spool,
+    /// One row's bytes and one row's code, between rows.
+    row: Vec<u8>,
+    code: Vec<u8>,
+}
+
+impl SegmentWriter {
+    /// A writer for rows of `dim` components. `dir` is where its scratch
+    /// files go once the rows outgrow memory: the directory the segment
+    /// will be written to.
+    pub fn new(dir: &Path, dim: usize) -> anyhow::Result<Self> {
+        Self::with_layout(dir, dim, f32_layout(), ROWS_IN_MEMORY, SIDE_IN_MEMORY)
+    }
+
+    /// [`new`](Self::new) with the layout (v2 when `f32_rows`) and the
+    /// bytes held in memory per section spelled out.
+    fn with_layout(dir: &Path, dim: usize, f32_rows: bool, rows_in_memory: usize, side_in_memory: usize) -> anyhow::Result<Self> {
+        ensure!(dim > 0, "dim must be > 0");
+        Ok(SegmentWriter {
+            dim,
+            f32_rows,
+            n_rows: 0,
+            metas: Spool::new(dir, "civec-metas", side_in_memory),
+            scales: Spool::new(dir, "civec-scales", side_in_memory),
+            rows: Spool::new(dir, "civec-rows", rows_in_memory),
+            codes: Spool::new(dir, "civec-codes", side_in_memory),
+            row: Vec::new(),
+            code: Vec::new(),
+        })
+    }
+
+    /// Rows pushed so far.
+    pub fn rows(&self) -> u32 {
+        self.n_rows
+    }
+
+    fn row_added(&mut self, meta: &RowMeta<'_>) -> anyhow::Result<u32> {
+        crate::rowmeta::write_record(&mut SpoolWrite(&mut self.metas), meta)?;
+        let row = self.n_rows;
+        self.n_rows = row.checked_add(1).ok_or_else(|| anyhow!("too many vector rows"))?;
+        Ok(row)
+    }
+
+    /// Append a row; returns its row id in the segment.
+    pub fn push(&mut self, meta: &RowMeta<'_>, v: &[f32]) -> anyhow::Result<u32> {
+        ensure!(v.len() == self.dim, "row {:?} has dim {}, expected {}", meta.path, v.len(), self.dim);
+        encode_code_into(v, &mut self.code);
+        self.codes.write(&self.code)?;
+        if self.f32_rows {
+            self.row.clear();
+            for x in v {
+                self.row.extend_from_slice(&x.to_le_bytes());
+            }
+        } else {
+            let scale = quantize_into(v, &mut self.row);
+            self.scales.write(&scale.to_le_bytes())?;
+        }
+        self.rows.write(&self.row)?;
+        self.row_added(meta)
+    }
+
+    /// Append a row whose vector is the one of `row`, pushed earlier: the
+    /// stored bytes are copied, which is what pushing the same vector again
+    /// writes. A chunk whose text occurs twice in one embed pass takes its
+    /// vector this way, so the pass keeps no vector to hand out again.
+    pub fn push_copy_of(&mut self, meta: &RowMeta<'_>, row: u32) -> anyhow::Result<u32> {
+        ensure!(row < self.n_rows, "row {row} is not written yet ({} rows)", self.n_rows);
+        let row = u64::from(row);
+        let row_bytes = self.dim * if self.f32_rows { 4 } else { 1 };
+        self.row.resize(row_bytes, 0);
+        self.rows.read_at(row * row_bytes as u64, &mut self.row)?;
+        self.rows.write(&self.row)?;
+        self.code.resize(self.dim.div_ceil(8), 0);
+        self.codes.read_at(row * self.code.len() as u64, &mut self.code)?;
+        self.codes.write(&self.code)?;
+        if !self.f32_rows {
+            let mut scale = [0u8; 4];
+            self.scales.read_at(row * 4, &mut scale)?;
+            self.scales.write(&scale)?;
+        }
+        self.row_added(meta)
+    }
+
+    /// Write the segment at `path` (tmp + rename; no HNSW) and remove a
+    /// tombstone side file left at that path.
+    pub fn finish(self, path: &Path) -> anyhow::Result<()> {
+        let SegmentWriter { dim, f32_rows, n_rows, mut metas, mut scales, mut rows, mut codes, .. } = self;
+        let shape = Shape { f32_rows, dim, n_rows: n_rows as usize, records: metas.len() };
+        shape.write(path, |section, out| {
+            match section {
+                Section::Metas => metas.copy_to(out)?,
+                Section::Scales => scales.copy_to(out)?,
+                Section::Rows => rows.copy_to(out)?,
+                Section::Codes => codes.copy_to(out)?,
+            }
+            Ok(())
+        })
+    }
+}
+
+/// `io::Write` over a spool.
+struct SpoolWrite<'a>(&'a mut Spool);
+
+impl Write for SpoolWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Write the rows `order` of open segments as one segment at `path`: what a
+/// compaction carries, `(index into segs, local row)` in the new row order.
+///
+/// A compaction used to turn every row back into f32 (`row_vector`),
+/// collect them all with an owned copy of their metadata and hand the lot
+/// to `create_segment`: 8.2 KB per row carried, then twice the file. Here
+/// the rows stay in the source mappings until they are written: a metadata
+/// record is copied as it is stored, and a row goes through f32 and the
+/// quantizer on its own, in one buffer, straight into the file. Only the
+/// binary codes wait (in a [`Spool`]), since they follow the rows in the
+/// file and come out of the same pass.
+///
+/// The row is quantized again, not copied, because that is what
+/// `create_segment` did to it and the trip is not the identity: the code
+/// bit of a component stored as zero comes back set, whatever the sign of
+/// the component was when the row was embedded (see
+/// `what_a_compaction_changes_in_a_row`; the int8 values and a scale the
+/// quantizer wrote come back as they were). A raw copy would write a
+/// segment whose codes differ from the one written until now, and the
+/// binary prescan of a search reads the codes. The file written here is
+/// the one `create_segment` wrote from the same rows, byte for byte.
+pub(crate) fn write_carried(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, u32)]) -> anyhow::Result<()> {
+    write_carried_as(path, dim, segs, order, f32_layout())
+}
+
+/// [`write_carried`] in the v2 layout when `f32_rows`.
+fn write_carried_as(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, u32)], f32_rows: bool) -> anyhow::Result<()> {
+    ensure!(dim > 0, "dim must be > 0");
+    ensure!(segs.iter().all(|s| s.dim == dim), "vector segments disagree on dim");
+    let dir = path.parent().unwrap_or(Path::new("."));
+    // one row at a time: as f32, as int8, as a code
+    let (mut v, mut q, mut code): (Vec<f32>, Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new(), Vec::new());
+    if f32_rows {
+        // the knob's f32 layout
+        let mut w = SegmentWriter::with_layout(dir, dim, true, ROWS_IN_MEMORY, SIDE_IN_MEMORY)?;
+        for &(s, r) in order {
+            let seg = segs[s as usize];
+            seg.row_into(r, &mut v);
+            w.push(&seg.row_meta(r), &v)?;
+        }
+        return w.finish(path);
+    }
+    let records = order.iter().map(|&(s, r)| segs[s as usize].metas.record_len(r) as u64).sum();
+    let shape = Shape { f32_rows: false, dim, n_rows: order.len(), records };
+    let mut codes = Spool::new(dir, "civec-codes", SIDE_IN_MEMORY);
+    shape.write(path, |section, out| {
+        match section {
+            Section::Metas => {
+                for &(s, r) in order {
+                    segs[s as usize].metas.write_record(r, out)?;
+                }
+            }
+            Section::Scales => {
+                for &(s, r) in order {
+                    let seg = segs[s as usize];
+                    let scale = match &seg.store {
+                        Storage::Quant(m) => requantized_scale(m.row(r as usize), m.scales()[r as usize]),
+                        _ => {
+                            seg.row_into(r, &mut v);
+                            quantize_into(&v, &mut q)
+                        }
+                    };
+                    out.write_all(&scale.to_le_bytes())?;
+                }
+            }
+            Section::Rows => {
+                for &(s, r) in order {
+                    segs[s as usize].row_into(r, &mut v);
+                    quantize_into(&v, &mut q);
+                    out.write_all(&q)?;
+                    encode_code_into(&v, &mut code);
+                    codes.write(&code)?;
+                }
+            }
+            Section::Codes => codes.copy_to(out)?,
+        }
+        Ok(())
+    })
 }
 
 /// `<segment>.tomb`: bincode `Vec<u32>` of tombstoned rows.
@@ -1511,6 +1837,176 @@ pub fn reap_stale(dir: &Path) {
                 _ => {}
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The writer before rows were streamed
+// ---------------------------------------------------------------------------
+
+/// What wrote segments before [`SegmentWriter`]: every row in memory, four
+/// vectors of their parts, the file in one buffer. Kept, as it was, for the
+/// tests that hold the streaming writers to the bytes it wrote. The
+/// `INDEXIO_VEC_F32` knob is the `f32_rows` parameter here, so that a test
+/// does not set a variable the whole test process reads.
+#[cfg(test)]
+pub(crate) mod reference {
+    use super::*;
+
+    /// Per-row symmetric int8 quantisation: `(scale, q)` with `x ≈ q * scale`.
+    fn quantize_row(v: &[f32]) -> (f32, Vec<i8>) {
+        let amax = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        if amax == 0.0 {
+            return (0.0, vec![0; v.len()]);
+        }
+        let scale = amax / 127.0;
+        let inv = 127.0 / amax;
+        let q = v.iter().map(|&x| (x * inv).round().clamp(-127.0, 127.0) as i8).collect();
+        (scale, q)
+    }
+
+    /// Write one flat segment file at `path` (tmp+rename; no HNSW).
+    pub fn create_segment(
+        path: &Path,
+        dim: usize,
+        rows: Vec<(VecRowMeta, Vec<f32>)>,
+        f32_rows: bool,
+    ) -> anyhow::Result<()> {
+        ensure!(dim > 0, "dim must be > 0");
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("create vec dir {}", dir.display()))?;
+        }
+        if f32_rows {
+            // A/B knob: the older f32 layout (v2)
+            let mut vectors: Vec<f32> = Vec::with_capacity(rows.len() * dim);
+            let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
+            let mut metas = Vec::with_capacity(rows.len());
+            for (m, v) in rows {
+                ensure!(v.len() == dim, "row {:?} has dim {}, expected {dim}", m.path, v.len());
+                codes.extend(encode_code(&v));
+                vectors.extend_from_slice(&v);
+                metas.push(m);
+            }
+            let idx = VecIndex {
+                path: path.to_path_buf(),
+                dim,
+                metas: MetaStore::owned(metas),
+                store: Storage::Owned { vectors, codes },
+                tombstones: BTreeSet::new(),
+                hnsw: None,
+            };
+            idx.write_file()?;
+            let side = tomb_side_path(path);
+            if side.exists() {
+                fs::remove_file(&side).ok();
+            }
+            return Ok(());
+        }
+        // v3: int8 rows with a per-row scale
+        let mut scales: Vec<u8> = Vec::with_capacity(rows.len() * 4);
+        let mut qrows: Vec<u8> = Vec::with_capacity(rows.len() * dim);
+        let mut codes: Vec<u8> = Vec::with_capacity(rows.len() * dim.div_ceil(8));
+        let mut metas = Vec::with_capacity(rows.len());
+        for (m, v) in rows {
+            ensure!(v.len() == dim, "row {:?} has dim {}, expected {dim}", m.path, v.len());
+            codes.extend(encode_code(&v));
+            let (scale, q) = quantize_row(&v);
+            scales.extend_from_slice(&scale.to_le_bytes());
+            qrows.extend(q.into_iter().map(|x| x as u8));
+            metas.push(m);
+        }
+        let metas_bytes = bincode::serialize(&metas)?;
+        let tombs = bincode::serialize(&Vec::<u32>::new())?;
+        let header_len = 8 + 4 + 4 + 4 + 8;
+        let scale_off = align8(header_len + metas_bytes.len());
+        let code_off = align8(scale_off + scales.len() + qrows.len());
+        let mut out = Vec::with_capacity(code_off + codes.len() + 8 + tombs.len());
+        out.extend_from_slice(MAGIC_V3);
+        out.extend_from_slice(&(dim as u32).to_le_bytes());
+        out.extend_from_slice(&(metas.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(metas_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&metas_bytes);
+        out.resize(scale_off, 0);
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&qrows);
+        out.resize(code_off, 0);
+        out.extend_from_slice(&codes);
+        out.extend_from_slice(&(tombs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&tombs);
+        let tmp = path.with_extension("civec.tmp");
+        {
+            let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(&out)?;
+            f.sync_all().ok();
+        }
+        fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+        let side = tomb_side_path(path);
+        if side.exists() {
+            fs::remove_file(&side).ok();
+        }
+        Ok(())
+    }
+
+    /// Where the per-row sections of a v3 file lie: (scales, rows, codes).
+    pub fn v3_sections(file: &[u8]) -> (usize, usize, usize) {
+        assert_eq!(&file[..8], MAGIC_V3);
+        let dim = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(file[12..16].try_into().unwrap()) as usize;
+        let meta_len = u64::from_le_bytes(file[20..28].try_into().unwrap()) as usize;
+        let scale_off = align8(28 + meta_len);
+        let q_off = scale_off + 4 * n;
+        (scale_off, q_off, align8(q_off + n * dim))
+    }
+
+    /// What a v3 segment file written by the quantizer becomes when a
+    /// compaction takes its rows, in place, through f32 (`row_vector`) and
+    /// the quantizer again. The trip is not the identity, and this is all
+    /// of what it changes:
+    ///
+    ///  - the binary code is derived again from the int8 values, so the bit
+    ///    of a component stored as zero is set whatever its sign was (the
+    ///    code written at embed time has it clear for a small negative one);
+    ///  - the scale becomes `(127 * scale) / 127` computed in f32. That is
+    ///    `scale` again for every scale the quantizer writes (`amax / 127`:
+    ///    checked over all the f32 of a binade); one in 129 of the other
+    ///    f32 comes back one ulp away.
+    ///
+    /// Header, metadata, int8 values, padding and tail stay as they are.
+    /// Returns the file after the trip, the scales that moved and the code
+    /// bits that were set; panics if the file holds anything the two rules
+    /// do not cover (a scale more than one ulp away, a bit cleared).
+    pub fn through_f32(file: &[u8]) -> (Vec<u8>, usize, usize) {
+        let dim = u32::from_le_bytes(file[8..12].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(file[12..16].try_into().unwrap()) as usize;
+        let code_bytes = dim.div_ceil(8);
+        let (scale_off, q_off, code_off) = v3_sections(file);
+        let mut out = file.to_vec();
+        let (mut scales_moved, mut bits_set) = (0usize, 0usize);
+        for row in 0..n {
+            let at = scale_off + 4 * row;
+            let scale = f32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+            let q = &file[q_off + row * dim..q_off + (row + 1) * dim];
+            let x: Vec<f32> = q.iter().map(|&b| b as i8 as f32 * scale).collect();
+            let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let again = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+            if again.to_bits() != scale.to_bits() {
+                assert_eq!((i64::from(again.to_bits()) - i64::from(scale.to_bits())).abs(), 1, "row {row}: more than one ulp");
+                scales_moved += 1;
+            }
+            out[at..at + 4].copy_from_slice(&again.to_le_bytes());
+            for (i, v) in x.iter().enumerate() {
+                let (byte, bit) = (code_off + row * code_bytes + i / 8, 1u8 << (i % 8));
+                let stored = out[byte] & bit != 0;
+                if *v >= 0.0 && !stored {
+                    assert_eq!(q[i], 0, "row {row}: only a component stored as zero changes sign");
+                    out[byte] |= bit;
+                    bits_set += 1;
+                }
+                assert!(*v >= 0.0 || !stored, "row {row}: a set bit is never cleared");
+            }
+        }
+        (out, scales_moved, bits_set)
     }
 }
 
@@ -2268,5 +2764,298 @@ mod tests {
         assert!(reg.get(p, (12, Some(later))).is_none());
         reg.put(q, (1, Some(t)), &seg);
         assert_eq!(reg.open.lock().unwrap().len(), 1);
+    }
+
+    // ---- the streaming writers against the writer they replace ------------
+
+    /// Rows that reach the corners of the quantizer: all-zero rows,
+    /// components of both signs that round to zero, very large and very
+    /// small rows, negative zero.
+    fn awkward_rows(n: usize, dim: usize, seed: u64) -> Vec<(VecRowMeta, Vec<f32>)> {
+        let mut rows = varied_rows(n, dim, seed);
+        for (i, (_, v)) in rows.iter_mut().enumerate() {
+            match i % 7 {
+                1 => v.iter_mut().for_each(|x| *x = 0.0),
+                2 => v.iter_mut().step_by(3).for_each(|x| *x *= 1e-4),
+                3 => v.iter_mut().for_each(|x| *x *= 1e20),
+                4 => v.iter_mut().for_each(|x| *x *= 1e-30),
+                5 => {
+                    v[0] = -0.0;
+                    if dim > 1 {
+                        v[1] = f32::MIN_POSITIVE;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    /// Extensions of the files in `dir`, sorted.
+    fn extensions(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A segment written a row at a time is, byte for byte, the segment the
+    /// in-memory writer built from the same rows: int8 and f32 layout,
+    /// sections kept in memory and sections spooled to scratch files.
+    #[test]
+    fn streamed_segments_are_the_segments_built_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for (case, (n, dim)) in [(0usize, 8usize), (1, 1), (3, 13), (257, 64), (2000, 100)].into_iter().enumerate() {
+            let rows = awkward_rows(n, dim, 40 + case as u64);
+            let (want_path, got_path) = (dir.join("want.civec"), dir.join("got.civec"));
+            for f32_rows in [false, true] {
+                reference::create_segment(&want_path, dim, rows.clone(), f32_rows).unwrap();
+                let want = fs::read(&want_path).unwrap();
+                assert_eq!(&want[..8], if f32_rows { MAGIC } else { MAGIC_V3 });
+                for (rows_mem, side_mem) in [(ROWS_IN_MEMORY, SIDE_IN_MEMORY), (0, 0), (1000, 50)] {
+                    let mut w = SegmentWriter::with_layout(dir, dim, f32_rows, rows_mem, side_mem).unwrap();
+                    for (i, (m, v)) in rows.iter().enumerate() {
+                        assert_eq!(w.push(&m.as_row(), v).unwrap(), i as u32);
+                    }
+                    assert_eq!(w.rows() as usize, n);
+                    assert_eq!(w.rows.on_disk(), n * dim * if f32_rows { 4 } else { 1 } > rows_mem);
+                    w.finish(&got_path).unwrap();
+                    assert!(fs::read(&got_path).unwrap() == want, "n={n} dim={dim} f32={f32_rows} in memory=({rows_mem}, {side_mem})");
+                }
+            }
+            // the wrapper callers with rows in hand use
+            reference::create_segment(&want_path, dim, rows.clone(), false).unwrap();
+            VecIndex::create_segment(&got_path, dim, rows).unwrap();
+            assert!(fs::read(&got_path).unwrap() == fs::read(&want_path).unwrap(), "create_segment, n={n} dim={dim}");
+            // and it opens
+            assert_eq!(VecIndex::open_segment(&got_path).unwrap().raw_len(), n);
+        }
+        // nothing but the segments is left: no temp file, no scratch file
+        assert_eq!(extensions(dir), ["civec"]);
+        // a row of the wrong size is refused as before
+        let mut w = SegmentWriter::new(dir, 4).unwrap();
+        let m = meta("r", "a.rs");
+        let err = w.push(&m.as_row(), &[0.0; 3]).unwrap_err().to_string();
+        assert_eq!(err, "row \"a.rs\" has dim 3, expected 4");
+        assert!(SegmentWriter::new(dir, 0).is_err());
+    }
+
+    /// A row copied from an earlier one is that vector pushed again.
+    #[test]
+    fn a_row_copied_from_an_earlier_one_is_its_vector_pushed_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (n, dim) = (600usize, 48usize);
+        let base = awkward_rows(n, dim, 77);
+        // every third row repeats the vector of row i/2 (itself a repeat at times)
+        let earlier = |i: usize| (i % 3 == 2).then_some(i / 2);
+        let mut rows: Vec<(VecRowMeta, Vec<f32>)> = Vec::with_capacity(n);
+        for (i, (meta, own)) in base.iter().enumerate() {
+            let v = match earlier(i) {
+                Some(j) => rows[j].1.clone(),
+                None => own.clone(),
+            };
+            rows.push((meta.clone(), v));
+        }
+        let (want_path, got_path) = (dir.join("want.civec"), dir.join("got.civec"));
+        for f32_rows in [false, true] {
+            reference::create_segment(&want_path, dim, rows.clone(), f32_rows).unwrap();
+            let want = fs::read(&want_path).unwrap();
+            for in_memory in [ROWS_IN_MEMORY, 0, 4096] {
+                let mut w = SegmentWriter::with_layout(dir, dim, f32_rows, in_memory, in_memory).unwrap();
+                for (i, (m, v)) in rows.iter().enumerate() {
+                    let row = match earlier(i) {
+                        Some(j) => w.push_copy_of(&m.as_row(), j as u32).unwrap(),
+                        None => w.push(&m.as_row(), v).unwrap(),
+                    };
+                    assert_eq!(row, i as u32);
+                }
+                assert!(w.push_copy_of(&rows[0].0.as_row(), n as u32).is_err(), "a row not written yet");
+                w.finish(&got_path).unwrap();
+                assert!(fs::read(&got_path).unwrap() == want, "f32={f32_rows} in memory={in_memory}");
+            }
+        }
+        assert_eq!(extensions(dir), ["civec"]);
+    }
+
+    /// Scales no writer produces, for rows a compaction must still carry
+    /// the way it always did.
+    const ODD_SCALES: [f32; 9] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.25, 0.0, -0.0, 1e-42, f32::MAX, f32::MIN_POSITIVE];
+
+    /// A v3 segment at `path` whose stored rows are not all what the
+    /// quantizer writes: some scales replaced by [`ODD_SCALES`], some rows
+    /// scaled down so that their largest value is under 127, a -128.
+    fn odd_segment(path: &Path, n: usize, dim: usize, seed: u64) -> VecIndex {
+        VecIndex::create_segment(path, dim, awkward_rows(n, dim, seed)).unwrap();
+        let mut bytes = fs::read(path).unwrap();
+        let (scale_off, q_off, _) = reference::v3_sections(&bytes);
+        for row in 0..n {
+            match row % 5 {
+                1 => {
+                    let odd = ODD_SCALES[(row / 5) % ODD_SCALES.len()];
+                    bytes[scale_off + 4 * row..scale_off + 4 * row + 4].copy_from_slice(&odd.to_le_bytes());
+                }
+                2 => {
+                    for b in &mut bytes[q_off + row * dim..q_off + (row + 1) * dim] {
+                        *b = ((*b as i8) / 3) as u8;
+                    }
+                }
+                3 => bytes[q_off + row * dim] = -128i8 as u8,
+                _ => {}
+            }
+        }
+        fs::write(path, &bytes).unwrap();
+        VecIndex::open_segment(path).unwrap()
+    }
+
+    /// A compaction writes the segment the compaction before it wrote from
+    /// the same rows: every row through f32 and the quantizer, here one at a
+    /// time instead of all of them held.
+    #[test]
+    fn carried_rows_are_quantized_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let dim = 96usize;
+        let mut segs: Vec<VecIndex> = Vec::new();
+        for (i, n) in [900usize, 1, 700].into_iter().enumerate() {
+            let p = dir.join(format!("m.d{i:013}.civec"));
+            VecIndex::create_segment(&p, dim, awkward_rows(n, dim, 500 + i as u64)).unwrap();
+            segs.push(VecIndex::open_segment(&p).unwrap());
+        }
+        segs.push(odd_segment(&dir.join("m.d0000000000009.civec"), 400, dim, 77));
+        let inputs: Vec<&VecIndex> = segs.iter().collect();
+        // most rows, in an order that mixes the segments
+        let mut order: Vec<(u32, u32)> = Vec::new();
+        for (s, seg) in segs.iter().enumerate() {
+            order.extend((0..seg.raw_len() as u32).filter(|r| r % 11 != 3).map(|r| (s as u32, r)));
+        }
+        let mut rng = Rng(0xABCD);
+        for i in (1..order.len()).rev() {
+            let j = (((rng.next_f32() + 1.0) / 2.0) * (i + 1) as f32) as usize;
+            order.swap(i, j.min(i));
+        }
+        let (new_path, old_path) = (dir.join("new.civec"), dir.join("old.civec"));
+        write_carried(&new_path, dim, &inputs, &order).unwrap();
+        let held: Vec<(VecRowMeta, Vec<f32>)> = order
+            .iter()
+            .map(|&(s, r)| (segs[s as usize].row_meta(r).to_owned_meta(), segs[s as usize].row_vector(r)))
+            .collect();
+        reference::create_segment(&old_path, dim, held, false).unwrap();
+        assert!(fs::read(&new_path).unwrap() == fs::read(&old_path).unwrap(), "a compaction wrote other bytes than before");
+        // no row carried: an empty segment, as before
+        write_carried(&new_path, dim, &inputs, &[]).unwrap();
+        reference::create_segment(&old_path, dim, Vec::new(), false).unwrap();
+        assert!(fs::read(&new_path).unwrap() == fs::read(&old_path).unwrap());
+        drop(segs);
+        fs::remove_file(&new_path).unwrap();
+        fs::remove_file(&old_path).unwrap();
+        assert_eq!(extensions(dir), ["civec"], "a scratch file was left");
+    }
+
+    /// Why a compaction quantizes the rows it carries instead of copying
+    /// them: the first trip through f32 sets the code bits of the
+    /// components stored as zero and changes nothing else, and a copy would
+    /// leave them. After that trip a row is a fixed point.
+    #[test]
+    fn what_a_compaction_changes_in_a_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (n, dim) = (3000usize, 96usize);
+        let fresh = dir.join("fresh.civec");
+        VecIndex::create_segment(&fresh, dim, awkward_rows(n, dim, 4242)).unwrap();
+        let seg = VecIndex::open_segment(&fresh).unwrap();
+        let all: Vec<(u32, u32)> = (0..n as u32).map(|r| (0, r)).collect();
+        let once = dir.join("once.civec");
+        write_carried(&once, dim, &[&seg], &all).unwrap();
+        // every row in place: a copy of the rows would be the file itself
+        let (stored, carried) = (fs::read(&fresh).unwrap(), fs::read(&once).unwrap());
+        let (expect, scales_moved, bits_set) = reference::through_f32(&stored);
+        assert!(carried == expect, "a compaction changed more than the code bits of zero components");
+        assert!(bits_set > 0, "no row shows the change");
+        assert_eq!(scales_moved, 0, "a scale the quantizer wrote moved");
+        // the int8 values, which is where the scores come from, never change
+        let (_, q_off, code_off) = reference::v3_sections(&stored);
+        assert!(stored[q_off..code_off] == carried[q_off..code_off]);
+        // a second trip changes nothing
+        let once_seg = VecIndex::open_segment(&once).unwrap();
+        let twice = dir.join("twice.civec");
+        write_carried(&twice, dim, &[&once_seg], &all).unwrap();
+        assert!(fs::read(&twice).unwrap() == carried);
+        assert_eq!(reference::through_f32(&carried), (carried.clone(), 0, 0));
+    }
+
+    /// The scale of a carried row is worked out from its largest value
+    /// alone; it is the scale the quantizer returns for the whole row.
+    #[test]
+    fn requantized_scale_is_the_scale_of_the_row_quantized_again() {
+        let mut rng = Rng(99);
+        let mut scales: Vec<f32> = ODD_SCALES.to_vec();
+        scales.extend((0..400).map(|i| (rng.next_f32().abs() + 1e-3) * 10f32.powi(i % 60 - 40)));
+        scales.extend((0..200u32).map(|i| f32::from_bits(0x3C00_0000 + i * 37)));
+        let mut q = Vec::new();
+        for (i, &scale) in scales.iter().enumerate() {
+            for top in [0i8, 1, 2, 63, 100, 126, 127, -127, -128] {
+                let mut row: Vec<i8> = (0..24).map(|_| (rng.next_f32() * f32::from(top.unsigned_abs())) as i8).collect();
+                row[i % 24] = top;
+                let as_f32: Vec<f32> = row.iter().map(|&x| x as f32 * scale).collect();
+                let want = quantize_into(&as_f32, &mut q);
+                assert_eq!(requantized_scale(&row, scale).to_bits(), want.to_bits(), "scale {scale:e}, largest value {top}");
+            }
+        }
+    }
+
+    /// Rows of f32 segments (v2 files, segments held in memory) are
+    /// quantized by a compaction exactly as before, and the f32 layout (the
+    /// A/B knob) is written exactly as before from any input.
+    #[test]
+    fn carried_f32_rows_are_quantized_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let dim = 40usize;
+        // a mapped v2 segment, a segment built in memory, a mapped v3 segment
+        let v2_path = dir.join("m.d0000000000001.civec");
+        reference::create_segment(&v2_path, dim, awkward_rows(300, dim, 1), true).unwrap();
+        let mapped = VecIndex::open_segment(&v2_path).unwrap();
+        assert!(matches!(mapped.store, Storage::Mapped(_)));
+        let owned = VecIndex::create(&dir.join("owned"), "m", dim, awkward_rows(120, dim, 2)).unwrap();
+        assert!(matches!(owned.store, Storage::Owned { .. }) && !owned.metas.is_in_place());
+        let v3_path = dir.join("m.d0000000000003.civec");
+        VecIndex::create_segment(&v3_path, dim, awkward_rows(200, dim, 3)).unwrap();
+        let quant = VecIndex::open_segment(&v3_path).unwrap();
+
+        let carry = |inputs: &[&VecIndex], f32_rows: bool| -> (Vec<u8>, Vec<u8>) {
+            // rows of the inputs interleaved, a few left out
+            let mut order: Vec<(u32, u32)> = Vec::new();
+            let most = inputs.iter().map(|s| s.raw_len()).max().unwrap() as u32;
+            for r in 0..most {
+                for (s, seg) in inputs.iter().enumerate() {
+                    if (r as usize) < seg.raw_len() && r % 9 != 4 {
+                        order.push((s as u32, r));
+                    }
+                }
+            }
+            let (new_path, old_path) = (dir.join("new.civec"), dir.join("old.civec"));
+            write_carried_as(&new_path, dim, inputs, &order, f32_rows).unwrap();
+            let through_f32: Vec<(VecRowMeta, Vec<f32>)> = order
+                .iter()
+                .map(|&(s, r)| (inputs[s as usize].row_meta(r).to_owned_meta(), inputs[s as usize].row_vector(r)))
+                .collect();
+            reference::create_segment(&old_path, dim, through_f32, f32_rows).unwrap();
+            (fs::read(&new_path).unwrap(), fs::read(&old_path).unwrap())
+        };
+        // f32 inputs into an int8 segment
+        let (new, old) = carry(&[&mapped, &owned], false);
+        assert!(new == old, "f32 rows quantized differently");
+        assert_eq!(&new[..8], MAGIC_V3);
+        // any input into the f32 layout
+        let (new, old) = carry(&[&mapped, &owned, &quant], true);
+        assert!(new == old, "the f32 layout differs");
+        assert_eq!(&new[..8], MAGIC);
     }
 }

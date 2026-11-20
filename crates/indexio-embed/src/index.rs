@@ -1131,6 +1131,53 @@ fn file_stamp(p: &Path) -> (u64, Option<std::time::SystemTime>) {
     }
 }
 
+/// The segments this process has open, by path.
+///
+/// The writers open the plane on their own (`pipeline::open_sets`: every
+/// incremental embed, the coverage repair, a compaction, `index_stats`)
+/// next to a query engine that already holds each of its segments, and
+/// opening an immutable file a second time bought nothing. A set being
+/// opened takes a segment from here when the file at that path still has
+/// the length and mtime the segment was opened at: the rule `reopen_paths`
+/// applies to the caller's previous set, extended to every set alive in
+/// the process.
+///
+/// Only the immutable part is shared. The segment list is listed and the
+/// tombstone side files are read on every open, so a set is as fresh as
+/// one opened from nothing; a writer still sees every row another server
+/// tombstoned or appended. Entries are weak: a segment is unmapped when the
+/// last set holding it goes, exactly as before.
+pub(crate) struct OpenSegments<T> {
+    open: std::sync::Mutex<Vec<(PathBuf, (u64, Option<std::time::SystemTime>), std::sync::Weak<T>)>>,
+}
+
+impl<T> OpenSegments<T> {
+    pub(crate) const fn new() -> Self {
+        OpenSegments { open: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// The open segment of the file at `path`, if it was opened at `stamp`.
+    /// A file that could not be stat'ed matches nothing.
+    pub(crate) fn get(&self, path: &Path, stamp: (u64, Option<std::time::SystemTime>)) -> Option<Arc<T>> {
+        stamp.1?;
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        open.iter().find(|(p, st, _)| p == path && *st == stamp).and_then(|(_, _, seg)| seg.upgrade())
+    }
+
+    /// Record `seg`, just opened from `path` at `stamp`; an older segment
+    /// of that path and entries whose segment is gone are dropped.
+    pub(crate) fn put(&self, path: &Path, stamp: (u64, Option<std::time::SystemTime>), seg: &Arc<T>) {
+        if stamp.1.is_none() {
+            return;
+        }
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        open.retain(|(p, _, s)| s.strong_count() > 0 && p != path);
+        open.push((path.to_path_buf(), stamp, Arc::downgrade(seg)));
+    }
+}
+
+static OPEN_SEGMENTS: OpenSegments<VecIndex> = OpenSegments::new();
+
 impl VecSet {
     /// Open every segment; `Ok(None)` when the model has no segment yet.
     pub fn open(dir: &Path, model_id: &str) -> anyhow::Result<Option<Self>> {
@@ -1138,7 +1185,8 @@ impl VecSet {
     }
 
     /// Open the current segment list, reusing `prev`'s parsed segments
-    /// whose files are byte-identical (same length and mtime).
+    /// whose files are byte-identical (same length and mtime), then those
+    /// of any other set open in this process ([`OpenSegments`]).
     pub fn reopen(prev: Option<&VecSet>, dir: &Path, model_id: &str) -> anyhow::Result<Option<Self>> {
         Self::reopen_paths(prev, dir, model_id, &segment_paths(dir, model_id))
     }
@@ -1158,21 +1206,27 @@ impl VecSet {
         let mut tombs = Vec::with_capacity(paths.len());
         for (i, p) in paths.iter().enumerate() {
             let stamp = file_stamp(p);
-            let reused = prev.and_then(|pv| {
-                pv.segs
-                    .iter()
-                    .zip(&pv.stamps)
-                    .find(|(s, st)| s.path() == p.as_path() && **st == stamp)
-                    .map(|(s, _)| std::sync::Arc::clone(s))
-            });
+            let reused = prev
+                .and_then(|pv| {
+                    pv.segs
+                        .iter()
+                        .zip(&pv.stamps)
+                        .find(|(s, st)| s.path() == p.as_path() && **st == stamp)
+                        .map(|(s, _)| std::sync::Arc::clone(s))
+                })
+                .or_else(|| OPEN_SEGMENTS.get(p, stamp));
             let seg = match reused {
                 Some(s) => s,
-                None => std::sync::Arc::new(if i == 0 && p == &VecIndex::file_path(dir, model_id) {
-                    // the legacy base may carry an HNSW sidecar
-                    VecIndex::open(dir, model_id)?.ok_or_else(|| anyhow!("{} vanished", p.display()))?
-                } else {
-                    VecIndex::open_segment(p)?
-                }),
+                None => {
+                    let seg = std::sync::Arc::new(if i == 0 && p == &VecIndex::file_path(dir, model_id) {
+                        // the legacy base may carry an HNSW sidecar
+                        VecIndex::open(dir, model_id)?.ok_or_else(|| anyhow!("{} vanished", p.display()))?
+                    } else {
+                        VecIndex::open_segment(p)?
+                    });
+                    OPEN_SEGMENTS.put(p, stamp, &seg);
+                    seg
+                }
             };
             let mut t = seg.tombstones().clone();
             t.extend(read_tomb_side(p));
@@ -2094,5 +2148,72 @@ mod tests {
         for seg in 0..3 {
             assert_eq!(set.offset(seg), set.segments()[..seg].iter().map(|s| s.raw_len() as u32).sum::<u32>());
         }
+    }
+    /// Sets opened while another set holds a segment share it; what makes a
+    /// set fresh (the segment list, the tombstone side files) is still read
+    /// on every open.
+    #[test]
+    fn sets_share_open_segments_and_stay_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..2u64 {
+            VecIndex::create_segment(&tmp.path().join(format!("m.d{i:013}.civec")), 8, varied_rows(60, 8, 20 + i)).unwrap();
+        }
+        let open = || VecSet::open(tmp.path(), "m").unwrap().unwrap();
+        let a = open();
+        let b = open();
+        assert!((0..2).all(|i| Arc::ptr_eq(&a.segments()[i], &b.segments()[i])), "the second set re-opened a segment");
+
+        // rows tombstoned through one set: the next open sees them, the
+        // sets opened before keep their own view
+        let doomed: std::collections::HashSet<u32> = [0, 5, a.offset(1) + 2].into_iter().collect();
+        a.tombstone_on_disk(&doomed).unwrap();
+        let c = open();
+        assert!(Arc::ptr_eq(&a.segments()[0], &c.segments()[0]));
+        assert_eq!(c.len(), a.len() - 3);
+        assert!(doomed.iter().all(|&g| c.is_deleted(g) && !a.is_deleted(g) && !b.is_deleted(g)));
+        let q = norm(vec![0.3, -0.2, 0.9, 0.1, 0.0, 0.4, -0.7, 0.2]);
+        assert!(c.search(&q, 120).iter().all(|(g, _)| !doomed.contains(g)));
+
+        // a segment written since joins the shared ones
+        VecIndex::create_segment(&tmp.path().join("m.d0000000000002.civec"), 8, varied_rows(30, 8, 33)).unwrap();
+        let d = open();
+        assert_eq!((d.segments().len(), d.raw_len()), (3, 150));
+        assert!(Arc::ptr_eq(&a.segments()[1], &d.segments()[1]));
+        assert_eq!(d.len(), 147);
+
+        // nothing outlives the sets: the mapping goes with the last one
+        let seg0 = a.segments()[0].path().to_path_buf();
+        let stamp = file_stamp(&seg0);
+        assert!(OPEN_SEGMENTS.get(&seg0, stamp).is_some());
+        drop((a, b, c, d));
+        assert!(OPEN_SEGMENTS.get(&seg0, stamp).is_none());
+        assert_eq!(open().len(), 147);
+    }
+
+    #[test]
+    fn open_segments_match_on_path_and_stamp() {
+        let reg: OpenSegments<String> = OpenSegments::new();
+        let t = std::time::SystemTime::now();
+        let later = t + std::time::Duration::from_secs(1);
+        let (p, q) = (Path::new("a.civec"), Path::new("b.civec"));
+        let seg = Arc::new("first".to_string());
+        reg.put(p, (10, Some(t)), &seg);
+        assert!(reg.get(p, (10, Some(t))).is_some_and(|s| Arc::ptr_eq(&s, &seg)));
+        assert!(reg.get(p, (11, Some(t))).is_none(), "another length is another file");
+        assert!(reg.get(p, (10, Some(later))).is_none(), "another mtime is another file");
+        assert!(reg.get(q, (10, Some(t))).is_none());
+        // a file that could not be stat'ed is neither recorded nor matched
+        reg.put(q, (0, None), &seg);
+        assert!(reg.get(q, (0, None)).is_none() && reg.get(p, (10, None)).is_none());
+        // a rewritten file replaces its entry
+        let newer = Arc::new("second".to_string());
+        reg.put(p, (12, Some(later)), &newer);
+        assert!(reg.get(p, (10, Some(t))).is_none());
+        assert!(reg.get(p, (12, Some(later))).is_some_and(|s| Arc::ptr_eq(&s, &newer)));
+        // entries are weak, and dead ones are dropped on the next insert
+        drop(newer);
+        assert!(reg.get(p, (12, Some(later))).is_none());
+        reg.put(q, (1, Some(t)), &seg);
+        assert_eq!(reg.open.lock().unwrap().len(), 1);
     }
 }

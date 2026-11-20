@@ -670,6 +670,10 @@ fn file_stamp(p: &Path) -> (u64, Option<std::time::SystemTime>) {
     }
 }
 
+/// The BM25 segments this process has open (see
+/// [`crate::index::OpenSegments`]: same rule, same freshness).
+static OPEN_SEGMENTS: crate::index::OpenSegments<ChunkBm25> = crate::index::OpenSegments::new();
+
 impl Bm25Set {
     pub fn open(dir: &Path, ns: &str) -> anyhow::Result<Option<Self>> {
         Self::reopen(None, dir, ns)
@@ -691,16 +695,22 @@ impl Bm25Set {
         let mut tombs = Vec::with_capacity(paths.len());
         for p in paths {
             let stamp = file_stamp(p);
-            let reused = prev.and_then(|pv| {
-                pv.segs
-                    .iter()
-                    .zip(&pv.stamps)
-                    .find(|(s, st)| s.path() == p.as_path() && **st == stamp)
-                    .map(|(s, _)| std::sync::Arc::clone(s))
-            });
+            let reused = prev
+                .and_then(|pv| {
+                    pv.segs
+                        .iter()
+                        .zip(&pv.stamps)
+                        .find(|(s, st)| s.path() == p.as_path() && **st == stamp)
+                        .map(|(s, _)| std::sync::Arc::clone(s))
+                })
+                .or_else(|| OPEN_SEGMENTS.get(p, stamp));
             let seg = match reused {
                 Some(s) => s,
-                None => std::sync::Arc::new(ChunkBm25::open_path(p)?),
+                None => {
+                    let seg = std::sync::Arc::new(ChunkBm25::open_path(p)?);
+                    OPEN_SEGMENTS.put(p, stamp, &seg);
+                    seg
+                }
             };
             let mut t = seg.tombstones().clone();
             t.extend(crate::index::read_tomb_side(p));

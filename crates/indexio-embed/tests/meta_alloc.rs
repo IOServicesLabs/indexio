@@ -163,6 +163,12 @@ fn opening_a_segment_keeps_a_few_bytes_per_row() {
     assert!(cost.peak <= 12 * total + 32 * 1024, "set open peaks at {} bytes for {total} rows: {cost:?}", cost.peak);
     assert!(cost.allocs < 200, "set open made {} allocations for {total} rows", cost.allocs);
 
+    // a writer opening the plane while the engine holds it parses nothing
+    let (again, cost) = measure(|| VecSet::open(dir, "m").unwrap().unwrap());
+    assert_eq!(again.raw_len(), total);
+    assert!(cost.kept <= 16 * 1024 && cost.peak <= 32 * 1024, "a second open of the same segments cost {cost:?}");
+    drop(again);
+
     // the per-file view writers use instead of a walk over every row
     let (files, cost) = measure(|| set.live_files().count());
     assert!(files > total / 8);
@@ -205,8 +211,13 @@ fn measure_real_plane() {
         timed(&format!("Bm25Set open ({round}), {} rows", bset.raw_len()), &cost, t);
         if round == "warm" {
             let t = Instant::now();
-            let (again, cost) = measure(|| VecSet::reopen_paths(Some(&set), &data.join("vec"), &model, &pp.vec).unwrap().unwrap());
-            timed("VecSet reopen over the open set", &cost, t);
+            let (again, cost) = measure(|| {
+                (
+                    VecSet::reopen_paths(None, &data.join("vec"), &model, &pp.vec).unwrap().unwrap(),
+                    Bm25Set::reopen_paths(None, &pp.bm25).unwrap().unwrap(),
+                )
+            });
+            timed("both sets again while the first are open", &cost, t);
             drop(again);
             let t = Instant::now();
             let (files, cost) = measure(|| set.live_files().collect::<std::collections::HashSet<(&str, &str)>>());

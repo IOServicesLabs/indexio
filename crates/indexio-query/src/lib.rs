@@ -1769,13 +1769,13 @@ impl Engine {
     /// lookup). Stale rows (doc deleted since the embed run) return None.
     fn row_hit(&self, idx: &VecSet, row: u32, score: f32) -> Option<SearchHit> {
         let m = idx.row_meta(row);
-        let (si, docid) = self.locate_doc(&m.repo, &m.path)?;
+        let (si, docid) = self.locate_doc(m.repo, m.path)?;
         let dm = self.set.doc(si, docid)?;
         let content = self.cached_content(si, docid)?;
         let (line, snippet) = semantic_snippet(&content, m.start_line, m.end_line)?;
         Some(SearchHit {
-            repo: m.repo.clone(),
-            path: m.path.clone(),
+            repo: m.repo.to_string(),
+            path: m.path.to_string(),
             line,
             col: 0,
             snippet,
@@ -1890,7 +1890,15 @@ impl Engine {
             return Ok(Vec::new());
         };
         let rows = match repo {
-            Some(r) => bm.search_where(q, k, &|g| (g as usize) < idx.raw_len() && idx.row_meta(g).repo == r),
+            // the repo's rows as ranges of the row-aligned vector set: the
+            // filter runs once per scored row and decodes no metadata
+            Some(r) => {
+                let rows = idx.repo_rows(r);
+                bm.search_where(q, k, &|g| {
+                    let i = rows.partition_point(|x| x.end <= g);
+                    rows.get(i).is_some_and(|x| x.start <= g)
+                })
+            }
             None => bm.search(q, k),
         };
         let hits: Vec<SearchHit> = rows

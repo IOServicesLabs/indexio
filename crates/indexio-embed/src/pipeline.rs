@@ -414,16 +414,13 @@ pub fn unembedded_docs(shards: &ShardSet, data_dir: &Path, model_id: &str) -> an
     let Some((vset, _)) = open_sets(data_dir, model_id)? else {
         return Ok(Vec::new());
     };
-    let mut have: HashSet<(String, String)> = HashSet::new();
-    for row in vset.live_rows() {
-        let m = vset.row_meta(row);
-        have.insert((m.repo.clone(), m.path.clone()));
-    }
+    // one entry per file, borrowed from the segments: the rows are not walked
+    let have: HashSet<(&str, &str)> = vset.live_files().collect();
     Ok(shards
         .visible_docs()
         .into_iter()
         .map(|(si, _, dm)| (doc_repo(shards, si, dm.repo_id), dm.path))
-        .filter(|k| !have.contains(k))
+        .filter(|(repo, path)| !have.contains(&(repo.as_str(), path.as_str())))
         .collect())
 }
 
@@ -579,15 +576,26 @@ fn embed_incremental_inner(
     let requested: HashSet<&str> = repos.iter().map(String::as_str).collect();
 
     // Live rows of the requested repos, per file: (global row, chunk hash).
+    // Only the requested repos' runs are walked, file by file; a row is
+    // looked at (its hash alone) once its file passed the filters, so an
+    // edit of one file does not read the metadata of the whole plane.
     let mut existing: HashMap<(String, String), Vec<(u32, [u8; 16])>> = HashMap::new();
     if let Some((vset, _)) = &sets {
-        for row in vset.live_rows() {
-            let m = vset.row_meta(row);
-            if requested.contains(m.repo.as_str()) && only_paths.is_none_or(|p| p.contains(&m.path)) {
-                existing
-                    .entry((m.repo.clone(), m.path.clone()))
-                    .or_default()
-                    .push((row, m.chunk_hash));
+        for (i, seg) in vset.segments().iter().enumerate() {
+            let (off, dead) = (vset.offset(i), vset.dead(i));
+            for (repo, repo_rows) in seg.repo_runs() {
+                if !requested.contains(repo) {
+                    continue;
+                }
+                for (file, rows) in seg.file_runs(repo_rows) {
+                    if only_paths.is_some_and(|p| !p.contains(file.path)) {
+                        continue;
+                    }
+                    let mut live = rows.filter(|r| !dead.contains(r)).map(|r| (off + r, seg.row_hash(r))).peekable();
+                    if live.peek().is_some() {
+                        existing.entry((file.repo.to_string(), file.path.to_string())).or_default().extend(live);
+                    }
+                }
             }
         }
     }
@@ -799,13 +807,13 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
     for &i in &merge {
         let vs = &vset.segments()[i];
         let mut bs_rows = bset.rows_tf_of(i);
-        let off = vset_offset(&vset, i);
+        let off = vset.offset(i);
         for r in 0..vs.raw_len() as u32 {
             if vset.is_deleted(off + r) {
                 continue;
             }
             origin.push((i, r));
-            rows.push((vs.row_meta(r).clone(), vs.row_vector(r)));
+            rows.push((vs.row_meta(r).to_owned_meta(), vs.row_vector(r)));
             tf_rows.push(std::mem::take(&mut bs_rows[r as usize]));
         }
     }
@@ -876,11 +884,6 @@ pub fn compact_vectors_opts(data_dir: &Path, model_id: &str, force: bool) -> any
         "semantic segments compacted"
     );
     Ok(true)
-}
-
-/// Global id of segment `i`'s first row.
-fn vset_offset(v: &VecSet, i: usize) -> u32 {
-    v.segments()[..i].iter().map(|s| s.raw_len() as u32).sum()
 }
 
 /// Cross-process compaction lock: `<data_dir>/compact.lock`,
@@ -1268,7 +1271,7 @@ mod tests {
             }
             let m = idx.row_meta(row);
             if m.repo == "r1" {
-                r1_paths.push(m.path.as_str());
+                r1_paths.push(m.path);
             } else if m.repo == "r2" {
                 r2_count += 1;
             }

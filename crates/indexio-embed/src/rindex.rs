@@ -2038,7 +2038,7 @@ mod tests {
             "a/login.rs",
             "expanded query must surface the login chunk first: {:?}",
             hits.iter()
-                .map(|&(r, s)| (idx.row_meta(r).path.clone(), s))
+                .map(|&(r, s)| (idx.row_meta(r).path.to_string(), s))
                 .collect::<Vec<_>>()
         );
 

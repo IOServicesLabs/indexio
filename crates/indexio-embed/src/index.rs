@@ -22,11 +22,13 @@
 //! files stay readable; `create_with_options` (the HNSW full build) still
 //! writes v2 because the graph walks f32 rows.
 //!
-//! Opening a v2 file memory-maps it: the vector block is
-//! never copied, so opening a multi-GB index costs the meta parse only and
-//! a query touches just the binary codes plus the rescored candidates. The
-//! mapping is the crate's single `unsafe` site (`mapped`), under the same
-//! policy as indexio-index shards: the file is immutable after its atomic rename.
+//! Opening a v2 or v3 file memory-maps it: the vector block is never
+//! copied and the row metadata is read where it lies (`rowmeta`: one walk
+//! of the meta block at open, four heap bytes per row afterwards), so a
+//! multi-GB index costs a few MB of heap and a query touches just the
+//! binary codes plus the rescored candidates. The mapping is the crate's
+//! single `unsafe` site (`mapped`), under the same policy as indexio-index
+//! shards: the file is immutable after its atomic rename.
 //!
 //! Tombstones are a bincode sorted `Vec<u32>` rather than a
 //! `RoaringBitmap` to avoid a new dependency; the `.civec` file is a
@@ -38,16 +40,22 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::sync::OnceLock;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::bm25::Bytes;
 use crate::embed::dot;
 use crate::hnsw::{Hnsw, HnswOptions};
+use crate::rowmeta::{BlockError, MetaStore};
+
+pub use crate::rowmeta::RowMeta;
 
 const MAGIC_V1: &[u8; 8] = b"CIVEC001";
 const MAGIC: &[u8; 8] = b"CIVEC002";
@@ -148,13 +156,26 @@ fn hamming(a: &[u8], b: &[u8]) -> u32 {
 mod mapped {
     use std::fs::File;
     use std::io;
+    use std::sync::Arc;
 
     use memmap2::Mmap;
 
-    /// A read-only mapping of a v2 `.civec` with the offsets of its vector
-    /// and code blocks.
+    /// Map a `.civec` file read-only. The mapping is shared by the vector
+    /// blocks and the row metadata of the segment.
+    ///
+    /// # Safety (why this is sound)
+    /// `memmap2` is unsafe because another process could mutate the file
+    /// under the mapping. `.civec` files are written to a temp path and
+    /// atomically renamed into place; they are never modified in place
+    /// (tombstones go to a side file), so the mapping cannot be invalidated
+    /// by this crate's own writers.
+    pub fn map_file(file: &File) -> io::Result<Arc<Mmap>> {
+        Ok(Arc::new(unsafe { Mmap::map(file)? }))
+    }
+
+    /// The vector and code blocks of a mapped v2 `.civec`.
     pub struct MappedVectors {
-        map: Mmap,
+        map: Arc<Mmap>,
         vec_off: usize,
         n_f32: usize,
         code_off: usize,
@@ -162,24 +183,16 @@ mod mapped {
     }
 
     impl MappedVectors {
-        /// Map `file` and validate that `[vec_off, vec_off + 4*n_f32)` and
-        /// `[code_off, code_off + code_len)` lie inside it and that the
+        /// Validate that `[vec_off, vec_off + 4*n_f32)` and
+        /// `[code_off, code_off + code_len)` lie inside `map` and that the
         /// vector block is 4-byte aligned in memory.
-        ///
-        /// # Safety (why this is sound)
-        /// `memmap2` is unsafe because another process could mutate the file
-        /// under the mapping. `.civec` files are written to a temp path and
-        /// atomically renamed into place; they are never modified in place
-        /// (tombstone saves rewrite through the same rename), so the mapping
-        /// cannot be invalidated by this crate's own writers.
-        pub fn map(
-            file: &File,
+        pub fn new(
+            map: Arc<Mmap>,
             vec_off: usize,
             n_f32: usize,
             code_off: usize,
             code_len: usize,
         ) -> io::Result<Self> {
-            let map = unsafe { Mmap::map(file)? };
             let vec_end = vec_off
                 .checked_add(n_f32.checked_mul(4).ok_or_else(bad)?)
                 .ok_or_else(bad)?;
@@ -199,12 +212,8 @@ mod mapped {
             })
         }
 
-        pub fn bytes(&self) -> &[u8] {
-            &self.map[..]
-        }
-
         /// The vector block as `&[f32]` (little-endian file on a
-        /// little-endian host; alignment checked in `map`).
+        /// little-endian host; alignment checked in `new`).
         #[cfg(target_endian = "little")]
         pub fn vectors(&self) -> &[f32] {
             let ptr = self.map[self.vec_off..].as_ptr() as *const f32;
@@ -216,11 +225,10 @@ mod mapped {
         }
     }
 
-    /// A read-only mapping of a v3 `.civec`: per-row scales, int8 rows and
-    /// binary codes. Same soundness argument as
-    /// [`MappedVectors`].
+    /// The blocks of a mapped v3 `.civec`: per-row scales, int8 rows and
+    /// binary codes.
     pub struct MappedQuant {
-        map: Mmap,
+        map: Arc<Mmap>,
         scale_off: usize,
         q_off: usize,
         n_rows: usize,
@@ -230,8 +238,8 @@ mod mapped {
     }
 
     impl MappedQuant {
-        pub fn map(
-            file: &File,
+        pub fn new(
+            map: Arc<Mmap>,
             scale_off: usize,
             q_off: usize,
             n_rows: usize,
@@ -239,7 +247,6 @@ mod mapped {
             code_off: usize,
             code_len: usize,
         ) -> io::Result<Self> {
-            let map = unsafe { Mmap::map(file)? };
             let scale_end = scale_off.checked_add(n_rows.checked_mul(4).ok_or_else(bad)?).ok_or_else(bad)?;
             let q_end = q_off.checked_add(n_rows.checked_mul(dim).ok_or_else(bad)?).ok_or_else(bad)?;
             let code_end = code_off.checked_add(code_len).ok_or_else(bad)?;
@@ -250,10 +257,6 @@ mod mapped {
                 return Err(bad());
             }
             Ok(MappedQuant { map, scale_off, q_off, n_rows, dim, code_off, code_len })
-        }
-
-        pub fn bytes(&self) -> &[u8] {
-            &self.map[..]
         }
 
         #[cfg(target_endian = "little")]
@@ -279,7 +282,7 @@ mod mapped {
     }
 }
 
-use mapped::{MappedQuant, MappedVectors};
+use mapped::{map_file, MappedQuant, MappedVectors};
 
 /// Where the vector + code blocks live.
 enum Storage {
@@ -293,16 +296,34 @@ enum Storage {
 pub struct VecIndex {
     path: PathBuf,
     dim: usize,
-    metas: Vec<VecRowMeta>,
+    /// Row metadata (read in place for a mapped segment) with the runs of
+    /// consecutive rows of one file and of one repo: a compaction writes
+    /// rows grouped by repo, so a repo-scoped search scans one run instead
+    /// of testing every row.
+    metas: MetaStore,
     /// n_rows * dim f32 (row-major) and n_rows * ceil(dim/8) codes.
     store: Storage,
     tombstones: BTreeSet<u32>,
     /// HNSW ANN graph; `None` below threshold / when absent.
     hnsw: Option<Hnsw>,
-    /// Runs of consecutive rows with the same repo, `(repo, start, end)`
-    /// half-open: a compaction writes rows grouped by repo,
-    /// so a repo-scoped search scans one run instead of testing every row.
-    repo_runs: OnceLock<Vec<(String, u32, u32)>>,
+}
+
+/// The row metadata of a mapped segment: read in place from
+/// `map[at..at + len]`, or (a block too large for `u32` record offsets)
+/// deserialized as before. Errors are the ones the deserializer gave.
+fn open_metas(map: &Arc<Mmap>, at: usize, len: usize, n_rows: usize, path: &Path) -> anyhow::Result<MetaStore> {
+    let bad = || anyhow!("{}: corrupt .civec file", path.display());
+    let end = at.checked_add(len).filter(|&e| e <= map.len()).ok_or_else(bad)?;
+    match MetaStore::in_place(Bytes::Mapped { map: Arc::clone(map), start: at, end }, n_rows) {
+        Ok(m) => Ok(m),
+        Err(BlockError::Corrupt) => Err(bad()),
+        Err(BlockError::Count(_)) => Err(anyhow!("meta count != n_rows")),
+        Err(BlockError::TooLarge) => {
+            let metas: Vec<VecRowMeta> = bincode::deserialize(&map[at..end]).map_err(|_| bad())?;
+            ensure!(metas.len() == n_rows, "meta count != n_rows");
+            Ok(MetaStore::owned(metas))
+        }
+    }
 }
 
 impl VecIndex {
@@ -390,11 +411,10 @@ impl VecIndex {
         let idx = VecIndex {
             path: Self::file_path(dir, model_id),
             dim,
-            metas,
+            metas: MetaStore::owned(metas),
             store: Storage::Owned { vectors, codes },
             tombstones: BTreeSet::new(),
             hnsw: None,
-            repo_runs: OnceLock::new(),
         };
         idx.write_file()?;
 
@@ -429,13 +449,13 @@ impl VecIndex {
         let hpath = Self::hnsw_path(dir, model_id);
         idx.hnsw = if hpath.exists() {
             match Hnsw::load(&hpath) {
-                Ok(h) if h.n_nodes() == idx.metas.len() => Some(h),
+                Ok(h) if h.n_nodes() == idx.raw_len() => Some(h),
                 Ok(h) => {
                     tracing::warn!(
                         "{}: stale .cihnsw ({} nodes, {} rows) — ignoring",
                         hpath.display(),
                         h.n_nodes(),
-                        idx.metas.len()
+                        idx.raw_len()
                     );
                     None
                 }
@@ -485,14 +505,11 @@ impl VecIndex {
         let n_f32 = n_rows.checked_mul(dim).ok_or_else(bad)?;
         let code_off = vec_off + n_f32 * 4;
         let code_len = n_rows.checked_mul(dim.div_ceil(8)).ok_or_else(bad)?;
-        let mapped = MappedVectors::map(&file, vec_off, n_f32, code_off, code_len)
+        let map = map_file(&file).with_context(|| format!("map {}", path.display()))?;
+        let mapped = MappedVectors::new(Arc::clone(&map), vec_off, n_f32, code_off, code_len)
             .with_context(|| format!("map {}", path.display()))?;
-        let bytes = mapped.bytes();
-        let metas: Vec<VecRowMeta> = bincode::deserialize(
-            bytes.get(header_len..header_len + meta_len).ok_or_else(bad)?,
-        )
-        .map_err(|_| bad())?;
-        ensure!(metas.len() == n_rows, "meta count != n_rows");
+        let metas = open_metas(&map, header_len, meta_len, n_rows, &path)?;
+        let bytes = &map[..];
         let mut off = code_off + code_len;
         let tomb_len = u64::from_le_bytes(
             bytes.get(off..off + 8).ok_or_else(bad)?.try_into().unwrap(),
@@ -514,7 +531,6 @@ impl VecIndex {
             store: Storage::Mapped(mapped),
             tombstones,
             hnsw: None,
-            repo_runs: OnceLock::new(),
         })
     }
 
@@ -538,12 +554,11 @@ impl VecIndex {
         let q_off = scale_off + n_rows * 4;
         let code_off = align8(q_off + n_rows.checked_mul(dim).ok_or_else(bad)?);
         let code_len = n_rows.checked_mul(dim.div_ceil(8)).ok_or_else(bad)?;
-        let mapped = MappedQuant::map(&file, scale_off, q_off, n_rows, dim, code_off, code_len)
+        let map = map_file(&file).with_context(|| format!("map {}", path.display()))?;
+        let mapped = MappedQuant::new(Arc::clone(&map), scale_off, q_off, n_rows, dim, code_off, code_len)
             .with_context(|| format!("map {}", path.display()))?;
-        let bytes = mapped.bytes();
-        let metas: Vec<VecRowMeta> =
-            bincode::deserialize(bytes.get(header_len..header_len + meta_len).ok_or_else(bad)?).map_err(|_| bad())?;
-        ensure!(metas.len() == n_rows, "meta count != n_rows");
+        let metas = open_metas(&map, header_len, meta_len, n_rows, &path)?;
+        let bytes = &map[..];
         let mut off = code_off + code_len;
         let tomb_len = u64::from_le_bytes(bytes.get(off..off + 8).ok_or_else(bad)?.try_into().unwrap()) as usize;
         off += 8;
@@ -551,7 +566,7 @@ impl VecIndex {
         let mut tombstones: BTreeSet<u32> = tombs.into_iter().collect();
         ensure!(tombstones.len() == n_deleted, "n_deleted header != tombstone count");
         tombstones.extend(read_tomb_side(&path));
-        Ok(VecIndex { path, dim, metas, store: Storage::Quant(mapped), tombstones, hnsw: None, repo_runs: OnceLock::new() })
+        Ok(VecIndex { path, dim, metas, store: Storage::Quant(mapped), tombstones, hnsw: None })
     }
 
     /// Open one segment file by path (no HNSW sidecar lookup).
@@ -583,11 +598,10 @@ impl VecIndex {
             let idx = VecIndex {
                 path: path.to_path_buf(),
                 dim,
-                metas,
+                metas: MetaStore::owned(metas),
                 store: Storage::Owned { vectors, codes },
                 tombstones: BTreeSet::new(),
                 hnsw: None,
-                repo_runs: OnceLock::new(),
             };
             idx.write_file()?;
             let side = tomb_side_path(path);
@@ -692,11 +706,10 @@ impl VecIndex {
         Ok(VecIndex {
             path,
             dim,
-            metas,
+            metas: MetaStore::owned(metas),
             store: Storage::Owned { vectors, codes },
             tombstones,
             hnsw: None,
-            repo_runs: OnceLock::new(),
         })
     }
 
@@ -704,7 +717,7 @@ impl VecIndex {
     /// tmp+rename. Callers with a mapped store must drop the mapping first
     /// (`save_tombstones` does) — Windows refuses to replace a mapped file.
     fn write_file(&self) -> anyhow::Result<()> {
-        let metas = bincode::serialize(&self.metas)?;
+        let metas = self.metas.encode()?;
         let tombs: Vec<u32> = self.tombstones.iter().copied().collect();
         let tombs = bincode::serialize(&tombs)?;
         let vectors = self.vectors().ok_or_else(|| anyhow!("int8 segments are written by create_segment"))?;
@@ -715,7 +728,7 @@ impl VecIndex {
         let mut out = Vec::with_capacity(vec_off + vectors.len() * 4 + codes.len() + 8 + tombs.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
-        out.extend_from_slice(&(self.metas.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.raw_len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.tombstones.len() as u32).to_le_bytes());
         out.extend_from_slice(&(metas.len() as u64).to_le_bytes());
         out.extend_from_slice(&metas);
@@ -757,23 +770,23 @@ impl VecIndex {
         self.search_where(q, k, dead, &|_| true)
     }
 
-    /// Runs of same-repo rows (computed once from the metas).
-    fn repo_runs(&self) -> &[(String, u32, u32)] {
-        self.repo_runs.get_or_init(|| {
-            let mut runs: Vec<(String, u32, u32)> = Vec::new();
-            for (i, m) in self.metas.iter().enumerate() {
-                match runs.last_mut() {
-                    Some((r, _, end)) if *r == m.repo => *end = i as u32 + 1,
-                    _ => runs.push((m.repo.clone(), i as u32, i as u32 + 1)),
-                }
-            }
-            runs
-        })
+    /// Runs of consecutive rows of one repo, in row order: `(repo, rows)`.
+    /// Found when the segment was opened; nothing is scanned here.
+    pub fn repo_runs(&self) -> impl Iterator<Item = (&str, Range<u32>)> + '_ {
+        self.metas.repo_runs().map(|rows| (self.metas.row(rows.start).repo, rows))
+    }
+
+    /// Runs of consecutive rows of one file inside `rows`, in row order:
+    /// the metadata of the run's first row (its `repo` and `path` are the
+    /// file's) and the run, clipped to `rows`. Writers lay rows out file by
+    /// file, so this visits each file of the range once, not each row.
+    pub fn file_runs(&self, rows: Range<u32>) -> impl Iterator<Item = (RowMeta<'_>, Range<u32>)> + '_ {
+        self.metas.file_runs(rows).map(|run| (self.metas.row(run.start), run))
     }
 
     /// Rows of `repo` as runs; `None` when the repo has no rows here.
     fn repo_ranges(&self, repo: &str) -> Option<Vec<(u32, u32)>> {
-        let v: Vec<(u32, u32)> = self.repo_runs().iter().filter(|(r, _, _)| r == repo).map(|&(_, s, e)| (s, e)).collect();
+        let v: Vec<(u32, u32)> = self.repo_runs().filter(|(r, _)| *r == repo).map(|(_, rows)| (rows.start, rows.end)).collect();
         (!v.is_empty()).then_some(v)
     }
 
@@ -827,7 +840,7 @@ impl VecIndex {
     /// prescan pool is then made of matching rows only, instead of a
     /// post-filter over a pool that a large corpus fills with other repos).
     pub fn search_where(&self, q: &[f32], k: usize, dead: &BTreeSet<u32>, keep: &(dyn Fn(u32) -> bool + Sync)) -> Vec<(u32, f32)> {
-        let n = self.metas.len();
+        let n = self.raw_len();
         let live = n.saturating_sub(self.tombstones.len().max(dead.len()));
         if k == 0 || live == 0 || q.len() != self.dim {
             return Vec::new();
@@ -906,8 +919,16 @@ impl VecIndex {
         scored
     }
 
-    pub fn row_meta(&self, row: u32) -> &VecRowMeta {
-        &self.metas[row as usize]
+    /// Metadata of `row`, borrowed from the segment (decoded from the
+    /// mapping on each call: keep it out of loops over every row, see
+    /// [`file_runs`](Self::file_runs) and [`row_hash`](Self::row_hash)).
+    pub fn row_meta(&self, row: u32) -> RowMeta<'_> {
+        self.metas.row(row)
+    }
+
+    /// The chunk hash of `row`, without decoding the rest of its metadata.
+    pub fn row_hash(&self, row: u32) -> [u8; 16] {
+        self.metas.hash(row)
     }
 
     /// Rows tombstoned inside the file or its side file at open time.
@@ -916,11 +937,11 @@ impl VecIndex {
     }
 
     /// Tombstone every row matching `pred`. Returns rows newly deleted.
-    pub fn delete_where(&mut self, pred: impl Fn(&VecRowMeta) -> bool) -> u64 {
+    pub fn delete_where(&mut self, pred: impl Fn(&RowMeta<'_>) -> bool) -> u64 {
         let mut n = 0u64;
-        for (i, m) in self.metas.iter().enumerate() {
-            if !self.tombstones.contains(&(i as u32)) && pred(m) {
-                self.tombstones.insert(i as u32);
+        for row in 0..self.raw_len() as u32 {
+            if !self.tombstones.contains(&row) && pred(&self.metas.row(row)) {
+                self.tombstones.insert(row);
                 n += 1;
             }
         }
@@ -1207,9 +1228,42 @@ impl VecSet {
         (i, row - self.offsets[i])
     }
 
-    pub fn row_meta(&self, row: u32) -> &VecRowMeta {
+    /// Global id of segment `seg`'s first row.
+    pub fn offset(&self, seg: usize) -> u32 {
+        self.offsets[seg]
+    }
+
+    /// Tombstoned local rows of segment `seg` (in-file ∪ side file).
+    pub fn dead(&self, seg: usize) -> &BTreeSet<u32> {
+        &self.tombs[seg]
+    }
+
+    /// Metadata of a global row, borrowed from its segment.
+    pub fn row_meta(&self, row: u32) -> RowMeta<'_> {
         let (s, r) = self.locate(row);
         self.segs[s].row_meta(r)
+    }
+
+    /// `(repo, path)` of every file with a live row, from the segments'
+    /// file runs: a file is visited once per run, not once per row (a file
+    /// with rows in two segments comes up twice).
+    pub fn live_files(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.segs.iter().zip(&self.tombs).flat_map(|(seg, dead)| {
+            seg.file_runs(0..seg.raw_len() as u32)
+                .filter(move |(_, rows)| dead.range(rows.clone()).count() < rows.len())
+                .map(|(m, _)| (m.repo, m.path))
+        })
+    }
+
+    /// Global rows of `repo` as ascending, disjoint ranges (tombstoned
+    /// rows included): what a per-row `row_meta(g).repo == repo` test
+    /// selects, without decoding a row.
+    pub fn repo_rows(&self, repo: &str) -> Vec<Range<u32>> {
+        let mut out: Vec<Range<u32>> = Vec::new();
+        for (seg, &off) in self.segs.iter().zip(&self.offsets) {
+            out.extend(seg.repo_runs().filter(|(r, _)| *r == repo).map(|(_, rows)| off + rows.start..off + rows.end));
+        }
+        out
     }
 
     pub fn is_deleted(&self, row: u32) -> bool {
@@ -1237,7 +1291,15 @@ impl VecSet {
 
     /// Top-k over all segments (cosine scores are comparable across them).
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(u32, f32)> {
-        self.search_where(q, k, &|_| true)
+        let mut out: Vec<(u32, f32)> = Vec::new();
+        for (i, s) in self.segs.iter().enumerate() {
+            for (r, score) in s.search_excluding(q, k, &self.tombs[i]) {
+                out.push((self.offsets[i] + r, score));
+            }
+        }
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.truncate(k);
+        out
     }
 
     /// [`search`](Self::search) over the rows of `repo` only, walking each
@@ -1255,10 +1317,12 @@ impl VecSet {
     }
 
     /// [`search`](Self::search) over the rows whose meta satisfies `keep`.
-    pub fn search_where(&self, q: &[f32], k: usize, keep: &(dyn Fn(&VecRowMeta) -> bool + Sync)) -> Vec<(u32, f32)> {
+    /// Every row's metadata is decoded for the test: for a repo filter use
+    /// [`search_repo`](Self::search_repo), which walks that repo's runs.
+    pub fn search_where(&self, q: &[f32], k: usize, keep: &(dyn Fn(&RowMeta<'_>) -> bool + Sync)) -> Vec<(u32, f32)> {
         let mut out: Vec<(u32, f32)> = Vec::new();
         for (i, s) in self.segs.iter().enumerate() {
-            let pred = |r: u32| keep(s.row_meta(r));
+            let pred = |r: u32| keep(&s.row_meta(r));
             for (r, score) in s.search_where(q, k, &self.tombs[i], &pred) {
                 out.push((self.offsets[i] + r, score));
             }
@@ -1269,11 +1333,11 @@ impl VecSet {
     }
 
     /// Tombstone every live row matching `pred`; returns rows newly deleted.
-    pub fn delete_where(&mut self, pred: impl Fn(&VecRowMeta) -> bool) -> u64 {
+    pub fn delete_where(&mut self, pred: impl Fn(&RowMeta<'_>) -> bool) -> u64 {
         let mut n = 0u64;
         for (i, s) in self.segs.iter().enumerate() {
             for r in 0..s.raw_len() as u32 {
-                if !self.tombs[i].contains(&r) && pred(s.row_meta(r)) {
+                if !self.tombs[i].contains(&r) && pred(&s.row_meta(r)) {
                     self.tombs[i].insert(r);
                     n += 1;
                 }
@@ -1450,7 +1514,7 @@ mod tests {
         let idx = VecIndex::create(tmp.path(), "hash-v1", 4, rows.clone()).unwrap();
         assert_eq!(idx.len(), 4);
         let hits = idx.search(&q, 3);
-        let got: Vec<&str> = hits.iter().map(|(r, _)| idx.row_meta(*r).path.as_str()).collect();
+        let got: Vec<&str> = hits.iter().map(|(r, _)| idx.row_meta(*r).path).collect();
         assert_eq!(got, expected, "planted nearest neighbor must rank first");
         assert!(hits[0].1 > hits[1].1 && hits[1].1 > hits[2].1);
 
@@ -1459,7 +1523,7 @@ mod tests {
         assert_eq!(idx2.len(), 4);
         let hits2 = idx2.search(&q, 3);
         let got2: Vec<&str> =
-            hits2.iter().map(|(r, _)| idx2.row_meta(*r).path.as_str()).collect();
+            hits2.iter().map(|(r, _)| idx2.row_meta(*r).path).collect();
         assert_eq!(got2, expected, "ordering must survive reopen");
 
         // Absent index -> Ok(None); k > n -> n results.
@@ -1504,7 +1568,7 @@ mod tests {
         assert!(agree_top1 >= 19, "top-1 agreement {agree_top1}/20");
         assert!(overlap >= 196, "top-{k} overlap {overlap}/200");
         // exact round-trip: dequantise -> requantise gives the same bytes
-        let carried: Vec<(VecRowMeta, Vec<f32>)> = (0..n as u32).map(|r| (idx.row_meta(r).clone(), idx.row_vector(r))).collect();
+        let carried: Vec<(VecRowMeta, Vec<f32>)> = (0..n as u32).map(|r| (idx.row_meta(r).to_owned_meta(), idx.row_vector(r))).collect();
         let seg2 = tmp.path().join("m.d2.civec");
         VecIndex::create_segment(&seg2, dim, carried).unwrap();
         let idx2 = VecIndex::open_segment(&seg2).unwrap();
@@ -1531,7 +1595,7 @@ mod tests {
         let seg = tmp.path().join("m.d1.civec");
         VecIndex::create_segment(&seg, dim, rows.clone()).unwrap();
         let idx = VecIndex::open_segment(&seg).unwrap();
-        assert_eq!(idx.repo_runs().len(), 12);
+        assert_eq!(idx.repo_runs().count(), 12);
         assert_eq!(idx.repo_ranges("b").unwrap().len(), 4);
         assert!(idx.repo_ranges("zzz").is_none());
         let dead = BTreeSet::from([7u32, 51, 52]);
@@ -1836,7 +1900,7 @@ mod tests {
         let paths: Vec<&str> = idx
             .search(&q, 4)
             .iter()
-            .map(|(r, _)| idx.row_meta(*r).path.as_str())
+            .map(|(r, _)| idx.row_meta(*r).path)
             .collect();
         assert_eq!(paths, ["a.rs", "d.rs"]);
         // Re-deleting is a no-op.
@@ -1851,8 +1915,184 @@ mod tests {
         let paths2: Vec<&str> = idx2
             .search(&q, 4)
             .iter()
-            .map(|(r, _)| idx2.row_meta(*r).path.as_str())
+            .map(|(r, _)| idx2.row_meta(*r).path)
             .collect();
         assert_eq!(paths2, ["a.rs", "d.rs"]);
+    }
+
+    /// Rows the way writers lay them out (file by file) with empty and
+    /// non-ASCII repo and path strings.
+    fn varied_rows(n: usize, dim: usize, seed: u64) -> Vec<(VecRowMeta, Vec<f32>)> {
+        const REPOS: [&str; 4] = ["alpha", "", "dépôt", "仓库"];
+        const PATHS: [&str; 5] = ["src/lib.rs", "", "docs/überblick.md", "数据/模型.py", "🦀 dir/a b.rs"];
+        let mut rng = Rng(seed);
+        let mut out = Vec::with_capacity(n);
+        let mut file = 0usize;
+        while out.len() < n {
+            let repo = REPOS[(file / 7) % REPOS.len()];
+            let path = format!("{}{}", PATHS[file % PATHS.len()], if file % 3 == 0 { String::new() } else { file.to_string() });
+            for chunk in 0..1 + file % 4 {
+                if out.len() == n {
+                    break;
+                }
+                let v = norm((0..dim).map(|_| rng.next_f32()).collect());
+                out.push((
+                    VecRowMeta {
+                        chunk_hash: chunk_hash(format!("{repo}/{path}#{chunk}").as_bytes()),
+                        repo: repo.to_string(),
+                        path: path.clone(),
+                        start_line: chunk as u32 * 30 + 1,
+                        end_line: chunk as u32 * 30 + 30,
+                    },
+                    v,
+                ));
+            }
+            file += 1;
+        }
+        out
+    }
+
+    /// The metadata read in place from a mapped segment (v2 and v3) is the
+    /// metadata that was written, row for row, and the run tables agree
+    /// with the rows.
+    #[test]
+    fn mapped_row_meta_equals_what_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = varied_rows(700, 16, 0xfeed);
+        let want: Vec<VecRowMeta> = rows.iter().map(|(m, _)| m.clone()).collect();
+
+        // v3 (create_segment) and v2 (the full build's write_file)
+        let v3 = tmp.path().join("m.d0000000000001.civec");
+        VecIndex::create_segment(&v3, 16, rows.clone()).unwrap();
+        drop(VecIndex::create(tmp.path(), "v2", 16, rows).unwrap());
+        let opened = [VecIndex::open_segment(&v3).unwrap(), VecIndex::open(tmp.path(), "v2").unwrap().unwrap()];
+        for idx in &opened {
+            assert!(idx.metas.is_in_place(), "a mapped segment keeps no owned rows");
+            assert_eq!(idx.raw_len(), want.len());
+            for (r, w) in want.iter().enumerate() {
+                assert_eq!(idx.row_meta(r as u32), w.as_row(), "row {r}");
+                assert_eq!(idx.row_hash(r as u32), w.chunk_hash);
+            }
+            // file runs: consecutive, covering, one (repo, path) each
+            let mut next = 0u32;
+            for (m, run) in idx.file_runs(0..want.len() as u32) {
+                assert_eq!(run.start, next);
+                for r in run.clone() {
+                    assert_eq!((want[r as usize].repo.as_str(), want[r as usize].path.as_str()), (m.repo, m.path));
+                }
+                if let Some(after) = want.get(run.end as usize) {
+                    assert!(after.repo != m.repo || after.path != m.path, "run ended inside a file");
+                }
+                next = run.end;
+            }
+            assert_eq!(next as usize, want.len());
+            // repo runs
+            let mut next = 0u32;
+            for (repo, run) in idx.repo_runs() {
+                assert_eq!(run.start, next);
+                assert!(run.clone().all(|r| want[r as usize].repo == repo));
+                assert!(want.get(run.end as usize).is_none_or(|m| m.repo != repo));
+                next = run.end;
+            }
+            assert_eq!(next as usize, want.len());
+        }
+    }
+
+    /// A damaged metadata block fails at open with the errors the
+    /// deserializer gave; nothing is handed out from it later.
+    #[test]
+    fn corrupt_meta_block_is_rejected_at_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = varied_rows(40, 8, 7);
+        let good = tmp.path().join("good.civec");
+        VecIndex::create_segment(&good, 8, rows).unwrap();
+        let bytes = fs::read(&good).unwrap();
+        let meta_len = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        let (meta_at, meta_end) = (28usize, 28 + meta_len);
+        let open_err = |name: &str, b: &[u8]| -> String {
+            let p = tmp.path().join(name);
+            fs::write(&p, b).unwrap();
+            match VecIndex::open_segment(&p) {
+                Ok(_) => panic!("{name}: a damaged segment opened"),
+                Err(e) => format!("{e:#}"),
+            }
+        };
+
+        // first string length runs past the block
+        let mut b = bytes.clone();
+        b[meta_at + 8 + 16..meta_at + 8 + 24].copy_from_slice(&(meta_len as u64 * 2).to_le_bytes());
+        assert!(open_err("len.civec", &b).contains("corrupt .civec file"));
+
+        // a string that is not UTF-8 (row 0's repo is "alpha")
+        let mut b = bytes.clone();
+        b[meta_at + 8 + 24] = 0xff;
+        assert!(open_err("utf8.civec", &b).contains("corrupt .civec file"));
+
+        // the last record cut short: the header's meta_len ends inside it
+        let mut b = bytes.clone();
+        b[20..28].copy_from_slice(&((meta_len - 5) as u64).to_le_bytes());
+        assert!(open_err("cut.civec", &b).contains("corrupt .civec file"));
+
+        // a row count the block cannot hold
+        let mut b = bytes.clone();
+        b[meta_at..meta_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(open_err("count.civec", &b).contains("corrupt .civec file"));
+
+        // a well-formed block with fewer rows than the header announces
+        let fewer = bincode::serialize(&varied_rows(39, 8, 7).into_iter().map(|(m, _)| m).collect::<Vec<_>>()).unwrap();
+        let mut b = bytes.clone();
+        b[meta_at..meta_at + fewer.len()].copy_from_slice(&fewer);
+        assert!(open_err("fewer.civec", &b).contains("meta count != n_rows"));
+
+        // a meta_len past the end of the file
+        let mut b = bytes.clone();
+        b[20..28].copy_from_slice(&(bytes.len() as u64 * 4).to_le_bytes());
+        let _ = open_err("past.civec", &b);
+
+        // the file cut inside the metadata block
+        let _ = open_err("short.civec", &bytes[..meta_end - 9]);
+
+        // and the untouched bytes still open
+        assert_eq!(VecIndex::open_segment(&good).unwrap().raw_len(), 40);
+    }
+
+    /// `live_files` and `repo_rows` say what a walk over every live row's
+    /// metadata says.
+    #[test]
+    fn set_file_and_repo_views_match_a_row_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (i, seed) in [3u64, 5, 9].into_iter().enumerate() {
+            VecIndex::create_segment(&tmp.path().join(format!("m.d{i:013}.civec")), 8, varied_rows(150 + 40 * i, 8, seed)).unwrap();
+        }
+        let mut set = VecSet::open(tmp.path(), "m").unwrap().unwrap();
+        assert_eq!(set.segments().len(), 3);
+        // tombstone some whole files and some single rows
+        let killed = set.delete_where(|m| m.path.ends_with('7') || m.start_line == 31);
+        assert!(killed > 0);
+
+        let mut want: BTreeSet<(String, String)> = BTreeSet::new();
+        for g in set.live_rows() {
+            let m = set.row_meta(g);
+            want.insert((m.repo.to_string(), m.path.to_string()));
+        }
+        let got: BTreeSet<(String, String)> = set.live_files().map(|(r, p)| (r.to_string(), p.to_string())).collect();
+        assert_eq!(got, want);
+        let all: BTreeSet<(String, String)> =
+            (0..set.raw_len() as u32).map(|g| set.row_meta(g)).map(|m| (m.repo.to_string(), m.path.to_string())).collect();
+        assert!(got.len() < all.len(), "a fully tombstoned file is not live");
+
+        for repo in ["alpha", "", "dépôt", "仓库", "absent"] {
+            let rows = set.repo_rows(repo);
+            assert!(rows.windows(2).all(|w| w[0].end <= w[1].start), "ascending and disjoint");
+            let inside = |g: u32| rows.iter().any(|r| r.contains(&g));
+            for g in 0..set.raw_len() as u32 {
+                assert_eq!(inside(g), set.row_meta(g).repo == repo, "row {g} of {repo:?}");
+            }
+            let q = norm(vec![0.3, -0.2, 0.9, 0.1, 0.0, 0.4, -0.7, 0.2]);
+            assert_eq!(set.search_repo(&q, 9, repo), set.search_where(&q, 9, &|m| m.repo == repo));
+        }
+        for seg in 0..3 {
+            assert_eq!(set.offset(seg), set.segments()[..seg].iter().map(|s| s.raw_len() as u32).sum::<u32>());
+        }
     }
 }

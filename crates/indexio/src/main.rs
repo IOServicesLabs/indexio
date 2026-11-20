@@ -871,17 +871,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let Some(idx) = engine.vec_index(embedder.model_id())? else {
                 anyhow::bail!("no vector plane for {}", embedder.model_id());
             };
-            let mut embedded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-            for row in idx.live_rows() {
-                let m = idx.row_meta(row);
-                embedded.insert((m.repo.clone(), m.path.clone()));
-            }
+            let embedded: std::collections::HashSet<(&str, &str)> = idx.live_files().collect();
             let (files, _) = engine.list_paths("**", None, usize::MAX);
             let mut per: std::collections::BTreeMap<String, (usize, Vec<String>)> = std::collections::BTreeMap::new();
             for (repo, path) in files {
                 let e = per.entry(repo.clone()).or_default();
                 e.0 += 1;
-                if !embedded.contains(&(repo, path.clone())) {
+                if !embedded.contains(&(repo.as_str(), path.as_str())) {
                     e.1.push(path);
                 }
             }

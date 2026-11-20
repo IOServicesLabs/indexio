@@ -4,7 +4,8 @@
 //! - [`embed`]   — pluggable embedders (`HashEmbedder` offline default,
 //!   `HttpEmbedder` for OpenAI-compatible endpoints).
 //! - [`store`]   — org-wide content-addressed embedding cache (CAS).
-//! - [`index`]   — binary-quantized flat vector index sidecar (`.civec`).
+//! - [`index`]   — binary-quantized flat vector index sidecar (`.civec`);
+//!   its row metadata is read from the mapped file (`rowmeta`).
 //! - [`hnsw`]    — deterministic HNSW ANN graph sidecar (`.cihnsw`).
 //! - [`pipeline`]— chunk → embed (CAS-deduped) → rebuild vec index.
 //! - [`rerank`] — reranker stage after RRF fusion: offline
@@ -34,4 +35,5 @@ pub mod pipeline;
 pub mod rerank;
 pub mod rimodel;
 pub mod rindex;
+mod rowmeta;
 pub mod store;

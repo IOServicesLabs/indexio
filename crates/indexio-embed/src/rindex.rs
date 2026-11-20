@@ -1123,7 +1123,56 @@ impl Model {
     /// Hard vocabulary cap: evict lowest-df types (ties by term) until
     /// within `cap`. This is where min-df 2 bites: singletons are evicted
     /// before any df >= 2 type.
+    ///
+    /// A vocabulary at its cap goes through here on every observe that adds
+    /// a term, to evict as many. The evicted set is the `excess` smallest
+    /// `(df, term)`, which a heap of that many candidates selects in one
+    /// pass over the vocabulary; nothing is allocated per term (this used
+    /// to copy every term into a vector, 250,000 strings, and sort it).
     fn enforce_cap(&mut self, cap: usize) {
+        let len = self.vocab.len();
+        if len <= cap {
+            return;
+        }
+        let excess = len - cap;
+        let vocab = &self.vocab;
+        // max-heap: its top is the largest of the `excess` smallest so far
+        let mut lowest: std::collections::BinaryHeap<(u32, &str)> = std::collections::BinaryHeap::with_capacity(excess);
+        for m in &vocab.shards {
+            for (t, e) in m {
+                offer_lowest(&mut lowest, excess, (e.df, t.as_str()));
+            }
+        }
+        if let Some(b) = &vocab.base {
+            for i in 0..b.len() {
+                let (t, df, _) = b.entry(i);
+                // almost every entry is out of the heap's reach: decided on
+                // (df, term) alone, before the overlay is asked about it
+                if lowest.len() == excess && lowest.peek().is_some_and(|top| (df, t) >= *top) {
+                    continue;
+                }
+                if vocab.removed.contains(t) || vocab.shards[Vocab::shard_of(t)].contains_key(t) {
+                    continue;
+                }
+                offer_lowest(&mut lowest, excess, (df, t));
+            }
+        }
+        let evict: Vec<String> = lowest.into_iter().map(|(_, t)| t.to_string()).collect();
+        for t in &evict {
+            self.vocab.remove(t);
+        }
+        // an overlay that lost most of its entries gives their slots back
+        for m in &mut self.vocab.shards {
+            if m.capacity() >= 64 && m.len() < m.capacity() / 4 {
+                m.shrink_to_fit();
+            }
+        }
+    }
+
+    /// [`enforce_cap`](Self::enforce_cap) as first written: the whole
+    /// vocabulary copied and sorted. The tests hold the heap selection to it.
+    #[cfg(test)]
+    fn enforce_cap_by_sorting(&mut self, cap: usize) {
         if self.vocab.len() <= cap {
             return;
         }
@@ -1134,6 +1183,17 @@ impl Model {
         let drop: Vec<String> = by_freq.into_iter().take(excess).map(|(_, t)| t).collect();
         for t in drop {
             self.vocab.remove(&t);
+        }
+    }
+}
+
+/// Keep `candidate` if it is among the `keep` smallest offered so far.
+fn offer_lowest<'a>(lowest: &mut std::collections::BinaryHeap<(u32, &'a str)>, keep: usize, candidate: (u32, &'a str)) {
+    if lowest.len() < keep {
+        lowest.push(candidate);
+    } else if let Some(mut top) = lowest.peek_mut() {
+        if candidate < *top {
+            *top = candidate;
         }
     }
 }
@@ -1801,6 +1861,11 @@ mod tests {
             .collect()
     }
 
+    /// Bit-exact view of a vocabulary (f32 compared by bits).
+    fn exact(entries: &[(String, u32, Vec<Comp>)]) -> Vec<(&str, u32, Vec<(u32, u32)>)> {
+        entries.iter().map(|(t, df, ctx)| (t.as_str(), *df, ctx.iter().map(|c| (c.d, c.v.to_bits())).collect())).collect()
+    }
+
     /// The file a save streams out of the mapped snapshot and the overlay
     /// is, byte for byte, the image the first writer built from owned,
     /// sorted copies of the whole vocabulary: for an overlay alone, for an
@@ -1880,6 +1945,48 @@ mod tests {
         e.observe(&generated_texts(10, 1500, 5)).unwrap();
         save_and_compare(&e, "unsorted snapshot");
         assert!(snapshot_is_sorted(e.model.read().unwrap().vocab.base.as_ref().unwrap()));
+    }
+
+    /// The heap selection evicts exactly what copying and sorting the whole
+    /// vocabulary evicted: two models fed the same texts, one capped each
+    /// way, hold the same entries after every observe, across saves (so the
+    /// snapshot, the overlay and the evicted set all take part).
+    #[test]
+    fn cap_eviction_equals_sorting_the_whole_vocabulary() {
+        const CAP: usize = 400;
+        let tmp = tempfile::tempdir().unwrap();
+        let (path_a, path_b) = (tmp.path().join("a.rimodel"), tmp.path().join("b.rimodel"));
+        let (mut a, mut b) = (Model::default(), Model::default());
+        let mut evictions = 0usize;
+        for step in 0..60u64 {
+            // batches of every size, the big ones far past the cap
+            let n = [1usize, 2, 3, 9, 1, 40, 2, 1][step as usize % 8];
+            let updates: Vec<TextUpdate> =
+                generated_texts(n, 300 + 40 * step as usize, 100 + step).iter().map(|t| compute_update(t)).collect();
+            a.apply_batch(&updates);
+            b.apply_batch(&updates);
+            let before = a.vocab.len();
+            a.enforce_cap(CAP);
+            b.enforce_cap_by_sorting(CAP);
+            evictions += before - a.vocab.len();
+            assert!(a.vocab.len() <= CAP);
+            let (ea, eb) = (a.vocab.to_entries(), b.vocab.to_entries());
+            assert!(exact(&ea) == exact(&eb), "step {step}: the two caps left different vocabularies ({} vs {} terms)", ea.len(), eb.len());
+            if step % 7 == 6 {
+                a.save_snapshot(&path_a).unwrap();
+                b.save_snapshot(&path_b).unwrap();
+                assert!(std::fs::read(&path_a).unwrap() == std::fs::read(&path_b).unwrap(), "step {step}: saved models differ");
+            }
+        }
+        assert!(evictions > 1000, "the sequence must keep crossing the cap: {evictions} evictions");
+        // an overlay that was mostly evicted does not keep its slots
+        let mut c = Model::default();
+        c.apply_batch(&generated_texts(64, 20_000, 9).iter().map(|t| compute_update(t)).collect::<Vec<_>>());
+        let held: usize = c.vocab.shards.iter().map(|s| s.capacity()).sum();
+        c.enforce_cap(50);
+        let kept: usize = c.vocab.shards.iter().map(|s| s.capacity()).sum();
+        assert_eq!(c.vocab.len(), 50);
+        assert!(kept * 8 < held, "overlay capacity after evicting almost everything: {kept} slots (was {held})");
     }
 
     /// the direction permutations are deterministic, true

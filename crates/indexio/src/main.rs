@@ -522,8 +522,11 @@ fn install_team_sync_hook(print_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// No async runtime here: only `serve` needs one and builds it in its own arm.
+/// `#[tokio::main]` gave every subcommand a worker thread per logical CPU
+/// (32 on the machine this was measured on), which the MCP server, the hooks
+/// and `tool` (all synchronous) kept parked for their whole life.
+fn main() -> ExitCode {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::builder()
         .file_name(std::env::var("INDEXIO_DHAT_OUT").unwrap_or_else(|_| "dhat-heap.json".into()))
@@ -538,7 +541,8 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    match run(cli).await {
+    configure_threads(&cli.command);
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -547,7 +551,51 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Worker threads per pool of an `indexio mcp` server unless
+/// `INDEXIO_MCP_THREADS` says otherwise. One server runs per agent session
+/// and most of them sit idle: with a worker per logical CPU in the global
+/// rayon pool and again in the model pool, each kept ~64 parked threads on a
+/// 32-CPU machine for calls that take a few milliseconds.
+const MCP_THREADS: usize = 16;
+
+/// The pool size for this run, `None` to leave every pool at its default.
+///
+/// * `mcp`: `INDEXIO_MCP_THREADS=N` (`0` = no cap), else `RAYON_NUM_THREADS`
+///   as rayon reads it, else [`MCP_THREADS`], never more than the CPUs.
+/// * everything else (`sync`, `embed`, `compact`, the maintenance child an
+///   MCP server spawns, hooks): one worker per logical CPU, as before.
+fn pool_size(is_mcp: bool, explicit: Option<&str>, rayon_env_set: bool, cpus: usize) -> Option<usize> {
+    if !is_mcp {
+        return None;
+    }
+    match explicit.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None if rayon_env_set => None,
+        None => Some(MCP_THREADS.min(cpus.max(1))),
+    }
+}
+
+/// Size the process's worker pools before anything can build one (see
+/// [`pool_size`]): the global rayon pool here, the model pool through
+/// `indexio_types::threads` when it is first used.
+fn configure_threads(cmd: &Commands) {
+    let cpus = std::thread::available_parallelism().map_or(MCP_THREADS, |n| n.get());
+    let Some(n) = pool_size(
+        matches!(cmd, Commands::Mcp { .. }),
+        std::env::var("INDEXIO_MCP_THREADS").ok().as_deref(),
+        std::env::var_os("RAYON_NUM_THREADS").is_some(),
+        cpus,
+    ) else {
+        return;
+    };
+    indexio_types::threads::set_worker_threads(n);
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
+        tracing::warn!(error = %e, threads = n, "could not size the global thread pool");
+    }
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(&cli);
     match cli.command {
         Commands::Add {
@@ -1095,7 +1143,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(p) => serve::load_acl_users(p)?,
                 None => Default::default(),
             };
-            serve::run_server(data_dir, bind, port, auth, users).await?;
+            // the one async subcommand: the runtime is built here, not in `main`
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("starting the async runtime")?
+                .block_on(serve::run_server(data_dir, bind, port, auth, users))?;
         }
         Commands::Mcp { repo } => {
             let engine = Engine::open(&data_dir)
@@ -1667,6 +1720,27 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Only the MCP server caps its pools; an explicit count wins, `0` and
+    /// `RAYON_NUM_THREADS` leave the pools to rayon, and the cap never
+    /// exceeds the machine.
+    #[test]
+    fn pool_size_caps_the_mcp_server_only() {
+        // every other subcommand keeps one worker per CPU
+        assert_eq!(pool_size(false, None, false, 32), None);
+        assert_eq!(pool_size(false, Some("4"), false, 32), None);
+        // the server: the default cap, bounded by the CPUs
+        assert_eq!(pool_size(true, None, false, 32), Some(MCP_THREADS));
+        assert_eq!(pool_size(true, None, false, 4), Some(4));
+        assert_eq!(pool_size(true, None, false, 0), Some(1));
+        // INDEXIO_MCP_THREADS
+        assert_eq!(pool_size(true, Some("6"), false, 32), Some(6));
+        assert_eq!(pool_size(true, Some(" 64 "), true, 32), Some(64));
+        assert_eq!(pool_size(true, Some("0"), false, 32), None, "0 = no cap");
+        assert_eq!(pool_size(true, Some("many"), false, 32), Some(MCP_THREADS), "not a number: the default");
+        // RAYON_NUM_THREADS alone: rayon reads it for both pools
+        assert_eq!(pool_size(true, None, true, 32), None);
     }
 
     #[test]

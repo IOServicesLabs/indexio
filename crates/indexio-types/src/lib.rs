@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod codec;
+pub mod threads;
 
 
 /// Global content key: first 16 bytes of blake3(content).

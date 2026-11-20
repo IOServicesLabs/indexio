@@ -1244,6 +1244,8 @@ fn model_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
+            // the process's worker budget (an MCP server caps it; 0 = one per CPU)
+            .num_threads(indexio_types::threads::worker_threads())
             .thread_name(|i| format!("rindex-{i}"))
             .build()
             .expect("rindex thread pool")

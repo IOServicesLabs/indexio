@@ -1925,6 +1925,7 @@ dependencies = [
  "indexio-types",
  "jsonwebtoken",
  "notify",
+ "rayon",
  "regex",
  "serde",
  "serde_json",

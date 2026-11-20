@@ -1,5 +1,5 @@
 //! ShardSet: newest-first collection of shards with fan-out reads and
-//! compaction (merge of the oldest shards into one compound shard).
+//! compaction (merge of a run of shards into one compound shard).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -11,16 +11,13 @@ use indexio_types::codec::PostingCursor;
 use indexio_types::{DocMeta, ExtractedArtifact, SymbolKind, SymbolRec, CallRec};
 use tracing::info;
 
-use crate::format::kind;
+use crate::format::{kind, TOMBSTONES_LEN};
+use crate::policy::{self, ShardStat};
 use crate::shard::{decode_call_payload, decode_sym_payload};
 use crate::{invalid, Shard, ShardWriter};
 
 /// Extension merged-but-still-mapped shards are parked under (see `merge`).
 const STALE_EXT: &str = "stale";
-
-/// Tombstoned share of all docs above which a merge takes the oldest run
-/// (dropping the dead docs) instead of the cheapest one.
-const MERGE_DEAD_SHARE: f64 = 0.3;
 
 /// A temp file untouched for an hour: its writer is gone.
 pub fn is_abandoned(path: &Path) -> bool {
@@ -612,34 +609,29 @@ impl ShardSet {
 
     /// The shards to merge, `lo..hi` in newest-first order: a run of
     /// adjacent ages (so the compound shard, dated by its newest input,
-    /// orders exactly where they did) just long enough to leave
-    /// `max_shards`, the one with the fewest bytes. Delta shards from
-    /// refreshes and hooks are the small young ones; always merging the
-    /// oldest run rewrote the big base shards with them (a 200 MB index:
-    /// ~30 s and ~2.4 GB per compaction, once a minute while other
-    /// sessions write). Once tombstoned docs are over [`MERGE_DEAD_SHARE`]
-    /// of all docs, the oldest run is merged as before, which drops them.
+    /// orders exactly where they did), chosen by size tiers and long enough
+    /// to leave `max_shards`. See [`policy::merge_window`].
     fn merge_window(&self, max_shards: usize) -> (usize, usize) {
-        let n = self.shards.len();
-        let len = n - max_shards + 1;
-        let oldest = (n - len, n);
-        let docs: u64 = self.shards.iter().map(|s| s.doc_count()).sum();
-        let dead: u64 = self.shards.iter().map(|s| s.tombstones().len()).sum();
-        if docs > 0 && dead as f64 / docs as f64 > MERGE_DEAD_SHARE {
-            return oldest;
-        }
-        let bytes: Vec<u64> = self.shards.iter().map(|s| fs::metadata(s.path()).map_or(u64::MAX / 64, |m| m.len())).collect();
-        (0..=n - len)
-            .min_by_key(|&lo| (bytes[lo..lo + len].iter().sum::<u64>(), std::cmp::Reverse(lo)))
-            .map_or(oldest, |lo| (lo, lo + len))
+        let stats: Vec<ShardStat> = self
+            .shards
+            .iter()
+            .map(|s| ShardStat {
+                bytes: s.file_len().saturating_sub(TOMBSTONES_LEN as u64),
+                docs: s.doc_count(),
+                dead: s.tombstones().len(),
+                created: s.created_unix(),
+            })
+            .collect();
+        policy::merge_window(&stats, max_shards)
     }
 
     /// If shard_count > max_shards, merge a run of adjacent shards (see
-    /// [`merge_window`](Self::merge_window)) into one compound shard. Applies tombstones
-    /// (deleted docs are dropped) and newest-wins dedup within the merged
-    /// group. Atomic swap: the compound shard is fully written (its own
-    /// atomic rename) before the merged files are removed; the set is then
-    /// updated in place.
+    /// [`policy::merge_window`]) into one compound shard, leaving at most
+    /// `max_shards`: fewer when the run takes older shards in by the
+    /// size-ratio rule. Applies tombstones (deleted docs are dropped) and
+    /// newest-wins dedup within the merged group. Atomic swap: the compound
+    /// shard is fully written (its own atomic rename) before the merged
+    /// files are removed; the set is then updated in place.
     pub fn merge(&mut self, out_dir: &Path, max_shards: usize) -> io::Result<()> {
         if self.layered {
             return Err(invalid("a layered shard set is compacted one layer at a time"));

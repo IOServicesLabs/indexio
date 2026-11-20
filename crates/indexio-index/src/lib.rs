@@ -20,10 +20,12 @@
 #![deny(unsafe_code)]
 
 mod format;
+mod policy;
 mod set;
 mod shard;
 mod writer;
 
+pub use policy::{COMPACT_ABOVE, COMPACT_TO};
 pub use set::{is_abandoned, ShardSet, Visibility};
 pub use shard::Shard;
 pub use writer::ShardWriter;

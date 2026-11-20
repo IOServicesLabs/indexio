@@ -142,6 +142,11 @@ impl Shard {
         self.created_unix
     }
 
+    /// Size of the shard file (as mapped at open).
+    pub(crate) fn file_len(&self) -> u64 {
+        self.mmap.len() as u64
+    }
+
     pub fn meta(&self) -> &ShardMeta {
         &self.meta
     }

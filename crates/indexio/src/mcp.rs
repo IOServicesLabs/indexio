@@ -46,10 +46,11 @@ const MAX_LINES_PER_FILE: usize = 100;
 /// tree-sitter parse per distinct file).
 const RANGE_HITS: usize = 20;
 
-/// `refresh_index` merges the oldest shards once more than this many exist…
-const COMPACT_ABOVE: usize = 12;
-/// …down to this many.
-const COMPACT_TO: usize = 6;
+/// `refresh_index` merges shards once more than this many exist…
+const COMPACT_ABOVE: usize = indexio_index::COMPACT_ABOVE;
+/// …down to this many, or fewer (the merge policy of indexio-index sets
+/// both and says why).
+const COMPACT_TO: usize = indexio_index::COMPACT_TO;
 
 /// How tool results are rendered: `Text` is the token-dense
 /// default for models; `Json` the compact JSON envelope for scripts/tests.

@@ -78,22 +78,6 @@ fn quantize_into(v: &[f32], q: &mut Vec<u8>) -> f32 {
     scale
 }
 
-/// The scale [`quantize_into`] returns for an int8 row taken back to f32
-/// (`q * scale`), from the row's largest |q| alone. The largest |x| of that
-/// row is the product of the largest |q|: a product is rounded the same way
-/// whatever its sign and rounding keeps order, and a product that is not a
-/// number (a zero times an infinite scale, anything times NaN) is passed
-/// over here as it is there.
-fn requantized_scale(q: &[i8], scale: f32) -> f32 {
-    let most = q.iter().fold(0u8, |m, &x| m.max(x.unsigned_abs()));
-    let amax = 0f32.max((f32::from(most) * scale).abs());
-    if amax == 0.0 {
-        0.0
-    } else {
-        amax / 127.0
-    }
-}
-
 /// `scale * dot(q, row)` for an int8 row.
 fn dot_i8(q: &[f32], row: &[i8], scale: f32) -> f32 {
     debug_assert_eq!(q.len(), row.len());
@@ -958,6 +942,15 @@ impl VecIndex {
         v
     }
 
+    /// The row as an int8 segment stores it: (scale, values, binary code).
+    /// `None` for a row of an f32 segment.
+    #[cfg(test)]
+    pub(crate) fn stored_quant(&self, row: u32) -> Option<(f32, &[u8], &[u8])> {
+        let Storage::Quant(m) = &self.store else { return None };
+        let (r, cb) = (row as usize, self.dim.div_ceil(8));
+        Some((m.scales()[r], m.row_bytes(r), &m.codes()[r * cb..(r + 1) * cb]))
+    }
+
     /// [`row_vector`](Self::row_vector) into a buffer the caller keeps
     /// between rows: what a compaction carries, one row at a time.
     fn row_into(&self, row: u32, v: &mut Vec<f32>) {
@@ -1265,15 +1258,15 @@ impl Write for SpoolWrite<'_> {
 /// binary codes wait (in a [`Spool`]), since they follow the rows in the
 /// file and come out of the same pass.
 ///
-/// The row is quantized again, not copied, because that is what
-/// `create_segment` did to it and the trip is not the identity: the code
-/// bit of a component stored as zero comes back set, whatever the sign of
-/// the component was when the row was embedded (see
-/// `what_a_compaction_changes_in_a_row`; the int8 values and a scale the
-/// quantizer wrote come back as they were). A raw copy would write a
-/// segment whose codes differ from the one written until now, and the
-/// binary prescan of a search reads the codes. The file written here is
-/// the one `create_segment` wrote from the same rows, byte for byte.
+/// A row stored as int8 is copied as it stands: its scale, its values and
+/// its binary code. Until 0.1.14 a compaction took every row through f32
+/// and the quantizer again, and that trip is not the identity: the code bit
+/// of a component stored as zero came back set, whatever the sign of the
+/// component was when the row was embedded (about 6% of the code bits of a
+/// real segment), so the binary prescan of a search ranked a compacted row
+/// differently from the row as embedded. A copy keeps the answers of a
+/// plane the same across compactions. Rows of an f32 segment are quantized
+/// here for the first time.
 pub(crate) fn write_carried(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, u32)]) -> anyhow::Result<()> {
     write_carried_as(path, dim, segs, order, f32_layout())
 }
@@ -1298,6 +1291,7 @@ fn write_carried_as(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, 
     let records = order.iter().map(|&(s, r)| segs[s as usize].metas.record_len(r) as u64).sum();
     let shape = Shape { f32_rows: false, dim, n_rows: order.len(), records };
     let mut codes = Spool::new(dir, "civec-codes", SIDE_IN_MEMORY);
+    let code_bytes = dim.div_ceil(8);
     shape.write(path, |section, out| {
         match section {
             Section::Metas => {
@@ -1309,7 +1303,7 @@ fn write_carried_as(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, 
                 for &(s, r) in order {
                     let seg = segs[s as usize];
                     let scale = match &seg.store {
-                        Storage::Quant(m) => requantized_scale(m.row(r as usize), m.scales()[r as usize]),
+                        Storage::Quant(m) => m.scales()[r as usize],
                         _ => {
                             seg.row_into(r, &mut v);
                             quantize_into(&v, &mut q)
@@ -1320,6 +1314,12 @@ fn write_carried_as(path: &Path, dim: usize, segs: &[&VecIndex], order: &[(u32, 
             }
             Section::Rows => {
                 for &(s, r) in order {
+                    if let Storage::Quant(m) = &segs[s as usize].store {
+                        let r = r as usize;
+                        out.write_all(m.row_bytes(r))?;
+                        codes.write(&m.codes()[r * code_bytes..(r + 1) * code_bytes])?;
+                        continue;
+                    }
                     segs[s as usize].row_into(r, &mut v);
                     quantize_into(&v, &mut q);
                     out.write_all(&q)?;
@@ -2914,11 +2914,10 @@ mod tests {
         VecIndex::open_segment(path).unwrap()
     }
 
-    /// A compaction writes the segment the compaction before it wrote from
-    /// the same rows: every row through f32 and the quantizer, here one at a
-    /// time instead of all of them held.
+    /// A compaction copies the rows it carries: metadata, scale, int8
+    /// values and binary code are the ones the inputs hold, damaged or not.
     #[test]
-    fn carried_rows_are_quantized_as_before() {
+    fn carried_rows_are_copied_as_stored() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let dim = 96usize;
@@ -2940,15 +2939,24 @@ mod tests {
             let j = (((rng.next_f32() + 1.0) / 2.0) * (i + 1) as f32) as usize;
             order.swap(i, j.min(i));
         }
-        let (new_path, old_path) = (dir.join("new.civec"), dir.join("old.civec"));
+        let new_path = dir.join("new.civec");
         write_carried(&new_path, dim, &inputs, &order).unwrap();
-        let held: Vec<(VecRowMeta, Vec<f32>)> = order
-            .iter()
-            .map(|&(s, r)| (segs[s as usize].row_meta(r).to_owned_meta(), segs[s as usize].row_vector(r)))
-            .collect();
-        reference::create_segment(&old_path, dim, held, false).unwrap();
-        assert!(fs::read(&new_path).unwrap() == fs::read(&old_path).unwrap(), "a compaction wrote other bytes than before");
+        let out = VecIndex::open_segment(&new_path).unwrap();
+        assert_eq!(out.raw_len(), order.len());
+        for (i, &(s, r)) in order.iter().enumerate() {
+            let src = &segs[s as usize];
+            let (m, n) = (out.row_meta(i as u32), src.row_meta(r));
+            assert_eq!(
+                (m.chunk_hash, m.repo, m.path, m.start_line, m.end_line),
+                (n.chunk_hash, n.repo, n.path, n.start_line, n.end_line),
+                "row {i}"
+            );
+            let (a, b) = (out.stored_quant(i as u32).unwrap(), src.stored_quant(r).unwrap());
+            assert_eq!((a.0.to_bits(), a.1, a.2), (b.0.to_bits(), b.1, b.2), "row {i}");
+        }
+        drop(out);
         // no row carried: an empty segment, as before
+        let old_path = dir.join("old.civec");
         write_carried(&new_path, dim, &inputs, &[]).unwrap();
         reference::create_segment(&old_path, dim, Vec::new(), false).unwrap();
         assert!(fs::read(&new_path).unwrap() == fs::read(&old_path).unwrap());
@@ -2958,12 +2966,11 @@ mod tests {
         assert_eq!(extensions(dir), ["civec"], "a scratch file was left");
     }
 
-    /// Why a compaction quantizes the rows it carries instead of copying
-    /// them: the first trip through f32 sets the code bits of the
-    /// components stored as zero and changes nothing else, and a copy would
-    /// leave them. After that trip a row is a fixed point.
+    /// A compaction that carries every row in place writes the file it
+    /// read. The trip through f32 that compactions made until 0.1.14 did
+    /// not: it set the code bits of the components stored as zero.
     #[test]
-    fn what_a_compaction_changes_in_a_row() {
+    fn a_compaction_leaves_a_row_as_it_is() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let (n, dim) = (3000usize, 96usize);
@@ -2973,41 +2980,12 @@ mod tests {
         let all: Vec<(u32, u32)> = (0..n as u32).map(|r| (0, r)).collect();
         let once = dir.join("once.civec");
         write_carried(&once, dim, &[&seg], &all).unwrap();
-        // every row in place: a copy of the rows would be the file itself
         let (stored, carried) = (fs::read(&fresh).unwrap(), fs::read(&once).unwrap());
-        let (expect, scales_moved, bits_set) = reference::through_f32(&stored);
-        assert!(carried == expect, "a compaction changed more than the code bits of zero components");
-        assert!(bits_set > 0, "no row shows the change");
-        assert_eq!(scales_moved, 0, "a scale the quantizer wrote moved");
-        // the int8 values, which is where the scores come from, never change
-        let (_, q_off, code_off) = reference::v3_sections(&stored);
-        assert!(stored[q_off..code_off] == carried[q_off..code_off]);
-        // a second trip changes nothing
-        let once_seg = VecIndex::open_segment(&once).unwrap();
-        let twice = dir.join("twice.civec");
-        write_carried(&twice, dim, &[&once_seg], &all).unwrap();
-        assert!(fs::read(&twice).unwrap() == carried);
-        assert_eq!(reference::through_f32(&carried), (carried.clone(), 0, 0));
-    }
-
-    /// The scale of a carried row is worked out from its largest value
-    /// alone; it is the scale the quantizer returns for the whole row.
-    #[test]
-    fn requantized_scale_is_the_scale_of_the_row_quantized_again() {
-        let mut rng = Rng(99);
-        let mut scales: Vec<f32> = ODD_SCALES.to_vec();
-        scales.extend((0..400).map(|i| (rng.next_f32().abs() + 1e-3) * 10f32.powi(i % 60 - 40)));
-        scales.extend((0..200u32).map(|i| f32::from_bits(0x3C00_0000 + i * 37)));
-        let mut q = Vec::new();
-        for (i, &scale) in scales.iter().enumerate() {
-            for top in [0i8, 1, 2, 63, 100, 126, 127, -127, -128] {
-                let mut row: Vec<i8> = (0..24).map(|_| (rng.next_f32() * f32::from(top.unsigned_abs())) as i8).collect();
-                row[i % 24] = top;
-                let as_f32: Vec<f32> = row.iter().map(|&x| x as f32 * scale).collect();
-                let want = quantize_into(&as_f32, &mut q);
-                assert_eq!(requantized_scale(&row, scale).to_bits(), want.to_bits(), "scale {scale:e}, largest value {top}");
-            }
-        }
+        assert!(carried == stored, "a compaction changed a row it carried");
+        // what the old trip would have done to the same file
+        let (old, scales_moved, bits_set) = reference::through_f32(&stored);
+        assert!(bits_set > 0 && old != stored, "no row shows what the old trip changed");
+        assert_eq!(scales_moved, 0);
     }
 
     /// Rows of f32 segments (v2 files, segments held in memory) are

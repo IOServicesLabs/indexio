@@ -1657,6 +1657,9 @@ mod reference {
         // origin[new row] = (segment, local row): tombstones another server
         // writes to an input while we merge are forwarded afterwards
         let mut origin: Vec<(usize, u32)> = Vec::new();
+        // what an int8 input stores for each carried row: a compaction
+        // copies it (scale, values, code) instead of quantizing again
+        let mut stored: Vec<Option<(f32, Vec<u8>, Vec<u8>)>> = Vec::new();
         for &i in &merge {
             let vs = &vset.segments()[i];
             let mut bs_rows = crate::bm25::reference::rows_tf_of(&bset, i);
@@ -1667,6 +1670,7 @@ mod reference {
                 }
                 origin.push((i, r));
                 rows.push((vs.row_meta(r).to_owned_meta(), vs.row_vector(r)));
+                stored.push(vs.stored_quant(r).map(|(s, q, c)| (s, q.to_vec(), c.to_vec())));
                 tf_rows.push(std::mem::take(&mut bs_rows[r as usize]));
             }
         }
@@ -1682,13 +1686,16 @@ mod reference {
             let mut rows_s = Vec::with_capacity(rows.len());
             let mut tf_s = Vec::with_capacity(tf_rows.len());
             let mut origin_s = Vec::with_capacity(origin.len());
+            let mut stored_s = Vec::with_capacity(stored.len());
             let mut rows_opt: Vec<Option<(VecRowMeta, Vec<f32>)>> = rows.into_iter().map(Some).collect();
             let mut tf_opt: Vec<Option<(BTreeMap<String, u32>, BTreeMap<String, u32>)>> = tf_rows.into_iter().map(Some).collect();
             for i in order {
                 rows_s.push(rows_opt[i].take().expect("row moved once"));
                 tf_s.push(tf_opt[i].take().expect("tf row moved once"));
                 origin_s.push(origin[i]);
+                stored_s.push(stored[i].take());
             }
+            stored = stored_s;
             rows = rows_s;
             tf_rows = tf_s;
             origin = origin_s;
@@ -1703,7 +1710,22 @@ mod reference {
         create_pair(
             &seg,
             &bseg,
-            |p| crate::index::reference::create_segment(p, dim, rows, f32_rows()),
+            |p| {
+                crate::index::reference::create_segment(p, dim, rows, f32_rows())?;
+                if f32_rows() {
+                    return Ok(());
+                }
+                let mut file = std::fs::read(p)?;
+                let (scale_off, q_off, code_off) = crate::index::reference::v3_sections(&file);
+                let cb = dim.div_ceil(8);
+                for (row, kept) in stored.iter().enumerate() {
+                    let Some((scale, q, code)) = kept else { continue };
+                    file[scale_off + 4 * row..scale_off + 4 * row + 4].copy_from_slice(&scale.to_le_bytes());
+                    file[q_off + row * dim..q_off + (row + 1) * dim].copy_from_slice(q);
+                    file[code_off + row * cb..code_off + (row + 1) * cb].copy_from_slice(code);
+                }
+                Ok(std::fs::write(p, file)?)
+            },
             |p| crate::bm25::reference::create_from_tf(p, tf_rows),
         )?;
         // rows tombstoned in an input since we read it

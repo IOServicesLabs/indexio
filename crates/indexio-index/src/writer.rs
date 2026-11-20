@@ -5,8 +5,8 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use indexio_types::codec::{encode_doc_postings, write_varint};
-use indexio_types::{DocMeta, ExtractedArtifact};
+use indexio_types::codec::{encode_doc_postings, read_varint, write_varint};
+use indexio_types::{CallRec, DocMeta, ExtractedArtifact, SymbolRec};
 use fst::MapBuilder;
 use roaring::RoaringBitmap;
 use tracing::{debug, info, warn};
@@ -28,7 +28,12 @@ pub(crate) const DICT_SAMPLE_BYTES: usize = 64 * 1024;
 struct PendingDoc {
     meta: DocMeta,
     content: Vec<u8>,
-    art: ExtractedArtifact,
+    /// The doc's grams one after the other, each behind its varint length:
+    /// 4 bytes per trigram, where the `Vec` per gram of
+    /// [`ExtractedArtifact`] is a 24-byte header and a heap block.
+    grams: Vec<u8>,
+    symbols: Vec<SymbolRec>,
+    calls: Vec<CallRec>,
     dead: bool,
 }
 
@@ -164,17 +169,24 @@ impl ShardWriter {
         }
         let idx = self.docs.len();
         self.seen.insert(key, idx);
+        let mut grams: Vec<u8> = Vec::with_capacity(art.ngrams.iter().map(|g| g.len() + 1).sum());
+        for g in &art.ngrams {
+            write_varint(&mut grams, g.len() as u64);
+            grams.extend_from_slice(g);
+        }
         self.docs.push(PendingDoc {
             meta: meta.clone(),
             content: content.to_vec(),
-            art: art.clone(),
+            grams,
+            symbols: art.symbols.clone(),
+            calls: art.calls.clone(),
             dead: false,
         });
         Ok(idx as u32)
     }
 
     pub fn finish(mut self, repos: &[String]) -> io::Result<PathBuf> {
-        let live: Vec<PendingDoc> = std::mem::take(&mut self.docs)
+        let mut live: Vec<PendingDoc> = std::mem::take(&mut self.docs)
             .into_iter()
             .filter(|d| !d.dead)
             .collect();
@@ -195,27 +207,32 @@ impl ShardWriter {
         let mut path_offs: Vec<(u32, u32)> = Vec::with_capacity(n);
         let mut total_raw: u64 = 0;
 
-        for (i, d) in live.iter().enumerate() {
+        // each doc's lists are released as they go into the maps
+        for (i, d) in live.iter_mut().enumerate() {
             let docid = i as u32;
             total_raw += d.meta.raw_len as u64;
             let poff = strings.intern_bytes(d.meta.path.as_bytes());
             path_offs.push((poff, d.meta.path.len() as u32));
-            for gram in &d.art.ngrams {
-                ngram_map.entry(gram.clone()).or_default().push(docid);
+            let grams = std::mem::take(&mut d.grams);
+            let mut pos = 0;
+            while pos < grams.len() {
+                let len = read_varint(&grams, &mut pos).unwrap_or(0) as usize;
+                let gram = grams.get(pos..pos + len).ok_or_else(|| crate::invalid("shard writer: gram list is cut short"))?;
+                pos += len;
+                match ngram_map.get_mut(gram) {
+                    Some(docs) => docs.push(docid),
+                    None => {
+                        ngram_map.insert(gram.to_vec(), vec![docid]);
+                    }
+                }
             }
-            for s in &d.art.symbols {
+            for s in std::mem::take(&mut d.symbols) {
                 let soff = strings.intern_cstr(&s.scope);
-                sym_map
-                    .entry(s.name.as_bytes().to_vec())
-                    .or_default()
-                    .push((docid, s.line, s.kind.as_u8(), soff));
+                sym_map.entry(s.name.into_bytes()).or_default().push((docid, s.line, s.kind.as_u8(), soff));
             }
-            for c in &d.art.calls {
+            for c in std::mem::take(&mut d.calls) {
                 let coff = strings.intern_cstr(&c.caller);
-                call_map
-                    .entry(c.callee.as_bytes().to_vec())
-                    .or_default()
-                    .push((docid, coff, c.line));
+                call_map.entry(c.callee.into_bytes()).or_default().push((docid, coff, c.line));
             }
         }
 
@@ -237,10 +254,11 @@ impl ShardWriter {
         // ---- CONTENT section --------------------------------------------
         let mut content_sect: Vec<u8> = Vec::new();
         let mut content_offs: Vec<(u64, u32)> = Vec::with_capacity(n);
-        for d in &live {
+        for d in live.iter_mut() {
             let frame = compress(&d.content, dict.as_deref())?;
             content_offs.push((content_sect.len() as u64, frame.len() as u32));
             content_sect.extend_from_slice(&frame);
+            d.content = Vec::new(); // the raw bytes are not needed again
         }
 
         // ---- DOCS section ------------------------------------------------

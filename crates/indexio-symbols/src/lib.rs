@@ -78,13 +78,21 @@ const TS_DEFS: &str = r#"
 (class_declaration name: (type_identifier) @name) @def.class
 (interface_declaration name: (type_identifier) @name) @def.interface
 (enum_declaration name: (identifier) @name) @def.enum
+(type_alias_declaration name: (type_identifier) @name) @def.type
 (program (lexical_declaration (variable_declarator name: (identifier) @name) @def.const))
 (program (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name) @def.const)))
 "#;
 
+// JSX elements are render sites: `<Board />` and `<AppShell>` count as a
+// call of the component (`<ui.Button>` of `Button`). Lowercase intrinsic
+// elements (`<div>`) are dropped in `collect_calls`.
 const TS_CALLS: &str = r#"
 (call_expression function: (_) @callee) @call
 (new_expression constructor: (_) @callee) @call
+(jsx_opening_element name: (identifier) @callee) @call
+(jsx_opening_element name: (member_expression) @callee) @call
+(jsx_self_closing_element name: (identifier) @callee) @call
+(jsx_self_closing_element name: (member_expression) @callee) @call
 "#;
 
 const JAVA_DEFS: &str = r#"
@@ -243,6 +251,23 @@ fn spec(lang: Lang) -> Option<&'static LangSpec> {
 /// Whether a tree-sitter grammar is available for `lang`.
 pub fn supported(lang: Lang) -> bool {
     spec(lang).is_some()
+}
+
+/// Newest extraction generation of any language (see [`generation`]).
+pub const GENERATION: u32 = 1;
+
+/// Generation of `extract`'s output for `lang`: bumped (to a new
+/// [`GENERATION`]) when a change to the language's queries changes what an
+/// unchanged file yields, so artifacts cached by an older build are not
+/// reused and indexes built by one are re-extracted.
+///
+/// 1 (0.1.15): TS/JS type aliases, JSX render sites as calls, callers
+/// named by their module-level `const`.
+pub fn generation(lang: Lang) -> u32 {
+    match lang {
+        Lang::TsJs => 1,
+        _ => 0,
+    }
 }
 
 /// Extract (symbols, calls) from source content. Never panics on
@@ -556,7 +581,7 @@ fn collect_calls(spec: &LangSpec, root: Node, content: &[u8]) -> Vec<CallRec> {
             continue;
         };
         let callee = callee_name(content, callee_node);
-        if callee.is_empty() {
+        if callee.is_empty() || (is_jsx_element(call_node) && !is_render_site(call_node, callee_node, &callee)) {
             continue;
         }
         let caller = caller_of(spec, content, call_node);
@@ -654,7 +679,43 @@ fn cpp_fn_name(content: &[u8], node: Node) -> Option<String> {
     }
 }
 
+/// A JSX element opening (`<Board>`, `<Board />`): a render site.
+fn is_jsx_element(node: Node) -> bool {
+    matches!(node.kind(), "jsx_opening_element" | "jsx_self_closing_element")
+}
+
+/// A JSX element that renders a component: its name (`<ui.Button>` reduced
+/// to `Button`) is capitalised, unlike an intrinsic element (`<div>`); it is
+/// not a context's `<Ctx.Provider>`/`<Ctx.Consumer>`, which would merge every
+/// context under one name; and it parsed cleanly. The TSX grammar parses an
+/// old-style type assertion in a `.ts` file (`<Foo>x`) as an element with no
+/// closing tag, which is not a render site.
+fn is_render_site(element: Node, name_node: Node, name: &str) -> bool {
+    if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    if name_node.kind() == "member_expression" && matches!(name, "Provider" | "Consumer") {
+        return false;
+    }
+    if element.kind() == "jsx_opening_element" {
+        let Some(el) = element.parent() else {
+            return false;
+        };
+        let mut cursor = el.walk();
+        let closed = el
+            .children(&mut cursor)
+            .any(|c| c.kind() == "jsx_closing_element" && !c.is_missing() && !c.has_error());
+        if !closed || element.has_error() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Nearest enclosing function/method name for a call site; "" at top level.
+/// A TS/JS function value bound to a module-level `const`
+/// (`const Board = () => …`, `export const Card = memo(function () {…})`)
+/// is named by that const, as the definition index names it.
 fn caller_of(spec: &LangSpec, content: &[u8], node: Node) -> String {
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -663,9 +724,37 @@ fn caller_of(spec: &LangSpec, content: &[u8], node: Node) -> String {
                 return name;
             }
         }
+        if matches!(n.kind(), "arrow_function" | "function_expression") {
+            if let Some(name) = module_const_name(content, n) {
+                return name;
+            }
+        }
         cur = n.parent();
     }
     String::new()
+}
+
+/// TS/JS: the name of the module-level `const` a function value is bound
+/// to, directly or as the argument of one wrapping call (`memo(…)`,
+/// `forwardRef(…)`); `None` for any other function value.
+fn module_const_name(content: &[u8], func: Node) -> Option<String> {
+    let mut p = func.parent()?;
+    if p.kind() == "arguments" {
+        let call = p.parent().filter(|c| c.kind() == "call_expression")?;
+        p = call.parent()?;
+    }
+    if p.kind() != "variable_declarator" || !is_const_decl(content, p) {
+        return None;
+    }
+    let decl = p.parent()?;
+    let top = decl.parent()?;
+    let top_level = top.kind() == "program"
+        || (top.kind() == "export_statement" && top.parent().is_some_and(|g| g.kind() == "program"));
+    if !top_level {
+        return None;
+    }
+    let name = p.child_by_field_name("name").filter(|n| n.kind() == "identifier")?;
+    Some(text(content, name))
 }
 
 /// Enclosing scope path for a definition: container names, outermost first,
@@ -984,6 +1073,128 @@ mod tests {
         assert!(has_call(&calls, "ConsoleLogger", "makeLogger"), "new: {calls:?}");
         assert!(has_call(&calls, "makeLogger", ""), "{calls:?}");
         assert!(has_call(&calls, "log", ""), "{calls:?}");
+    }
+
+    #[test]
+    fn ts_type_aliases_are_definitions() {
+        let src = concat!(
+            "export type Status = 'todo' | 'done';\n",          // 1
+            "type Patch<T> = Partial<Omit<T, \"id\">>;\n",      // 2
+            "export interface Task { status: Status }\n",       // 3
+            "export function StatusChart() { return null; }\n", // 4
+            "function local() {\n",                             // 5
+            "  type Inner = { n: number };\n",                  // 6
+            "}\n",                                              // 7
+            "export type { Task as T };\n",                     // 8
+        );
+        let (syms, _) = extract(Lang::TsJs, src.as_bytes());
+        assert_eq!(sym(&syms, "Status", SymbolKind::Type).unwrap().line, 1);
+        assert_eq!(sym(&syms, "Patch", SymbolKind::Type).unwrap().line, 2);
+        let inner = sym(&syms, "Inner", SymbolKind::Type).expect("nested alias");
+        assert_eq!((inner.line, inner.scope.as_str()), (6, "local"));
+        assert_eq!(sym(&syms, "Task", SymbolKind::Interface).unwrap().line, 3);
+        // a type-only re-export is not a definition
+        assert!(!syms.iter().any(|s| s.name == "T"), "{syms:?}");
+        // outline carries the alias with its range
+        let o = outline(Lang::TsJs, src.as_bytes());
+        assert!(o.iter().any(|i| i.name == "Status" && i.kind == SymbolKind::Type && i.start_line == 1));
+    }
+
+    #[test]
+    fn jsx_render_sites_are_calls() {
+        let src = concat!(
+            "import * as ui from './ui';\n",                                       // 1
+            "export default function Page() {\n",                                  // 2
+            "  return (\n",                                                        // 3
+            "    <AppShell title=\"x\">\n",                                        // 4
+            "      <div className=\"row\">\n",                                     // 5
+            "        <Board items={[]} />\n",                                      // 6
+            "        <ui.Button onClick={() => save()}>ok</ui.Button>\n",          // 7
+            "        <motion.div />\n",                                            // 8
+            "      </div>\n",                                                      // 9
+            "    </AppShell>\n",                                                   // 10
+            "  );\n",                                                              // 11
+            "}\n",                                                                 // 12
+            "export const Card = ({ t }: { t: string }) => <Badge>{t}</Badge>;\n", // 13
+            "const Row = memo(function Row() { return <Cell />; });\n",            // 14
+            "function outer() {\n",                                                // 15
+            "  const inner = () => <Leaf />;\n",                                   // 16
+            "}\n",                                                                 // 17
+            "<Top />;\n",                                                          // 18
+        );
+        let (syms, calls) = extract(Lang::TsJs, src.as_bytes());
+        assert!(has_call(&calls, "AppShell", "Page"), "{calls:?}");
+        assert!(has_call(&calls, "Board", "Page"), "{calls:?}");
+        assert!(
+            has_call(&calls, "Button", "Page"),
+            "member expression: {calls:?}"
+        );
+        assert!(has_call(&calls, "save", "Page"), "{calls:?}");
+        // one edge per element: the closing tag is not a second site
+        assert_eq!(
+            calls.iter().filter(|c| c.callee == "AppShell").count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().find(|c| c.callee == "AppShell").unwrap().line,
+            4
+        );
+        assert_eq!(calls.iter().find(|c| c.callee == "Board").unwrap().line, 6);
+        // intrinsic elements are not calls
+        assert!(!calls.iter().any(|c| c.callee == "div"), "{calls:?}");
+        // components bound to a module-level const are named callers
+        assert!(has_call(&calls, "Badge", "Card"), "{calls:?}");
+        assert!(sym(&syms, "Card", SymbolKind::Const).is_some());
+        assert!(
+            has_call(&calls, "Cell", "Row"),
+            "memo(function …): {calls:?}"
+        );
+        // a nested local arrow keeps the enclosing function as caller
+        assert!(has_call(&calls, "Leaf", "outer"), "{calls:?}");
+        assert!(has_call(&calls, "Top", ""), "{calls:?}");
+    }
+
+    #[test]
+    fn jsx_non_render_sites_are_not_calls() {
+        // an old-style type assertion (`.ts` parsed with the TSX grammar) is
+        // not a render site
+        let src = concat!(
+            "interface Foo { n: number }
+", // 1
+            "declare const x: unknown;
+", // 2
+            "const y = <Foo>x;
+", // 3
+            "const z = <Bar>(<unknown>x);
+", // 4
+        );
+        let (_, calls) = extract(Lang::TsJs, src.as_bytes());
+        assert!(
+            !calls.iter().any(|c| c.callee == "Foo" || c.callee == "Bar"),
+            "{calls:?}"
+        );
+        // context providers and consumers are not calls; their children are
+        let src = concat!(
+            "export const App = () => (
+", // 1
+            "  <Ctx.Provider value={1}>
+", // 2
+            "    <Ctx.Consumer>{(v) => <Shown v={v} />}</Ctx.Consumer>
+", // 3
+            "  </Ctx.Provider>
+", // 4
+            ");
+", // 5
+        );
+        let (_, calls) = extract(Lang::TsJs, src.as_bytes());
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.callee == "Provider" || c.callee == "Consumer"),
+            "{calls:?}"
+        );
+        assert!(has_call(&calls, "Shown", "App"), "{calls:?}");
     }
 
     #[test]

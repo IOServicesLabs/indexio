@@ -667,7 +667,7 @@ To keep a shell command from being rewritten, add `# raw` to it or set `INDEXIO_
 |---|---|
 | `code_search` | Literal or regex search (`mode: "lexical"`), concept search (`"semantic"`), or both (`"hybrid"`). A lexical query that looks like a grep pattern and matches nothing runs as a regex. A lexical query of several words that matches nothing runs as hybrid. |
 | `code_grep` | `grep -n` across all repositories: every matching line per file, ranked. `repo` and `path` arguments, or trailing `repo:`, `path:` and `lang:` filters. An unbalanced parenthesis is read as a literal. |
-| `find_symbol` | Where a function, struct, class, trait or enum is defined. |
+| `find_symbol` | Where a function, struct, class, trait, enum or type is defined. |
 | `who_calls` | Every recorded caller of a symbol. |
 | `semantic_search` | Vector search only. |
 | `list_files` | A glob or substring over indexed paths, folded by directory. No pattern lists every file. |

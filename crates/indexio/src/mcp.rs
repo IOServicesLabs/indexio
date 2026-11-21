@@ -1685,8 +1685,8 @@ fn tools_list() -> Value {
             ),
             tool(
                 "find_symbol",
-                "Where a function/method/class/struct/trait/enum is DEFINED (exact name, substring \
-                 fallback), instead of grepping for `fn name` / `def name` / `class name`. Rows \
+                "Where a function/method/class/struct/trait/enum/type is DEFINED (exact name; longer \
+                 names containing it only when none matches exactly, and then flagged), instead of grepping for `fn name` / `def name` / `class name`. Rows \
                  read `start-end: signature`; read_span with that start returns the definition. \
                  Your repo first; a common name lists your repo and counts the others (pass repo: \
                  to list one).",
@@ -2499,6 +2499,8 @@ fn call_tool(
             let name = req_str(args, "name")?;
             let repo = opt_repo(args)?;
             let mut hits = engine.find_symbol(name, fetch(DEFAULT_LIMIT).max(HUB_FETCH));
+            // no definition has exactly this name: the rows are longer names
+            let fallback = indexio_query::is_substring_fallback(&hits);
             // a grep for `fn name` in the session's repo: the definition lines
             *baseline = Some(grep_baseline(&hits, current));
             let note = focus_repo(&mut hits, current, repo.as_deref(), DEFAULT_LIMIT, "definitions");
@@ -2520,6 +2522,13 @@ fn call_tool(
                     "definitions",
                     &end_of,
                 );
+                if fallback && !hits.is_empty() {
+                    out = format!(
+                        "{}
+{out}",
+                        mcp_text::substring_fallback_note(name)
+                    );
+                }
                 out.push_str(&note);
                 return Ok(plain_result(out));
             }
@@ -4186,6 +4195,30 @@ mod tests {
     }
 
     #[test]
+    fn find_symbol_flags_the_substring_fallback() {
+        let (_t, e) = fixture_engine();
+        let text_of = |name: &str| {
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{{"name":"find_symbol","arguments":{{"name":"{name}"}}}}}}"#
+            );
+            let v = parse_resp(&handle_text(&e, &req).unwrap());
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // no definition is named `foo_bar`: the longer name is listed, flagged
+        let text = text_of("foo_bar");
+        assert!(
+            text.starts_with("no definition named exactly `foo_bar`; definitions whose name contains it:\nalpha:src/foo.rs\n"),
+            "{text}"
+        );
+        // an exact definition is listed alone, unflagged
+        assert!(text_of("foo_bar_123").starts_with("alpha:src/foo.rs\n"));
+        assert_eq!(text_of("nothing_like_it"), "no definitions");
+    }
+
+    #[test]
     fn tools_call_list_files_glob_substring_repo() {
         let (_t, e) = fixture_engine();
         let call = |args: &str| {
@@ -4240,6 +4273,7 @@ mod tests {
                 skip: Vec::new(),
                 pdf_text: false,
                 within: Vec::new(),
+                extract_gen: 0,
             })
             .unwrap(),
         )

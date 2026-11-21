@@ -91,6 +91,12 @@ pub fn hits(hits: &[SearchHit], grouped: bool, truncated: bool, what: &str) -> S
     hits_with_ends(hits, grouped, truncated, what, &|_| None)
 }
 
+/// Header of a `find_symbol` answer that is the substring fallback, so a
+/// longer name (`StatusChart` for `Status`) is not read as the definition.
+pub fn substring_fallback_note(name: &str) -> String {
+    format!("no definition named exactly `{name}`; definitions whose name contains it:")
+}
+
 /// [`hits`] where `end_of(hit)` may supply the last line of the definition
 /// a hit starts (rendered `start-end: snippet`), so the agent can read
 /// exactly that range next.

@@ -216,7 +216,8 @@ enum Commands {
         #[arg(long)]
         coverage: bool,
     },
-    /// Find a symbol by name (exact, substring fallback).
+    /// Find a symbol by name: exact (case-sensitive) matches; definitions
+    /// whose name contains NAME only when none is named exactly NAME.
     Symbol { name: String },
     /// Find callers of a function/method.
     Calls { name: String },
@@ -901,7 +902,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Symbol { name } => {
             let engine = Engine::open(&data_dir)
                 .with_context(|| format!("opening index at {}", data_dir.display()))?;
-            print_hits(&engine.find_symbol(&name, 50));
+            let hits = engine.find_symbol(&name, 50);
+            if indexio_query::is_substring_fallback(&hits) {
+                eprintln!("{}", mcp_text::substring_fallback_note(&name));
+            }
+            print_hits(&hits);
         }
         Commands::Calls { name } => {
             let engine = Engine::open(&data_dir)

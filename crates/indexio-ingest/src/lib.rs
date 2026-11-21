@@ -82,6 +82,19 @@ pub struct RepoState {
     /// the transcripts and tool output beside it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub within: Vec<String>,
+    /// [`indexio_symbols::GENERATION`] the repo's docs were extracted with
+    /// (0 = before 0.1.15). The next unscoped delta re-extracts the files of
+    /// every language whose generation is newer, unchanged or not.
+    #[serde(default)]
+    pub extract_gen: u32,
+}
+
+impl RepoState {
+    /// Whether a doc at `path` was extracted by an older generation of its
+    /// language's extractor than this build's.
+    fn stale_extraction(&self, path: &str) -> bool {
+        indexio_symbols::generation(Lang::from_path(path)) > self.extract_gen
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -243,7 +256,7 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
                 }
                 let blob = BlobId::from_content(&content);
                 let raw_len = content.len() as u32;
-                let (art, cas_hit) = match cas.get(&blob) {
+                let (art, cas_hit) = match cas.get(&blob, lang) {
                     Some(art) => (art, true),
                     None => {
                         let ngrams = grams::extract(&content, &CommonGrams::empty());
@@ -260,7 +273,7 @@ fn extract_docs(files: Vec<(String, Vec<u8>)>, cas: &Cas) -> Vec<PreparedDoc> {
                             lang,
                         };
                         // A failed put only costs a future CAS miss.
-                        if let Err(e) = cas.put(&blob, &art) {
+                        if let Err(e) = cas.put(&blob, lang, &art) {
                             warn!(%path, error = %e, "CAS put failed");
                         }
                         (art, false)
@@ -429,6 +442,7 @@ pub fn index_repo(
                 skip: Vec::new(),
                 pdf_text: false,
                 within: Vec::new(),
+                extract_gen: 0,
             },
         )?;
         return reindex_worktree(name, data_dir, cas);
@@ -466,6 +480,7 @@ pub fn index_repo(
             skip: Vec::new(),
             pdf_text: false,
             within: Vec::new(),
+            extract_gen: indexio_symbols::GENERATION,
         },
     )?;
     Ok(report)
@@ -944,6 +959,7 @@ fn index_dir_inner(
             skip,
             pdf_text,
             within,
+            extract_gen: indexio_symbols::GENERATION,
         },
     )?;
     Ok(IndexReport {
@@ -1170,6 +1186,12 @@ fn delta_by_content_in(
     let prev_blob: HashMap<&str, BlobId> =
         prev_docs.iter().map(|(_, _, dm)| (dm.path.as_str(), dm.blob)).collect();
 
+    // A full pass re-extracts the docs an older extractor generation wrote
+    // (a scoped pass leaves them, and the generation, to the next full one).
+    let mut next = next;
+    if scope.is_none() {
+        next.extract_gen = indexio_symbols::GENERATION;
+    }
     let mut to_index: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut doomed: HashSet<String> = HashSet::new();
@@ -1177,10 +1199,13 @@ fn delta_by_content_in(
         let rel = f.rel;
         seen.insert(rel.clone());
         let old = prev_blob.get(rel.as_str()).copied();
+        // an unchanged file is still re-indexed when its doc is stale
+        let stale = scope.is_none() && state.stale_extraction(&rel);
+        let unchanged = |blob: BlobId| old == Some(blob) && !stale;
         let content = match f.content {
             Some(c) => c,
             None => {
-                if old == Some(f.blob) {
+                if unchanged(f.blob) {
                     continue; // unchanged on disk and still the visible doc
                 }
                 // unchanged on disk but its doc is gone (a HEAD sync from
@@ -1193,7 +1218,7 @@ fn delta_by_content_in(
                 }
             }
         };
-        if old == Some(BlobId::from_content(&content)) {
+        if unchanged(BlobId::from_content(&content)) {
             continue; // byte-identical
         }
         // Windows checkouts carry CRLF on disk while git blobs (and the
@@ -1201,7 +1226,7 @@ fn delta_by_content_in(
         // LF-normalised bytes so line endings alone never re-index a file.
         let content = match normalize_crlf(&content) {
             Some(lf) => {
-                if old == Some(BlobId::from_content(&lf)) {
+                if unchanged(BlobId::from_content(&lf)) {
                     continue;
                 }
                 lf
@@ -1291,7 +1316,11 @@ pub fn head_moved(data_dir: &Path, name: &str) -> bool {
     }
     let Ok(repo) = gix::open(&state.path) else { return false };
     match head(&repo) {
-        Ok((commit, _)) => state.last_commit.as_deref() != Some(commit.as_str()),
+        // an index an older extractor built is due a pass too
+        Ok((commit, _)) => {
+            state.last_commit.as_deref() != Some(commit.as_str())
+                || state.extract_gen < indexio_symbols::GENERATION
+        }
         Err(_) => false,
     }
 }
@@ -1722,7 +1751,9 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
             for f in head_files {
                 match old_map.get(&f.path) {
                     None => to_index.push(f),
-                    Some(old_oid) if *old_oid != f.oid => {
+                    // modified, or unchanged but extracted by an older
+                    // generation of its language's extractor
+                    Some(old_oid) if *old_oid != f.oid || state.stale_extraction(&f.path) => {
                         doomed_paths.insert(f.path.clone());
                         to_index.push(f);
                     }
@@ -1801,6 +1832,7 @@ pub fn reindex_repo(name: &str, data_dir: &Path, cas: &Cas) -> anyhow::Result<In
             skip: Vec::new(),
             pdf_text: false,
             within: Vec::new(),
+            extract_gen: indexio_symbols::GENERATION,
         },
     )?;
     Ok(report)
@@ -2215,6 +2247,78 @@ mod tests {
         assert!(!head_moved(data, "no-such-repo"));
     }
 
+    /// A repo indexed before the TS/JS extractor's generation 1 (0.1.15):
+    /// its next pass re-extracts the unchanged TS/JS files, and only those,
+    /// for a git repo and for a plain folder alike.
+    #[test]
+    fn stale_extraction_generation_reindexes_unchanged_tsjs_files() {
+        const PAGE_TSX: &[u8] = b"export type Status = 'a' | 'b';\nexport default function Page() { return <Board />; }\n";
+        let data_td = tempfile::tempdir().unwrap();
+        let data = data_td.path();
+        let age = |name: &str| {
+            let mut st = load_repo_state(data, name);
+            st.extract_gen = 0;
+            save_state(data, &st).unwrap();
+        };
+
+        let repo = make_repo(&[("src/main.rs", MAIN_RS), ("web/page.tsx", PAGE_TSX)]);
+        index_repo(repo.path(), "repo", data, &open_cas(data)).unwrap();
+        assert_eq!(
+            load_repo_state(data, "repo").extract_gen,
+            indexio_symbols::GENERATION
+        );
+        age("repo");
+        assert!(head_moved(data, "repo"), "a stale index is due a pass");
+        let r = reindex_repo("repo", data, &open_cas(data)).unwrap();
+        assert_eq!((r.docs_added, r.docs_deleted), (1, 1), "{r:?}");
+        assert_eq!(r.changed_paths, vec!["web/page.tsx".to_string()]);
+        assert_eq!(
+            load_repo_state(data, "repo").extract_gen,
+            indexio_symbols::GENERATION
+        );
+        assert!(!head_moved(data, "repo"));
+        let r = reindex_repo("repo", data, &open_cas(data)).unwrap();
+        assert_eq!(r.docs_added, 0, "up to date: {r:?}");
+
+        let plain = tempfile::tempdir().unwrap();
+        write_files(plain.path(), &[("a.rs", MAIN_RS), ("b.ts", PAGE_TSX)]);
+        index_dir(plain.path(), "plain", data, &open_cas(data)).unwrap();
+        age("plain");
+        let r = reindex_repo("plain", data, &open_cas(data)).unwrap();
+        assert_eq!(r.changed_paths, vec!["b.ts".to_string()], "{r:?}");
+        assert_eq!(
+            load_repo_state(data, "plain").extract_gen,
+            indexio_symbols::GENERATION
+        );
+        assert_eq!(
+            reindex_repo("plain", data, &open_cas(data))
+                .unwrap()
+                .docs_added,
+            0
+        );
+    }
+
+    /// CAS entries are keyed by the language's extraction generation: an
+    /// artifact stored for generation 0 is not served to a TS/JS lookup.
+    #[test]
+    fn cas_keys_tsjs_entries_by_generation() {
+        let td = tempfile::tempdir().unwrap();
+        let cas = Cas::open(td.path()).unwrap();
+        let id = BlobId::from_content(b"export type A = 1;\n");
+        let art = ExtractedArtifact {
+            raw_len: 7,
+            ..Default::default()
+        };
+        cas.put(&id, Lang::Rust, &art).unwrap(); // generation 0 key
+        assert!(cas.get(&id, Lang::Rust).is_some());
+        assert!(
+            cas.get(&id, Lang::TsJs).is_none(),
+            "an older generation's entry is a miss"
+        );
+        cas.put(&id, Lang::TsJs, &art).unwrap();
+        assert!(cas.get(&id, Lang::TsJs).is_some());
+    }
+
     const MAIN_RS: &[u8] = b"fn main() {\n    println!(\"hello world\");\n}\n";
     const LIB_RS: &[u8] = b"pub fn library_function() -> i32 { 42 }\n";
     const UTIL_PY: &[u8] = b"def util_function():\n    return 'util'\n";
@@ -2558,22 +2662,25 @@ mod tests {
         let cas = Cas::open(td.path()).unwrap();
         let content = b"pub fn corrupt_me() {}\n";
         let id = BlobId::from_content(content);
-        assert!(cas.get(&id).is_none());
+        assert!(cas.get(&id, Lang::Rust).is_none());
 
         // write garbage at the entry path
         let hex = id.hex();
         let sub = td.path().join(&hex[..2]);
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join(&hex[2..]), b"not bincode").unwrap();
-        assert!(cas.get(&id).is_none(), "corrupt entry must be a miss");
+        assert!(
+            cas.get(&id, Lang::Rust).is_none(),
+            "corrupt entry must be a miss"
+        );
 
         // put overwrites the corrupt entry
         let art = ExtractedArtifact {
             ngrams: vec![b"abc".to_vec()],
             ..Default::default()
         };
-        cas.put(&id, &art).unwrap();
-        let got = cas.get(&id).unwrap();
+        cas.put(&id, Lang::Rust, &art).unwrap();
+        let got = cas.get(&id, Lang::Rust).unwrap();
         assert_eq!(got.ngrams, art.ngrams);
         assert_eq!(cas.stats().0, 1);
     }

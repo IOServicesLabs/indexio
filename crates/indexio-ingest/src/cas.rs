@@ -2,7 +2,10 @@
 //!
 //! Layout: `<dir>/v2/<hex[0..2]>/
 //! <hex[2..]>`, one file per blob: a 4-byte magic then the zstd frame of the
-//! bincode-serialized `ExtractedArtifact`. The CAS dedups *extraction work*
+//! bincode-serialized `ExtractedArtifact`. A language whose extraction
+//! generation is above 0 (`indexio_symbols::generation`) keys its entries
+//! `<hex[2..]>.g<N>`, so a newer extractor never reuses an older build's
+//! artifact for the same content. The CAS dedups *extraction work*
 //! (grams + tree-sitter) across repos, branches and forks — file content
 //! itself is not stored here (it lives in shards).
 //!
@@ -24,7 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use indexio_types::{BlobId, ExtractedArtifact};
+use indexio_types::{BlobId, ExtractedArtifact, Lang};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,15 +71,21 @@ impl Cas {
         }
     }
 
-    fn entry_path(&self, id: &BlobId) -> PathBuf {
+    fn entry_path(&self, id: &BlobId, lang: Lang) -> PathBuf {
         let hex = id.hex();
-        self.dir.join(LAYOUT).join(&hex[..2]).join(&hex[2..])
+        let sub = self.dir.join(LAYOUT).join(&hex[..2]);
+        match indexio_symbols::generation(lang) {
+            0 => sub.join(&hex[2..]),
+            g => sub.join(format!("{}.g{g}", &hex[2..])),
+        }
     }
 
-    /// Look up an artifact. A missing *or corrupt* entry is a miss (the
-    /// caller recomputes and `put` overwrites the corrupt entry).
-    pub fn get(&self, id: &BlobId) -> Option<ExtractedArtifact> {
-        let path = self.entry_path(id);
+    /// Look up the artifact of content `id` extracted as `lang`. A missing
+    /// *or corrupt* entry is a miss (the caller recomputes and `put`
+    /// overwrites the corrupt entry), and so is one an older extraction
+    /// generation of `lang` wrote.
+    pub fn get(&self, id: &BlobId, lang: Lang) -> Option<ExtractedArtifact> {
+        let path = self.entry_path(id, lang);
         let bytes = fs::read(&path).ok()?;
         let frame = bytes.strip_prefix(MAGIC)?;
         let raw = zstd::stream::decode_all(frame).ok()?;
@@ -85,8 +94,8 @@ impl Cas {
 
     /// Store an artifact (tmp file + atomic rename). Idempotent: putting the
     /// same id twice just overwrites.
-    pub fn put(&self, id: &BlobId, art: &ExtractedArtifact) -> io::Result<()> {
-        let path = self.entry_path(id);
+    pub fn put(&self, id: &BlobId, lang: Lang, art: &ExtractedArtifact) -> io::Result<()> {
+        let path = self.entry_path(id, lang);
         let sub = path.parent().expect("entry path has a parent");
         fs::create_dir_all(sub)?;
         let raw = bincode::serialize(art).map_err(io::Error::other)?;

@@ -73,6 +73,17 @@ pub const CANDIDATE_CAP: usize = 2000;
 pub const SCAN_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// Snippet length cap.
 pub const SNIPPET_MAX_CHARS: usize = 240;
+/// `find_symbol` score of a definition named exactly as asked.
+pub const EXACT_SYMBOL_SCORE: f32 = 10.0;
+/// `find_symbol` score of a definition whose name only contains the asked
+/// name (the substring fallback, used when no exact definition exists).
+pub const SUBSTRING_SYMBOL_SCORE: f32 = 1.0;
+
+/// Whether a `find_symbol` answer is the substring fallback: definitions
+/// whose names contain the asked name, none named exactly as asked.
+pub fn is_substring_fallback(hits: &[SearchHit]) -> bool {
+    !hits.is_empty() && hits.iter().all(|h| h.score < EXACT_SYMBOL_SCORE)
+}
 /// Per-doc match cap for verification / tf counting.
 const MAX_HITS_PER_DOC: usize = 256;
 /// BM25-lite parameters.
@@ -1519,10 +1530,12 @@ impl Engine {
     }
 
     /// Exact symbol lookup across shards; falls back to substring matching
-    /// (score 1.0) when the exact lookup is empty. Exact-name entries score
-    /// 10.0 (find_symbol).
+    /// (score [`SUBSTRING_SYMBOL_SCORE`]) only when no definition has exactly
+    /// this name (case-sensitive). Exact-name entries score
+    /// [`EXACT_SYMBOL_SCORE`]; the two never mix in one answer, and
+    /// [`is_substring_fallback`] tells which one a caller got.
     pub fn find_symbol(&self, name: &str, limit: usize) -> Vec<SearchHit> {
-        let mut hits = self.symbol_hits(name, 10.0);
+        let mut hits = self.symbol_hits(name, EXACT_SYMBOL_SCORE);
         if hits.is_empty() {
             hits = self.substring_symbol_hits(name);
         }
@@ -1564,7 +1577,9 @@ impl Engine {
                 for ident in identifiers_containing(&line_text, name) {
                     for (si2, docid2, _, line, _) in self.set.symbol_postings(&ident) {
                         if seen.insert((si2, docid2, line)) {
-                            if let Some(hit) = self.posting_hit(si2, docid2, line, 1.0) {
+                            if let Some(hit) =
+                                self.posting_hit(si2, docid2, line, SUBSTRING_SYMBOL_SCORE)
+                            {
                                 out.push(hit);
                             }
                         }
@@ -2741,6 +2756,48 @@ mod tests {
         assert_eq!(hits[0].path, "src/foo.rs");
         assert_eq!(hits[0].line, 1);
         assert_eq!(hits[0].score, 1.0);
+        assert!(is_substring_fallback(&hits));
+        assert!(!is_substring_fallback(&e.find_symbol("foo_bar_123", 10)));
+        assert!(!is_substring_fallback(&[]));
+    }
+
+    /// `Status` is a type alias next to a `StatusChart` component: the
+    /// lookup answers with the alias only; the component is not a
+    /// substring hit while an exact definition exists. Without the alias
+    /// (an index built before 0.1.15) the fallback answers, flagged as such.
+    #[test]
+    fn find_symbol_exact_name_wins_over_longer_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shards = tmp.path().join("shards");
+        std::fs::create_dir_all(&shards).unwrap();
+        let types = "export type Status = 'todo' | 'done';\n";
+        let chart = "export function StatusChart() {\n  return null;\n}\n";
+        let docs = vec![
+            Doc {
+                path: "lib/types.ts",
+                lang: Lang::TsJs,
+                content: types.to_string(),
+                symbols: indexio_symbols::extract(Lang::TsJs, types.as_bytes()).0,
+                calls: vec![],
+            },
+            Doc {
+                path: "components/StatusChart.tsx",
+                lang: Lang::TsJs,
+                content: chart.to_string(),
+                symbols: indexio_symbols::extract(Lang::TsJs, chart.as_bytes()).0,
+                calls: vec![],
+            },
+        ];
+        write_shard(&shards, &docs, &["app".to_string()]);
+        let e = Engine::open(tmp.path()).unwrap();
+        let hits = e.find_symbol("Status", 10);
+        let at: Vec<(&str, u32)> = hits.iter().map(|h| (h.path.as_str(), h.line)).collect();
+        assert_eq!(at, vec![("lib/types.ts", 1)]);
+        assert!(!is_substring_fallback(&hits));
+        // `Statu` names nothing exactly: the fallback lists both, flagged
+        let hits = e.find_symbol("Statu", 10);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(is_substring_fallback(&hits));
     }
 
     #[test]
